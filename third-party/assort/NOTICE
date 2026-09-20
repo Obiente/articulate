@@ -1,0 +1,18 @@
+Assort
+
+Source: https://github.com/Obiente/assort/tree/d6cf161ac6db63ba221cfef6e9d7975d09f38d6d
+License: AGPL-3.0-or-later
+
+This distribution includes assort-core, assort-data, assort-inference,
+assort-model, assort-tokenizer and assort-transcript from the revision above.
+
+The project owner has declared that Obiente projects are licensed under the
+GNU Affero General Public License, version 3 or any later version. Obiente's
+public organization profile also states its AGPL licensing policy:
+https://github.com/Obiente/.github/blob/main/profile/README.md
+
+The pinned Assort revision does not contain a separate license file. The
+accompanying LICENSE supplies the standard AGPL version 3 terms for the
+owner's declaration. These two distribution files are maintained by Articulate;
+they are not represented as files copied from that Assort revision. Existing
+upstream notices are retained separately when present.

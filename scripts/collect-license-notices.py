@@ -13,6 +13,7 @@ import io
 import json
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
 import sys
 import tarfile
 import urllib.parse
@@ -49,7 +50,7 @@ def is_notice(path):
     ) and not name.endswith((".rs", ".py", ".html", ".svg", ".json", ".toml"))
 
 
-def runtime_packages(metadata):
+def runtime_packages(metadata, runtime_tree=None):
     graph = metadata.get("resolve")
     if not graph or not graph.get("root"):
         raise ValueError("Metadata must have a resolved root package")
@@ -65,6 +66,26 @@ def runtime_packages(metadata):
         for dependency in nodes[identity]["deps"]:
             if any(kind["kind"] is None for kind in dependency["dep_kinds"]):
                 pending.append(dependency["pkg"])
+    if runtime_tree is not None:
+        # Cargo metadata can unify development features into its resolution,
+        # exposing optional dependencies absent from the normal build. The
+        # matching cargo tree invocation provides the active normal edge set.
+        # Do not guess which source Cargo meant if name/version is ambiguous.
+        identities = {}
+        for package in packages.values():
+            identities.setdefault((package["name"], package["version"]), []).append(package["id"])
+        active = set()
+        for line in runtime_tree.splitlines():
+            match = re.fullmatch(r"([A-Za-z0-9_+-]+) v([^\s]+)(?: \(.*\))?", line.strip())
+            if not match:
+                raise ValueError("Invalid active Cargo tree package entry")
+            candidates = identities.get(match.groups(), [])
+            if len(candidates) != 1:
+                raise ValueError("Active Cargo tree package has an unknown or ambiguous source")
+            active.add(candidates[0])
+        if graph["root"] not in active or not active.issubset(seen):
+            raise ValueError("Active Cargo tree does not match the supplied metadata resolution")
+        seen = active
     return sorted(
         (packages[identity] for identity in seen if identity != graph["root"]),
         key=lambda package: (package["name"], package["version"]),
@@ -72,16 +93,43 @@ def runtime_packages(metadata):
 
 
 def read_registry_notices(package):
-    root = Path(package["manifest_path"]).parent
+    root = Path(package["manifest_path"]).parent.resolve()
+    allowed_root = root
     notices = {}
     for file in root.rglob("*"):
         if file.is_file() and is_notice(file.relative_to(root)):
             notices[file.relative_to(root).as_posix()] = file.read_bytes()
+    source = package.get("source") or ""
+    if source.startswith("git+"):
+        # Git workspace members can inherit their license from the repository
+        # root. Bind that ancestor to Cargo's exact pinned checkout first.
+        revision = source.rpartition("#")[2]
+        if not re.fullmatch(r"[a-fA-F0-9]{40}", revision):
+            raise ValueError(f"{package['name']}: Git dependency is not pinned")
+        git_root = Path(subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"], cwd=root, text=True
+        ).strip()).resolve()
+        actual = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip()
+        if actual.lower() != revision.lower() or not root.is_relative_to(git_root):
+            raise ValueError(f"{package['name']}: Git checkout does not match Cargo's pin")
+        allowed_root = git_root
+        ancestor = root
+        while True:
+            for file in ancestor.iterdir():
+                if file.is_file() and is_notice(file.name):
+                    if not file.resolve().is_relative_to(git_root):
+                        raise ValueError("Git workspace notice leaves its checkout")
+                    notices[f"workspace/{file.relative_to(git_root).as_posix()}"] = file.read_bytes()
+            if ancestor == git_root:
+                break
+            ancestor = ancestor.parent
     if package.get("license_file"):
         file = (root / package["license_file"]).resolve()
-        if not file.is_relative_to(root.resolve()):
+        if not file.is_relative_to(allowed_root):
             raise ValueError(f"{package['name']}: license_file leaves its published crate")
-        notices[file.relative_to(root.resolve()).as_posix()] = file.read_bytes()
+        notices[f"declared/{file.name}"] = file.read_bytes()
     return notices
 
 
@@ -91,7 +139,18 @@ def upstream_notices(package, cache):
     commit = vcs.get("git", {}).get("sha1", "")
     if not re.fullmatch(r"[a-fA-F0-9]{40}", commit):
         raise ValueError("Published crate has no pinned VCS commit")
-    repository = urllib.parse.urlparse(package.get("repository") or "")
+    repository_url = package.get("repository") or ""
+    if (
+        not repository_url
+        and package["name"] == "cubecl-zspace"
+        and package["version"] == "0.10.0"
+        and commit == "7cf203735e095e640a2c03b2400d0faa03196bb4"
+    ):
+        # This exact published crate omits package.repository, but includes the
+        # workspace README identifying this repository. Its pinned workspace
+        # supplies the actual MIT, Apache and copyright notices.
+        repository_url = "https://github.com/tracel-ai/cubecl"
+    repository = urllib.parse.urlparse(repository_url)
     parts = repository.path.strip("/").split("/")
     if len(parts) < 2 or repository.scheme != "https":
         raise ValueError("Published crate has no supported HTTPS repository")
@@ -133,9 +192,22 @@ def upstream_notices(package, cache):
     return selected, url
 
 
-def collect(metadata_file, output):
+def assort_declaration(package):
+    revision = "d6cf161ac6db63ba221cfef6e9d7975d09f38d6d"
+    source = f"git+https://github.com/Obiente/assort.git?rev={revision}#{revision}"
+    names = {"assort-core", "assort-data", "assort-inference", "assort-model",
+             "assort-tokenizer", "assort-transcript"}
+    if package["name"] not in names or package.get("source") != source:
+        return {}
+    directory = Path(__file__).resolve().parent.parent / "third-party" / "assort"
+    return {f"owner-declaration/{name}": (directory / name).read_bytes()
+            for name in ("LICENSE", "NOTICE")}
+
+
+def collect(metadata_file, output, runtime_tree_file=None):
     metadata = json.loads(metadata_file.read_text(encoding="utf-8-sig"))
-    packages = runtime_packages(metadata)
+    tree = runtime_tree_file.read_text(encoding="utf-8-sig") if runtime_tree_file else None
+    packages = runtime_packages(metadata, tree)
     cache = {}
     entries = []
     missing = []
@@ -145,6 +217,8 @@ def collect(metadata_file, output):
         if not re.fullmatch(r"[A-Za-z0-9_.+-]+", label):
             raise ValueError("Unsafe package identifier")
         notices = read_registry_notices(package)
+        declaration = assort_declaration(package)
+        notices.update(declaration)
         origin = None
         # egui's published font crate omits three required font notices, even
         # though the emoji notice is present. Recover its pinned upstream files.
@@ -193,6 +267,9 @@ def collect(metadata_file, output):
                  "license": package.get("license"), "repository": package.get("repository"), "notices": files}
         if origin:
             entry["pinned_notice_source"] = origin
+        if declaration:
+            entry["license"] = "AGPL-3.0-or-later"
+            entry["license_declaration_source"] = "Articulate third-party/assort/NOTICE (project owner declaration)"
         entries.append(entry)
     (output / "index.json").write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
     lines = ["# Rust dependency notices", "", "Dependencies reachable through normal dependency edges in the Windows Cargo resolution.",
@@ -209,9 +286,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("metadata", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--runtime-tree", type=Path,
+                        help="Matching cargo tree -e normal --prefix none --format '{p}' output")
     arguments = parser.parse_args()
     try:
-        collect(arguments.metadata, arguments.output)
+        collect(arguments.metadata, arguments.output, arguments.runtime_tree)
     except Exception as failure:
         print(f"License collection failed: {failure}", file=sys.stderr)
         sys.exit(1)

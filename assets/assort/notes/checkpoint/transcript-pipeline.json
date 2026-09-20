@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "category_ids": [
+    "decision",
+    "action",
+    "key_fact",
+    "background"
+  ],
+  "training_label_smoothing": 0.1
+}

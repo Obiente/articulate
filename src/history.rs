@@ -388,7 +388,8 @@ fn validate(session: &Session) -> Result<()> {
                     && attribution
                         .speakers
                         .iter()
-                        .all(|speaker| speaker.name.len() <= 512),
+                        .all(|speaker| speaker.name.len() <= 512
+                            && speaker.avatar.as_ref().is_none_or(|avatar| avatar.valid())),
                 "Invalid saved speaker labels"
             );
         }
@@ -413,7 +414,8 @@ fn validate(session: &Session) -> Result<()> {
                         && attribution
                             .speakers
                             .iter()
-                            .all(|speaker| speaker.name.len() <= 512),
+                            .all(|speaker| speaker.name.len() <= 512
+                                && speaker.avatar.as_ref().is_none_or(|avatar| avatar.valid())),
                     "Invalid saved note labels"
                 );
             }
@@ -786,6 +788,7 @@ mod tests {
                 generation: 987654,
                 channel_id: "private-channel-fixture".into(),
                 speakers: vec![NamedSpeaker {
+                    avatar: None,
                     id: "private-user-fixture".into(),
                     name: "Élodie".into(),
                 }],

@@ -6,7 +6,9 @@ mod call_capture;
 mod call_export;
 mod call_segments;
 mod calls;
+mod classification;
 mod cleanup;
+mod correction_context;
 mod dictionary;
 mod discord;
 mod discord_attribution;
@@ -38,6 +40,22 @@ fn main() {
 
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--assort-worker") {
+        return classification::worker(&args[1..]);
+    }
+    if args.as_slice() == ["--verify-assort-models"] {
+        classification::verify_builtin_models()?;
+        println!("Pretrained Assort notes and correction models are bundled and verified.");
+        return Ok(());
+    }
+    if args.as_slice() == ["--verify-native-audio-payload"] {
+        anyhow::ensure!(
+            discord::install::native_payload_available(),
+            "Native Discord audio payload is missing"
+        );
+        println!("Native Discord audio payload and notices are bundled.");
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--discord-check") {
         return discord_check(&args);
     }

@@ -454,6 +454,82 @@ mod win {
         send_text(expected, text, true, same_field)
     }
 
+    /// Extends a verified selection by one native left-arrow step. The caller
+    /// must verify the resulting UIA range before replacing any selected text.
+    pub fn select_previous_character(expected: Target, guard: impl Fn() -> bool) -> Result<()> {
+        unsafe {
+            for _ in 0..50 {
+                if modifiers_released() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if !modifiers_released() {
+                bail!("Release the modifier keys. Live typing paused.");
+            }
+            // UIA can take time to answer. Check native focus and modifiers
+            // after it returns, immediately before queuing any keyboard input.
+            if !guard() || target() != Some(expected) || !modifiers_released() {
+                bail!("Focus changed. Live typing paused.");
+            }
+            send_selection(|input| {
+                SendInput(
+                    input.len() as u32,
+                    input.as_ptr(),
+                    std::mem::size_of::<INPUT>() as i32,
+                )
+            })
+        }
+    }
+
+    unsafe fn modifiers_released() -> bool {
+        [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+            .iter()
+            .all(|key| unsafe { GetAsyncKeyState(*key as i32) >= 0 })
+    }
+
+    fn selection_key(key: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: key,
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    fn send_selection(mut send: impl FnMut(&[INPUT]) -> u32) -> Result<()> {
+        let input = [
+            selection_key(VK_SHIFT, 0),
+            selection_key(VK_LEFT, KEYEVENTF_EXTENDEDKEY),
+            selection_key(VK_LEFT, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+            selection_key(VK_SHIFT, KEYEVENTF_KEYUP),
+        ];
+        let sent = send(&input);
+        if sent == input.len() as u32 {
+            return Ok(());
+        }
+        if sent > 0 {
+            // A partial batch must not leave Shift or Left held. Cleanup sends
+            // only releases, never another selection step or any text editing.
+            let releases = [
+                selection_key(VK_LEFT, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+                selection_key(VK_SHIFT, KEYEVENTF_KEYUP),
+            ];
+            for _ in 0..3 {
+                if send(&releases) == releases.len() as u32 {
+                    break;
+                }
+            }
+        }
+        bail!("Windows blocked selection. Live typing paused.")
+    }
+
     fn send_text(
         expected: Target,
         text: &str,
@@ -589,6 +665,72 @@ mod win {
     #[cfg(test)]
     mod hotkey_tests {
         use super::*;
+
+        #[test]
+        fn selection_releases_modifiers_after_every_partial_batch() {
+            for accepted in 0..=4 {
+                let mut batches = Vec::new();
+                let result = send_selection(|input| {
+                    let keys: Vec<_> = input
+                        .iter()
+                        .map(|event| unsafe {
+                            assert_eq!(event.r#type, INPUT_KEYBOARD);
+                            let key = event.Anonymous.ki;
+                            (key.wVk, key.dwFlags)
+                        })
+                        .collect();
+                    batches.push(keys);
+                    if batches.len() == 1 {
+                        accepted
+                    } else {
+                        input.len() as u32
+                    }
+                });
+                assert_eq!(result.is_ok(), accepted == 4);
+                assert_eq!(
+                    batches[0],
+                    vec![
+                        (VK_SHIFT, 0),
+                        (VK_LEFT, KEYEVENTF_EXTENDEDKEY),
+                        (VK_LEFT, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+                        (VK_SHIFT, KEYEVENTF_KEYUP)
+                    ]
+                );
+                if (1..4).contains(&accepted) {
+                    assert_eq!(batches.len(), 2);
+                    assert_eq!(
+                        batches[1],
+                        vec![
+                            (VK_LEFT, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+                            (VK_SHIFT, KEYEVENTF_KEYUP)
+                        ]
+                    );
+                } else {
+                    assert_eq!(batches.len(), 1);
+                }
+            }
+        }
+
+        #[test]
+        fn blocked_selection_cleanup_is_bounded_and_never_repeats_keydown() {
+            let mut batches = 0;
+            assert!(
+                send_selection(|input| {
+                    batches += 1;
+                    if batches == 1 {
+                        return 1;
+                    }
+                    assert!(
+                        input
+                            .iter()
+                            .all(|key| unsafe { key.Anonymous.ki.dwFlags & KEYEVENTF_KEYUP != 0 })
+                    );
+                    0
+                })
+                .is_err()
+            );
+            assert_eq!(batches, 4);
+        }
 
         #[derive(Default)]
         struct Registry {
@@ -762,7 +904,9 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{app_name, copy, hotkey, insert, replace_selection, target};
+pub use win::{
+    app_name, copy, hotkey, insert, replace_selection, select_previous_character, target,
+};
 
 #[cfg(not(windows))]
 pub fn app_name(_: Target) -> Option<String> {
@@ -781,6 +925,10 @@ pub fn hotkey(initial: Hotkey, tx: Sender<HotkeyEvent>) -> Sender<Hotkey> {
 #[cfg(not(windows))]
 pub fn insert(_: Target, _: &str, _: impl Fn() -> bool) -> Result<()> {
     bail!("Insertion is currently available on Windows");
+}
+#[cfg(not(windows))]
+pub fn select_previous_character(_: Target, _: impl Fn() -> bool) -> Result<()> {
+    bail!("Keyboard selection is currently available on Windows");
 }
 #[cfg(not(windows))]
 pub fn target() -> Option<Target> {

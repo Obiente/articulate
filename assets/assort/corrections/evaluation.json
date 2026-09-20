@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "model_id": "articulate-corrections-v1",
+  "license": "AGPL-3.0-or-later",
+  "training_source": "Authored synthetic English vocabulary decisions; no user transcripts, dictionaries or account data",
+  "selection": "Validation-loss checkpoint selection with separate authored sentence families",
+  "held_out_scope": "Synthetic English context and registered-vocabulary decisions only",
+  "real_world_evaluation": false,
+  "calibrated_confidence": false,
+  "use": "Score keep_original and replace for existing saved rules; explicit user review and deterministic eligibility checks are required",
+  "limitations": [
+    "Not a general language model",
+    "No new prose or vocabulary entries are generated",
+    "Unknown names and wording can be misclassified",
+    "No multilingual semantic accuracy claim"
+  ],
+  "assort_revision": "d6cf161ac6db63ba221cfef6e9d7975d09f38d6d",
+  "recipe": "scripts/classification/train.py",
+  "task": "corrections",
+  "seed": 42
+}

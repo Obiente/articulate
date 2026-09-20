@@ -20,11 +20,18 @@ export async function publish(_event: IpcMainInvokeEvent, token: string, snapsho
         const ids = new Set<string>();
         for (const participant of value.participants) {
             if (!participant || typeof participant !== "object"
-                || Object.keys(participant).some(key => !["id", "name", "speaking", "is_self"].includes(key))
+                || Object.keys(participant).some(key => !["id", "name", "speaking", "is_self", "avatar"].includes(key))
                 || typeof participant.id !== "string" || !/^\d{1,24}$/.test(participant.id) || ids.has(participant.id)
                 || typeof participant.name !== "string" || !participant.name || [...participant.name].length > 128
                 || /[\u0000-\u001f\u007f-\u009f]/.test(participant.name)
                 || typeof participant.speaking !== "boolean" || typeof participant.is_self !== "boolean") return false;
+            if (participant.avatar !== undefined) {
+                const avatar = participant.avatar;
+                if (!avatar || typeof avatar !== "object" || Array.isArray(avatar)
+                    || Object.keys(avatar).length !== 2 || Object.keys(avatar).some(key => !["user_id", "hash"].includes(key))
+                    || typeof avatar.user_id !== "string" || !/^[0-9]{1,20}$/.test(avatar.user_id) || avatar.user_id !== participant.id
+                    || typeof avatar.hash !== "string" || !/^(?:a_)?[a-f0-9]{32}$/.test(avatar.hash)) return false;
+            }
             ids.add(participant.id);
         }
         if (value.channel_id === null && value.participants.length) return false;

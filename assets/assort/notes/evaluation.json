@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "model_id": "articulate-notes-v1",
+  "training_source": "Authored synthetic English meeting passages; no user or account data",
+  "selection": "Minimum validation cross entropy; test split excluded from training and checkpoint selection",
+  "held_out_scope": "Disjoint sentence template families and topic names; English synthetic examples only",
+  "real_world_evaluation": false,
+  "calibrated_confidence": false,
+  "use": "Reviewable source-quote suggestions only; never automatic actions",
+  "assort_revision": "d6cf161ac6db63ba221cfef6e9d7975d09f38d6d",
+  "recipe": "scripts/classification/train_notes.py",
+  "corpus": "scripts/classification/notes_corpus.py",
+  "corpus_source_sha256": "3b5caad81991293fd5cf74e0e979239e4965e39d5d8ceb9de75079188fff1038",
+  "seed": 42,
+  "epochs": 32,
+  "license": "AGPL-3.0-or-later"
+}

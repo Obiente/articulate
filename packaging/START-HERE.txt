@@ -35,7 +35,9 @@ There is no cloud transcription, telemetry, account or automatic sync.
 CALLS AND DISCORD
 Output capture includes everything playing through the chosen device.
 Discord speaker names use voice activity; they do not separate overlapping
-audio. Participant-isolated audio is not implemented. Notes are highlights
+audio. The custom build includes the participant-isolated audio adapter. It
+has not yet been validated in a real call. See docs/vencord.md in the repository.
+Notes are highlights
 and possible actions quoted from the transcript, not a generative summary.
 
 FEEDBACK

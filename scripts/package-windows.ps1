@@ -1,4 +1,4 @@
-param([switch]$SkipBuild, [string]$Python = 'python', [string]$Makensis = '')
+param([string]$Python = 'python', [string]$Makensis = '', [string]$BuildDirectory = '', [switch]$Validate)
 $ErrorActionPreference = 'Stop'
 $articulateRoot = Split-Path $PSScriptRoot -Parent
 Set-Location $articulateRoot
@@ -8,7 +8,7 @@ $dist = Join-Path $articulateRoot 'dist'
 $zip = Join-Path $dist "Articulate-$version-windows-x86_64.zip"
 $setup = Join-Path $dist "Articulate-$version-windows-x86_64-setup.exe"
 if ((Test-Path -LiteralPath $zip) -or (Test-Path -LiteralPath $setup)) { throw 'Output exists. Move the previous release artifacts before repackaging.' }
-$build = Join-Path $articulateRoot '.local/package-target'
+$build = if ($BuildDirectory) { [IO.Path]::GetFullPath($BuildDirectory) } else { Join-Path $articulateRoot '.local/package-target' }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $stage = Join-Path $articulateRoot ".local/package-stage/$stamp/Articulate-$version-windows-x86_64"
 New-Item -ItemType Directory -Force $dist,$stage | Out-Null
@@ -45,8 +45,12 @@ Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-ar
 $oldFlags = $env:CARGO_ENCODED_RUSTFLAGS
 $oldTarget = $env:CARGO_TARGET_DIR
 $oldResource = $env:ARTICULATE_RESOURCE
+$oldNativeAudio = $env:ARTICULATE_NATIVE_AUDIO_DIR
+$oldAssortModels = $env:ARTICULATE_ASSORT_MODELS_DIR
+$oldPath = $env:PATH
 try {
     $env:CARGO_TARGET_DIR = $build
+    $env:ARTICULATE_ASSORT_MODELS_DIR = Join-Path $articulateRoot 'assets/assort'
     $env:CARGO_ENCODED_RUSTFLAGS = (@("--remap-path-prefix=$($env:USERPROFILE)=/build/user", "--remap-path-prefix=$articulateRoot=/src/articulate", '-C', 'strip=symbols') -join [char]31)
     $rc = Join-Path $articulateRoot '.local/articulate.rc'
     $resource = Join-Path $articulateRoot '.local/articulate.res'
@@ -57,12 +61,23 @@ try {
     & rc.exe /nologo "/fo$resource" $rc
     if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed.' }
     $env:ARTICULATE_RESOURCE = $resource
-    if (!$SkipBuild) {
-        & (Join-Path $PSScriptRoot 'build-windows.ps1')
-        if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+    if ($Validate) {
+        & cargo fmt --check
+        if ($LASTEXITCODE -ne 0) { throw 'Formatting failed.' }
+        $env:PATH = (Join-Path $articulateRoot '.local/native/install/bin') + ';' + $env:PATH
+        & (Join-Path $PSScriptRoot 'build-windows.ps1') -Test
+        if ($LASTEXITCODE -ne 0) { throw 'Release tests failed.' }
+        & cargo clippy --release --locked --features dynamic-backends --all-targets -- -D warnings
+        if ($LASTEXITCODE -ne 0) { throw 'Release Clippy failed.' }
     }
-    $exe = Join-Path $build 'release/transcribe-local.exe'
+    & (Join-Path $PSScriptRoot 'build-windows.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
+    $exe = Join-Path $build 'release/articulate.exe'
     if (!(Test-Path -LiteralPath $exe)) { throw 'Build the packaged executable first.' }
+    & $exe --verify-native-audio-payload
+    if ($LASTEXITCODE -ne 0) { throw 'Packaged executable has no native Discord payload.' }
+    & $exe --verify-assort-models
+    if ($LASTEXITCODE -ne 0) { throw 'Packaged executable has no valid pretrained Assort models.' }
     Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'Articulate.exe')
     $native = Join-Path $articulateRoot '.local/native/transcribe-native-windows-x86_64-cpu-vulkan'
     $dlls = @('transcribe','ggml','ggml-base','ggml-vulkan','ggml-cpu-x64','ggml-cpu-sse42','ggml-cpu-sandybridge','ggml-cpu-haswell','ggml-cpu-cannonlake','ggml-cpu-cascadelake','ggml-cpu-alderlake','ggml-cpu-skylakex','ggml-cpu-icelake')
@@ -76,18 +91,24 @@ try {
     Copy-Item -LiteralPath (Join-Path $native 'licenses') -Destination (Join-Path $licenses 'native') -Recurse
     Copy-Item -LiteralPath LICENSE -Destination (Join-Path $licenses 'Articulate-AGPL-3.0-or-later.txt')
     Copy-Item -LiteralPath NOTICE -Destination (Join-Path $licenses 'Articulate-NOTICE.txt')
+    if (!$env:ARTICULATE_NATIVE_AUDIO_DIR) { throw 'Native Discord payload path is required for packaging.' }
+    $nativeAudioLicenses = Join-Path $env:ARTICULATE_NATIVE_AUDIO_DIR 'licenses'
+    Copy-Item -LiteralPath $nativeAudioLicenses -Destination (Join-Path $licenses 'discord-audio') -Recurse
     Copy-Item -LiteralPath assets/fonts/OFL.txt -Destination (Join-Path $licenses 'Inter-OFL.txt')
     Copy-Item -LiteralPath assets/icons/LICENSE.txt -Destination (Join-Path $licenses 'Phosphor-MIT.txt')
     Copy-Item -LiteralPath packaging/START-HERE.txt -Destination $stage
     @('Microsoft Visual C++ Runtime', 'App-local redistributable files from the Visual Studio x64 CRT distribution.', 'Copyright Microsoft Corporation. All rights reserved.', 'https://visualstudio.microsoft.com/license-terms/') | Set-Content -LiteralPath (Join-Path $licenses 'Microsoft-runtime.txt')
     # Preserve the installed distribution's actual notices. Articulate's license
-    # license does not relicense Microsoft's runtime files.
+    # does not relicense Microsoft's runtime files.
     Copy-Item -LiteralPath (Join-Path $vs 'Licenses/1033/Redist.txt') -Destination (Join-Path $licenses 'Microsoft-Redist.txt')
     Copy-Item -LiteralPath (Join-Path $vs 'Licenses/1033/ThirdPartyNotices.txt') -Destination (Join-Path $licenses 'Microsoft-ThirdPartyNotices.txt')
     $metadata = Join-Path $articulateRoot '.local/package-metadata.json'
     & cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc --features dynamic-backends | Set-Content -LiteralPath $metadata -Encoding utf8
     if ($LASTEXITCODE -ne 0) { throw 'Dependency metadata failed.' }
-    & $Python (Join-Path $PSScriptRoot 'collect-license-notices.py') $metadata (Join-Path $licenses 'rust')
+    $runtimeTree = Join-Path $articulateRoot '.local/package-runtime-tree.txt'
+    & cargo tree --locked --target x86_64-pc-windows-msvc --features dynamic-backends -e normal --prefix none --format '{p}' | Set-Content -LiteralPath $runtimeTree -Encoding utf8
+    if ($LASTEXITCODE -ne 0) { throw 'Runtime dependency tree failed.' }
+    & $Python (Join-Path $PSScriptRoot 'collect-license-notices.py') $metadata (Join-Path $licenses 'rust') --runtime-tree $runtimeTree
     if ($LASTEXITCODE -ne 0) { throw 'License collection failed.' }
     # Reject developer data and machine paths before an artifact can leave staging.
     foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File) {
@@ -122,4 +143,7 @@ try {
     $env:CARGO_ENCODED_RUSTFLAGS = $oldFlags
     $env:CARGO_TARGET_DIR = $oldTarget
     $env:ARTICULATE_RESOURCE = $oldResource
+    $env:ARTICULATE_NATIVE_AUDIO_DIR = $oldNativeAudio
+    $env:ARTICULATE_ASSORT_MODELS_DIR = $oldAssortModels
+    $env:PATH = $oldPath
 }

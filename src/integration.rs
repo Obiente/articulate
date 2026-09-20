@@ -158,14 +158,99 @@ mod win {
             Ok(ui.cast()?)
         }
     }
-    fn same(ui: &IUIAutomation, target: Target, field: &IUIAutomationElement) -> bool {
-        platform::target() == Some(target)
-            && unsafe {
-                ui.GetFocusedElement()
-                    .and_then(|now| ui.CompareElements(field, &now))
-                    .is_ok_and(|v| v.as_bool())
-                    && field.CurrentHasKeyboardFocus().is_ok_and(|v| v.as_bool())
+    #[test]
+    #[ignore = "Read-only diagnostic of the currently focused external editor"]
+    fn focused_editor_capabilities() {
+        assert_eq!(
+            std::env::var("ARTICULATE_EDITOR_DIAGNOSTIC").as_deref(),
+            Ok("1")
+        );
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).unwrap();
+        }
+        let _com = Com;
+        let ui = automation().unwrap();
+        let target = platform::target().expect("Focus the external editor first");
+        let field = unsafe { ui.GetFocusedElement() }.unwrap();
+        println!(
+            "same={}; editable={:?}; live={:?}",
+            same(&ui, target, &field),
+            editable(&field).map_err(|e| e.to_string()),
+            crate::live::win::Session::new(&field)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        );
+        unsafe {
+            println!(
+                "control={:?}; focused={:?}; value_pattern={}; text_pattern={}",
+                field.CurrentControlType(),
+                field.CurrentHasKeyboardFocus(),
+                field
+                    .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                    .is_ok(),
+                field
+                    .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                    .is_ok()
+            );
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Focus {
+        Same,
+        Changed,
+        Unavailable,
+    }
+    fn focus(ui: &IUIAutomation, target: Target, field: &IUIAutomationElement) -> Focus {
+        if platform::target() != Some(target) {
+            return Focus::Changed;
+        }
+        unsafe {
+            match ui
+                .GetFocusedElement()
+                .and_then(|now| ui.CompareElements(field, &now))
+            {
+                Ok(equal) if !equal.as_bool() => Focus::Changed,
+                Ok(_)
+                    if field
+                        .CurrentHasKeyboardFocus()
+                        .is_ok_and(|value| value.as_bool()) =>
+                {
+                    Focus::Same
+                }
+                _ => Focus::Unavailable,
             }
+        }
+    }
+    fn same(ui: &IUIAutomation, target: Target, field: &IUIAutomationElement) -> bool {
+        // Chromium accessibility providers can briefly stop answering during a
+        // render. Retry reads only; a real focus change still rejects immediately.
+        for attempt in 0..3 {
+            match focus(ui, target, field) {
+                Focus::Same => return true,
+                Focus::Changed => return false,
+                Focus::Unavailable if attempt < 2 => std::thread::sleep(Duration::from_millis(20)),
+                Focus::Unavailable => return false,
+            }
+        }
+        false
+    }
+    fn arm(ui: &IUIAutomation, id: u64, target: Target, use_live: bool) -> Result<Armed> {
+        let field = unsafe { ui.GetFocusedElement() }
+            .context("Windows could not read the focused field. Focus the editor and try again.")?;
+        ensure!(
+            same(ui, target, &field),
+            "Focus changed before dictation started."
+        );
+        editable(&field)?;
+        let live = use_live
+            .then(|| crate::live::win::Session::new(&field).ok())
+            .flatten();
+        Ok(Armed {
+            id,
+            target,
+            field,
+            live,
+        })
     }
     fn editable(field: &IUIAutomationElement) -> Result<()> {
         unsafe {
@@ -290,34 +375,25 @@ mod win {
         let _com = initialized.then_some(Com);
         let ui = initialized.then(automation).and_then(Result::ok);
         let mut armed: Option<Armed> = None;
+        let mut insertion_failure: Option<String> = None;
         let mut watch: Option<Watch> = None;
         let mut polled = Instant::now();
         loop {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(Action::Cancel) => {
                     armed = None;
+                    insertion_failure = None;
                     watch = None;
                 }
                 Ok(Action::StopLearning) => watch = None,
                 Ok(Action::Arm(id, target, use_live)) => {
                     watch = None;
-                    armed = ui
+                    let result = ui
                         .as_ref()
-                        .and_then(|ui| unsafe { ui.GetFocusedElement().ok() })
-                        .filter(|field| {
-                            same(ui.as_ref().unwrap(), target, field) && editable(field).is_ok()
-                        })
-                        .map(|field| {
-                            let live = use_live
-                                .then(|| crate::live::win::Session::new(&field).ok())
-                                .flatten();
-                            Armed {
-                                id,
-                                target,
-                                field,
-                                live,
-                            }
-                        });
+                        .context("Windows text-field access is unavailable")
+                        .and_then(|ui| arm(ui, id, target, use_live));
+                    insertion_failure = result.as_ref().err().map(|error| format!("{error:#}"));
+                    armed = result.ok();
                     if use_live {
                         emit(Event::LiveSupport(
                             id,
@@ -353,7 +429,8 @@ mod win {
                         })
                     })()
                     .map_err(|e| format!("{e:#}"));
-                    if result.is_err() {
+                    if let Err(error) = &result {
+                        insertion_failure = Some(error.clone());
                         armed = None;
                     }
                     emit(Event::Previewed(id, result));
@@ -369,6 +446,14 @@ mod win {
                     let result = ui
                         .as_ref()
                         .context("Windows text-field access is unavailable")
+                        .and_then(|ui| {
+                            if armed.is_none()
+                                && let Some(error) = insertion_failure.take()
+                            {
+                                anyhow::bail!("{error}");
+                            }
+                            Ok(ui)
+                        })
                         .and_then(|ui| insert(ui, armed.take(), id, target, &text, learn, &cancel));
                     let result = result
                         .map(|next| {
@@ -391,9 +476,10 @@ mod win {
             };
             if armed
                 .as_ref()
-                .is_some_and(|a| !same(ui, a.target, &a.field))
+                .is_some_and(|a| focus(ui, a.target, &a.field) == Focus::Changed)
             {
                 armed = None;
+                insertion_failure = Some("Focus changed. Your transcript is ready to copy.".into());
             }
             let Some(w) = watch.as_mut() else {
                 continue;
@@ -438,6 +524,40 @@ mod win {
         #[test]
         #[ignore = "Interactive: focus an empty disposable TextPattern field; this test replaces its dictated text repeatedly"]
         fn native_live_revisions_and_final_insertion_keep_up_with_own_edits() {
+            live_revisions(
+                &[
+                    "Send the notes to Jon.",
+                    "Send the notes to John.",
+                    "Send the notes to John. café 😀",
+                    "Send the notes to John. café 😃 Ready.",
+                    "Send the notes to John. café 😃",
+                ],
+                "Send the notes to John. café 😃 Finished.",
+            );
+        }
+
+        #[test]
+        #[ignore = "Interactive Discord test: revises only synthetic plain text in an empty composer; never sends a message"]
+        fn discord_live_plain_text_revisions_and_empty_editor_recovery() {
+            assert_eq!(
+                std::env::var("ARTICULATE_EDITOR_TEST_APP").as_deref(),
+                Ok("discord.exe")
+            );
+            live_revisions(
+                &[
+                    "Send the notes to Jon.",
+                    "Send the notes to John.",
+                    "Send the notes to John. café résumé",
+                    "Send the notes to John. café résumé Ready.",
+                    "Send the notes to John. café résumé",
+                    "",
+                    "Send the notes to John. café résumé",
+                ],
+                "Send the notes to John. café résumé Finished.",
+            );
+        }
+
+        fn live_revisions(revisions: &[&str], final_text: &str) {
             assert_eq!(std::env::var("TRANSCRIBE_UI_TEST").as_deref(), Ok("1"));
             println!(
                 "Focus an empty disposable text field within five seconds. Leave the caret untouched until the result."
@@ -449,11 +569,69 @@ mod win {
             let _com = Com;
             let ui = automation().unwrap();
             let target = platform::target().expect("A disposable app must have focus");
+            if let Ok(expected_app) = std::env::var("ARTICULATE_EDITOR_TEST_APP") {
+                assert_eq!(
+                    platform::app_name(target).as_deref(),
+                    Some(expected_app.as_str()),
+                    "The authorized test app must remain focused"
+                );
+            }
             let field = unsafe { ui.GetFocusedElement().unwrap() };
-            assert_eq!(
-                contents(&field).as_deref(),
-                Some(""),
+            // A failed prior run can leave one of these exact synthetic values.
+            // Resume without ever clearing an arbitrary draft or sending Enter.
+            let old_value = contents(&field).unwrap();
+            if [
+                "Send the notes to Jon.",
+                "Send the notes to John. café \n\u{fffc}\n:grinning:\n\u{feff}\n\u{feff}",
+                "Send the notes to John. café résumé Finished.",
+            ]
+            .contains(&old_value.as_str())
+            {
+                if old_value.contains('\u{fffc}') {
+                    println!("Synthetic rich value: {:?}", unsafe {
+                        field
+                            .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                            .and_then(|value| value.CurrentValue())
+                    });
+                }
+                let pattern: IUIAutomationTextPattern =
+                    unsafe { field.GetCurrentPatternAs(UIA_TextPatternId).unwrap() };
+                unsafe {
+                    pattern.DocumentRange().unwrap().Select().unwrap();
+                }
+                for _ in 0..20 {
+                    if unsafe {
+                        pattern
+                            .GetSelection()
+                            .and_then(|ranges| ranges.GetElement(0))
+                            .and_then(|range| range.GetText(100))
+                            .is_ok_and(|value| value == old_value.as_str())
+                    } {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                platform::replace_selection(target, "", || {
+                    same(&ui, target, &field)
+                        && contents(&field).as_deref() == Some(old_value.as_str())
+                        && unsafe {
+                            pattern
+                                .GetSelection()
+                                .and_then(|ranges| ranges.GetElement(0))
+                                .and_then(|range| range.GetText(100))
+                                .is_ok_and(|value| value == old_value.as_str())
+                        }
+                })
+                .unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(
+                matches!(contents(&field).as_deref(), Some("" | "\u{feff}\n")),
                 "The disposable text field must be empty"
+            );
+            println!(
+                "Empty editor: {:?}",
+                crate::live::win::Session::diagnostic_snapshot(&field)
             );
             let (tx, rx) = crate::integration::start(|| {});
             tx.send(Action::Arm(41, target, true)).unwrap();
@@ -464,13 +642,7 @@ mod win {
                 ),
                 "The chosen field must expose a live TextPattern"
             );
-            for text in [
-                "Send the notes to Jon.",
-                "Send the notes to John.",
-                "Send the notes to John. café 😀",
-                "Send the notes to John. café 😃 Ready.",
-                "Send the notes to John. café 😃",
-            ] {
+            for &text in revisions {
                 tx.send(Action::Preview {
                     id: 41,
                     target,
@@ -480,16 +652,25 @@ mod win {
                 .unwrap();
                 match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                     Event::Previewed(41, Ok(())) => {}
-                    Event::Previewed(_, result) => panic!("Live revision paused: {result:?}"),
+                    Event::Previewed(_, result) => panic!(
+                        "Live revision paused: {result:?}; snapshot={:?}",
+                        crate::live::win::Session::diagnostic_snapshot(&field)
+                    ),
                     _ => panic!("Expected a live revision acknowledgement"),
                 }
-                assert_eq!(
-                    contents(&field).as_deref(),
-                    Some(text),
-                    "Only the dictated span should be revised"
-                );
+                if text.is_empty() {
+                    assert!(matches!(
+                        contents(&field).as_deref(),
+                        Some("" | "\u{feff}\n")
+                    ));
+                } else {
+                    assert_eq!(
+                        contents(&field).as_deref(),
+                        Some(text),
+                        "Only the dictated span should be revised"
+                    );
+                }
             }
-            let final_text = "Send the notes to John. café 😃 Finished.";
             tx.send(Action::Insert {
                 id: 41,
                 target,

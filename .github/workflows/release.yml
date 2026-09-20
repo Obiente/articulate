@@ -40,14 +40,7 @@ jobs:
           rustup default stable
       - name: Validate and package
         shell: pwsh
-        run: |
-          cargo fmt --check
-          if ($LASTEXITCODE -ne 0) { throw 'Formatting failed.' }
-          $env:PATH = (Join-Path $PWD '.local/native/install/bin') + ';' + $env:PATH
-          ./scripts/build-windows.ps1 -Test
-          cargo clippy --release --locked --features dynamic-backends --all-targets -- -D warnings
-          if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
-          ./scripts/package-windows.ps1
+        run: ./scripts/package-windows.ps1 -Validate
       - name: Preserve artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

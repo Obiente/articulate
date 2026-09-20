@@ -11,14 +11,19 @@ fn style_name(style: WritingStyle) -> &'static str {
 
 impl App {
     pub(super) fn shortcut_preferences(&mut self, ui: &mut egui::Ui, idle: bool) {
-        ui.label(RichText::new(self.settings.hotkey.label()).color(ACCENT));
-        ui.label(
-            RichText::new(
-                "Press once to start, again to finish. Choose Type live to write into another app.",
-            )
-            .small()
-            .color(theme::MUTED),
-        );
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label("Keyboard shortcut");
+                ui.label(
+                    RichText::new("Start or finish dictation from any app.")
+                        .small()
+                        .color(theme::MUTED),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                theme::keycap(ui, &self.settings.hotkey.label());
+            });
+        });
         ui.collapsing("Change keyboard shortcut", |ui| {
             ui.add_enabled_ui(idle && !self.hotkey_pending, |ui| {
                 ui.horizontal_wrapped(|ui| {

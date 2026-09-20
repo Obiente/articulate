@@ -2,7 +2,10 @@
 //!
 //! The renderer observer reads only current voice membership and speaking state.
 //! Its lease removes its own listeners even if this process disappears.
+pub mod avatar;
+pub mod install;
 pub mod launch;
+pub mod pcm;
 pub mod plugin;
 
 use std::{
@@ -33,6 +36,8 @@ pub struct Participant {
     pub name: String,
     pub speaking: bool,
     pub is_self: bool,
+    #[serde(default)]
+    pub avatar: Option<avatar::Avatar>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +70,7 @@ struct State {
 }
 
 struct Shared {
+    pcm: pcm::Hub,
     state: Mutex<State>,
     stopped: AtomicBool,
     wake: Condvar,
@@ -80,6 +86,7 @@ pub struct Connection {
 impl Connection {
     pub fn start() -> Arc<Self> {
         let shared = Arc::new(Shared {
+            pcm: pcm::Hub::default(),
             state: Mutex::new(State {
                 snapshot: Snapshot {
                     status: Status::Connecting,
@@ -117,6 +124,28 @@ impl Connection {
             .unwrap_or_else(|e| e.into_inner())
             .snapshot
             .clone()
+    }
+    pub fn is_running(&self) -> bool {
+        !self.shared.stopped()
+            && self
+                .worker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+    }
+    pub fn native_audio_ready(&self) -> bool {
+        self.shared.pcm.ready()
+            && self.snapshot().observation.is_some_and(|o| {
+                o.valid && o.at.elapsed() <= Duration::from_millis(750) && o.channel_id.is_some()
+            })
+    }
+    pub fn start_native_audio(&self) -> Result<pcm::Capture> {
+        let observation = self
+            .snapshot()
+            .observation
+            .context("Discord voice membership is unavailable")?;
+        self.shared.pcm.begin(&observation)
     }
 
     /// Includes the most recent state at or before `from` for interval attribution.
@@ -414,6 +443,9 @@ fn valid_sample(sample: &Sample) -> bool {
             && !p.name.is_empty()
             && p.name.chars().count() <= 128
             && !p.name.chars().any(char::is_control)
+            && p.avatar
+                .as_ref()
+                .is_none_or(|avatar| avatar.valid() && avatar.user_id == p.id)
     })
 }
 
@@ -704,6 +736,7 @@ mod tests {
         fn connection() -> Arc<Connection> {
             Arc::new(Connection {
                 shared: Arc::new(Shared {
+                    pcm: pcm::Hub::default(),
                     state: Mutex::new(State {
                         snapshot: Snapshot {
                             status: Status::Connecting,
@@ -736,6 +769,7 @@ mod tests {
                 name: "Example".into(),
                 speaking: true,
                 is_self: false,
+                avatar: None,
             }],
         });
         assert_eq!(
@@ -847,6 +881,7 @@ mod tests {
             name: "Example".into(),
             speaking: true,
             is_self: false,
+            avatar: None,
         };
         let mut sample = Sample {
             time: 0.0,
@@ -900,6 +935,7 @@ mod tests {
     fn disconnect_clears_current_identity_and_marks_history_invalid() {
         let now = Instant::now();
         let shared = Shared {
+            pcm: pcm::Hub::default(),
             state: Mutex::new(State {
                 snapshot: Snapshot {
                     status: Status::Connecting,
@@ -922,6 +958,7 @@ mod tests {
                 name: "Example".into(),
                 speaking: true,
                 is_self: false,
+                avatar: None,
             }],
             valid: true,
         });

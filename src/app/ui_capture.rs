@@ -6,7 +6,12 @@ fn populated_app() -> App {
     app.page = 3;
     app.preview_inflight = false;
     app.call_status = "Call transcript ready".into();
-    app.speaker_names = ["Alex".into(), "Sam".into(), String::new(), String::new()];
+    app.speaker_names = [
+        "Casey".into(),
+        "Jordan".into(),
+        String::new(),
+        String::new(),
+    ];
     for index in 0..16 {
         app.call_rows.push(calls::Row {
             start_ms: index * 14000,
@@ -20,6 +25,67 @@ fn populated_app() -> App {
                 _ => "I'll check the final details tomorrow and send an update. This gives us a useful record to come back to.",
             }.into(),
         });
+    }
+    app
+}
+
+fn page_app(page: &str) -> App {
+    let mut app = match page {
+        "history" => populated_history_app(false),
+        "reader" => populated_history_app(true),
+        _ => populated_app(),
+    };
+    match page {
+        "notes" => {
+            app.call_tab = 1;
+            app.call_rows.truncate(3);
+            app.call_committed = app.call_rows.clone();
+        }
+        "discord-setup" => {
+            app.call_tab = 2;
+            let defaults = (
+                app.settings.discord_auto_connect,
+                app.settings.discord_auto_transcribe,
+            );
+            app.prepare_companion_capture();
+            // This harness calls surface only, never connection polling. Preserve
+            // actual preference defaults without opening any Discord connection.
+            app.settings.discord_auto_connect = defaults.0;
+            app.settings.discord_auto_transcribe = defaults.1;
+        }
+        "calls" => {
+            app.call = Some(call_capture::Control::new());
+            app.call_status = "Listening to your microphone and call audio".into();
+            app.call_rows.truncate(4);
+            for (index,text) in ["The new onboarding feels much clearer. I think we should keep the first step focused on getting a good microphone level.", "Agreed. Once someone finishes their first recording, we can show them where their transcript is saved.", "I will update the checklist and share it before tomorrow. Let us keep the download step short and explain what happens next.", "And we should also make sure..."].iter().enumerate() {
+                app.call_rows[index].text=(*text).into();
+                app.call_rows[index].microphone=index>=2;
+                app.call_rows[index].speakers=vec![if index==0 {1}else{2}];
+            }
+            app.call_committed = app.call_rows[..3].to_vec();
+            let mut session = crate::history::Session::new(crate::history::Kind::Call);
+            session.title = "Weekly check-in".into();
+            app.history.call = Some(session);
+        }
+
+        "dictate" => {
+            app.page = 0;
+            app.text = "Hi Casey, could you review the updated plan before tomorrow? I moved the launch check-in to Thursday at three.".into();
+            app.raw = app.text.clone();
+            app.status = "Your transcript is ready".into();
+        }
+        "vocabulary" => {
+            app.page = 1;
+            app.populate_editor_capture(false);
+        }
+        "shortcuts" => {
+            app.page = 4;
+            app.populate_editor_capture(true);
+        }
+        "settings" => {
+            app.page = 2;
+        }
+        _ => {}
     }
     app
 }
@@ -104,7 +170,9 @@ fn capture_calls_ui() {
     }
     impl eframe::App for Capture {
         fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-            if self.card {
+            if std::env::var_os("ARTICULATE_UI_ASSORT_MODELS").is_some() {
+                egui::CentralPanel::default().show(ctx, |ui| self.app.assort_settings_ui(ui));
+            } else if self.card {
                 let snapshot = crate::discord::Snapshot {
                     status: crate::discord::Status::Ready,
                     observation: Some(crate::discord::Observation {
@@ -119,6 +187,7 @@ fn capture_calls_ui() {
                                 id: format!("synthetic-{index}"),
                                 name: name.into(),
                                 speaking: index == 1 || index == 3,
+                                avatar: None,
                                 is_self: index == 0,
                             })
                             .collect(),
@@ -192,10 +261,14 @@ fn capture_calls_ui() {
         Box::new(move |cc| {
             theme::configure(&cc.egui_ctx);
             Ok(Box::new(Capture {
-                app: match std::env::var("ARTICULATE_UI_HISTORY").as_deref() {
-                    Ok("list") => populated_history_app(false),
-                    Ok("detail") => populated_history_app(true),
-                    _ => populated_app(),
+                app: if let Ok(page) = std::env::var("ARTICULATE_UI_PAGE") {
+                    page_app(&page)
+                } else {
+                    match std::env::var("ARTICULATE_UI_HISTORY").as_deref() {
+                        Ok("list") => populated_history_app(false),
+                        Ok("detail") => populated_history_app(true),
+                        _ => populated_app(),
+                    }
                 },
                 output,
                 frames: 0,
@@ -204,4 +277,104 @@ fn capture_calls_ui() {
         }),
     )
     .unwrap();
+}
+
+#[test]
+fn library_save_stays_visible_at_supported_sizes() {
+    for (page, label) in [
+        ("shortcuts", "Save shortcut"),
+        ("vocabulary", "Save correction"),
+    ] {
+        for (width, height) in [(850.0, 620.0), (1200.0, 840.0), (1920.0, 1080.0)] {
+            let mut app = page_app(page);
+            let ctx = egui::Context::default();
+            theme::configure(&ctx);
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| app.surface(ctx),
+                ));
+            }
+            let output = output.unwrap();
+            let shape = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape
+                        && text.galley.job.text == label
+                    {
+                        Some((
+                            shape.clip_rect,
+                            text.galley.rect.translate(text.pos.to_vec2()),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .expect("Save shortcut must be rendered");
+            assert!(
+                shape.0.contains_rect(shape.1),
+                "Save clipped at {width}x{height}: {shape:?}"
+            );
+            assert!(shape.1.bottom() < height - 44.0, "Save overlaps footer");
+        }
+    }
+}
+
+#[test]
+fn live_calls_keep_reading_space_with_follow_controls() {
+    for (width, height, minimum) in [
+        (850.0, 620.0, 300.0),
+        (1200.0, 840.0, 450.0),
+        (1920.0, 1080.0, 680.0),
+    ] {
+        let mut app = populated_app();
+        app.call = Some(call_capture::Control::new());
+        let ctx = egui::Context::default();
+        theme::configure(&ctx);
+        let mut output = None;
+        for _ in 0..3 {
+            output = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, height),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.surface(ctx),
+            ));
+        }
+        let output = output.unwrap();
+        let clip = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text)
+                    if app
+                        .call_rows
+                        .iter()
+                        .any(|row| text.galley.job.text == row.text) =>
+                {
+                    Some(shape.clip_rect)
+                }
+                _ => None,
+            })
+            .expect("Live transcript renders");
+        assert!(
+            clip.height() >= minimum,
+            "Live transcript too short at {width}x{height}: {clip:?}"
+        );
+        assert!(
+            clip.bottom() <= height - 44.0,
+            "Live transcript overlaps footer"
+        );
+    }
 }

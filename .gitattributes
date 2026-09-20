@@ -1,0 +1,2 @@
+# Model manifests verify exact payload bytes on every platform.
+assets/assort/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

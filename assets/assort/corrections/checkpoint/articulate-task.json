@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "task": "corrections",
+  "question": {
+    "id": "correction",
+    "text": "Should this proposed dictionary correction replace the original text?",
+    "candidates": [
+      {
+        "id": "keep_original",
+        "description": "Keep the original text unchanged; the replacement is unsafe, unconfirmed, ambiguous, or out of scope."
+      },
+      {
+        "id": "replace",
+        "description": "Apply this confirmed dictionary replacement in its matching context without changing meaning."
+      }
+    ]
+  }
+}

@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 
+mod native;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Row {
     pub start_ms: u64,
@@ -57,6 +59,8 @@ pub fn append_rows(transcript: &mut Vec<Row>, incoming: Vec<Row>) {
 
 pub enum Update {
     Started,
+    /// Native capture is armed; true means an authenticated PCM frame arrived.
+    NativeAudio(bool),
     Levels(f32, f32),
     /// Replace the current uncommitted text as more audio context arrives.
     Preview(Vec<Row>),
@@ -67,6 +71,7 @@ pub struct Request {
     pub microphone: Option<String>,
     pub output: Option<String>,
     pub cpu: bool,
+    pub native_audio: bool,
     pub control: Arc<Control>,
 }
 
@@ -105,6 +110,42 @@ pub fn process_window(
         });
     }
     rows.sort_by_key(|r| r.start_ms);
+    Ok(rows)
+}
+
+fn process_activity_window(
+    engine: &mut Engine,
+    mic: &[f32],
+    remote: &[f32],
+    offset_ms: u64,
+    segments: &[crate::discord_attribution::ActivitySegment],
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    let text = engine.transcribe(mic)?;
+    if !text.is_empty() {
+        rows.push(Row {
+            start_ms: offset_ms,
+            end_ms: offset_ms + mic.len() as u64 / 16,
+            microphone: true,
+            speakers: Vec::new(),
+            discord: None,
+            text,
+        });
+    }
+    for segment in segments {
+        let text = engine.transcribe(&remote[segment.audio_start..segment.audio_end])?;
+        if !text.is_empty() {
+            rows.push(Row {
+                start_ms: offset_ms + segment.start as u64 / 16,
+                end_ms: offset_ms + segment.end as u64 / 16,
+                microphone: false,
+                speakers: Vec::new(),
+                discord: Some(segment.attribution.clone()),
+                text,
+            });
+        }
+    }
+    rows.sort_by_key(|row| row.start_ms);
     Ok(rows)
 }
 
@@ -149,7 +190,10 @@ fn quiet_tail(pcm: &[f32]) -> bool {
 }
 
 pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)) -> Result<()> {
-    let mut tracker = Tracker::new(request.cpu)?;
+    if request.native_audio {
+        return native::run(engine, request, update);
+    }
+    let mut tracker: Option<Tracker> = None;
     if request.control.abort.load(Ordering::Relaxed)
         || request.control.stop_ns.load(Ordering::SeqCst) != 0
     {
@@ -165,7 +209,7 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
     let mut cursor = 0.0;
     let mut draft_start = 0.0;
     let mut draft = Draft::default();
-    let mut checkpoint = tracker.checkpoint();
+    let mut checkpoint = None;
     let result = (|| -> Result<()> {
         loop {
             if request.control.abort.load(Ordering::Relaxed) {
@@ -188,24 +232,52 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                 }
                 draft.mic.extend(microphone.take_until(end)?);
                 draft.remote.extend(output.take_until(end)?);
-                tracker.restore(&checkpoint);
-                let mut rows = process_window(
-                    engine,
-                    &mut tracker,
-                    &draft.mic,
-                    &draft.remote,
-                    (draft_start * 1000.0) as u64,
-                )?;
-                if let Some(discord) = request.control.discord()
-                    && let Some(origin) = request.control.origin()
-                {
-                    let from = origin + Duration::from_secs_f64(draft_start);
-                    let to = origin + Duration::from_secs_f64(end);
-                    let history = discord.history(from, to);
-                    for row in &mut rows {
-                        row.discord = crate::discord_attribution::identify(row, origin, &history);
+                let offset_ms = (draft_start * 1000.0) as u64;
+                let discord_context = request.control.discord().zip(request.control.origin()).map(
+                    |(discord, origin)| {
+                        let from = origin + Duration::from_secs_f64(draft_start);
+                        let to = origin + Duration::from_secs_f64(end);
+                        (origin, discord.history(from, to))
+                    },
+                );
+                let activity = discord_context.as_ref().and_then(|(origin, history)| {
+                    crate::discord_attribution::plan_activity(
+                        *origin,
+                        offset_ms,
+                        draft.remote.len(),
+                        history,
+                    )
+                });
+                let rows = if let Some(segments) = activity {
+                    process_activity_window(
+                        engine,
+                        &draft.mic,
+                        &draft.remote,
+                        offset_ms,
+                        &segments,
+                    )?
+                } else {
+                    if tracker.is_none() {
+                        let fallback=Tracker::new(request.cpu).map_err(|error|anyhow::anyhow!("Speaker activity is unavailable and acoustic speaker recognition could not load: {error}. Prepare speaker recognition in call Setup for offline fallback."))?;
+                        checkpoint = Some(fallback.checkpoint());
+                        tracker = Some(fallback);
                     }
-                }
+                    let fallback = tracker.as_mut().expect("fallback was initialized");
+                    fallback.restore(
+                        checkpoint
+                            .as_ref()
+                            .expect("fallback checkpoint initialized"),
+                    );
+                    let mut rows =
+                        process_window(engine, fallback, &draft.mic, &draft.remote, offset_ms)?;
+                    if let Some((origin, history)) = &discord_context {
+                        for row in &mut rows {
+                            row.discord =
+                                crate::discord_attribution::identify(row, *origin, history);
+                        }
+                    }
+                    rows
+                };
                 draft.rows = rows;
                 cursor = end;
                 if draft.endpoint() || (stopping && cursor >= now) {
@@ -213,7 +285,7 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                     update(Update::Rows(std::mem::take(&mut draft.rows)));
                     draft.mic.clear();
                     draft.remote.clear();
-                    checkpoint = tracker.checkpoint();
+                    checkpoint = tracker.as_ref().map(Tracker::checkpoint);
                     draft_start = cursor;
                 } else {
                     update(Update::Preview(draft.rows.clone()));
@@ -465,6 +537,7 @@ mod tests {
             generation: 1,
             channel_id: "synthetic-channel".into(),
             speakers: vec![crate::discord_attribution::NamedSpeaker {
+                avatar: None,
                 id: id.into(),
                 name: name.into(),
             }],

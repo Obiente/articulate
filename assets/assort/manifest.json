@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "models": [
+    {
+      "task": "notes",
+      "id": "articulate-notes-v1",
+      "files": [
+        {
+          "path": "notes/checkpoint/manifest.json",
+          "sha256": "afe7e4d2d66226444b6c13b079570683a04920c0c2732ef62ac03a3fcb1b116b"
+        },
+        {
+          "path": "notes/checkpoint/weights.mpk",
+          "sha256": "25bce3bde07c89a54db964c35f1407304411f5c10f3bc2eff617d015ef060b22"
+        },
+        {
+          "path": "notes/tokenizer.json",
+          "sha256": "206a16453fa8cd7d80e11f26c64c34b44cad045f7a9ad0815705786189483f02"
+        },
+        {
+          "path": "notes/inference-limits.json",
+          "sha256": "e948c432f0dde89743571a27098eaa8643e4c848a5fb96e8dba9e51c7e0b069f"
+        },
+        {
+          "path": "notes/evaluation.json",
+          "sha256": "2612ad38fc7a0475dbc49ef094c6e0638e382f29785fb2b5ab44c4c2ca1fb87b"
+        },
+        {
+          "path": "notes/LICENSE.txt",
+          "sha256": "57c8ff33c9c0cfc3ef00e650a1cc910d7ee479a8bc509f6c9209a7c2a11399d6"
+        },
+        {
+          "path": "notes/checkpoint/transcript-pipeline.json",
+          "sha256": "49f290bf3ae23e3e3e76a696cd6290fee32cc4ce5b2bb574cb24b54253075b06"
+        }
+      ]
+    },
+    {
+      "task": "corrections",
+      "id": "articulate-corrections-v1",
+      "files": [
+        {
+          "path": "corrections/checkpoint/manifest.json",
+          "sha256": "20c7c6d10ba71fa2b4099079dc69c4e973f07e8db094f3ee01a17e40dc349b27"
+        },
+        {
+          "path": "corrections/checkpoint/weights.mpk",
+          "sha256": "7daff93567c05578a0e317ac3a158db11bdf45d308c68e3f8c216cdc2e3cbe0a"
+        },
+        {
+          "path": "corrections/tokenizer.json",
+          "sha256": "ba3381f3ef743adec2d6ced0b09057f8dee89fbdc56ea303af3b14ba8ced9b84"
+        },
+        {
+          "path": "corrections/inference-limits.json",
+          "sha256": "84be99abe1c5a9c295a1cef6a4af7f8cb70654a13b0a5d487757473a57f143aa"
+        },
+        {
+          "path": "corrections/evaluation.json",
+          "sha256": "9fc522eee9674fbd0c180d07bbe1a7f5ea6718a2725f4b44551fb7b792be1f02"
+        },
+        {
+          "path": "corrections/LICENSE.txt",
+          "sha256": "57c8ff33c9c0cfc3ef00e650a1cc910d7ee479a8bc509f6c9209a7c2a11399d6"
+        },
+        {
+          "path": "corrections/checkpoint/articulate-task.json",
+          "sha256": "8d18e74cbee9b2163c06a8683c799d460d7203d2ec0e50f4f3560eb4b9f847b4"
+        }
+      ]
+    }
+  ]
+}

@@ -31,6 +31,8 @@ $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Componen
 if (!$vs) { throw 'Install Visual Studio Build Tools with Desktop development with C++' }
 Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
 Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+& (Join-Path $PSScriptRoot 'build-discord-native.ps1')
+if ($LASTEXITCODE -ne 0 -or !$env:ARTICULATE_NATIVE_AUDIO_DIR) { throw 'Native Discord adapter build failed' }
 
 # Release archives contain DLLs, not the import .lib used by MSVC's linker.
 # Generate the import library from their actual exports, without altering DLLs.
@@ -50,11 +52,14 @@ elseif ($Check) { & cargo clippy --release --locked --features dynamic-backends 
 else { & cargo build --release --locked --features dynamic-backends }
 if ($LASTEXITCODE -ne 0) { throw 'Rust build or checks failed' }
 if (!$Test -and !$Check) {
-    Copy-Item -LiteralPath "$bundle\licenses" -Destination (Join-Path $root 'target\release') -Recurse -Force
-    $articulateNotices = Join-Path $root 'target\release\licenses\articulate'
+    $targetRoot = if ($env:CARGO_TARGET_DIR) { [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR) } else { Join-Path $root 'target' }
+    $binaryDirectory = Join-Path $targetRoot 'release'
+    Copy-Item -Path "$bundle\*.dll" -Destination $binaryDirectory -Force
+    Copy-Item -LiteralPath "$bundle\licenses" -Destination $binaryDirectory -Recurse -Force
+    $articulateNotices = Join-Path $binaryDirectory 'licenses\articulate'
     New-Item -ItemType Directory -Force $articulateNotices | Out-Null
     Copy-Item -LiteralPath (Join-Path $root 'assets\LICENSES.md') -Destination $articulateNotices -Force
     Copy-Item -LiteralPath (Join-Path $root 'assets\fonts\OFL.txt') -Destination (Join-Path $articulateNotices 'Inter-OFL.txt') -Force
     Copy-Item -LiteralPath (Join-Path $root 'assets\icons\LICENSE.txt') -Destination (Join-Path $articulateNotices 'Phosphor-LICENSE.txt') -Force
-    Write-Host 'Ready: target\release\transcribe-local.exe'
+    Write-Host "Ready: $(Join-Path $binaryDirectory 'articulate.exe')"
 }

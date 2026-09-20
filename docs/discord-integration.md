@@ -17,7 +17,7 @@ Names and activity are held in bounded process memory. Copied or saved transcrip
 Developers can check connectivity without capturing audio:
 
 ```powershell
-.\target\release\transcribe-local.exe --discord-check --seconds 10
+.\target\release\articulate.exe --discord-check --seconds 10
 ```
 
 The check prints aggregate counts, not names or account IDs.

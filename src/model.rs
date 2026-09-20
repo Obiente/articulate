@@ -22,8 +22,7 @@ pub fn default_path() -> PathBuf {
     data_dir().join("models").join(NAME)
 }
 
-// This is the only networking code in the application. No audio, text, IDs,
-// settings or dictionary data are included in this request.
+// No audio, text, IDs, settings or dictionary data are included in this request.
 pub fn download(mut progress: impl FnMut(f32)) -> Result<PathBuf> {
     download_file(NAME, SIZE, SHA256, URL, &mut progress)
 }

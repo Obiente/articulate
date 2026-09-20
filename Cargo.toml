@@ -1,8 +1,8 @@
 [package]
-name = "transcribe-local"
-version = "0.1.0"
+name = "articulate"
+version = "0.1.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.92"
 description = "Your words, ready to use. Local dictation and call transcripts."
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/Obiente/articulate"
@@ -13,11 +13,23 @@ default = []
 dynamic-backends = ["transcribe-cpp/dynamic-backends"]
 vulkan = ["transcribe-cpp/vulkan"]
 
+[build-dependencies]
+serde_json = "1"
+sha2 = "0.10"
+
 [dependencies]
+assort-core = { git = "https://github.com/Obiente/assort.git", rev = "d6cf161ac6db63ba221cfef6e9d7975d09f38d6d" }
+assort-data = { git = "https://github.com/Obiente/assort.git", rev = "d6cf161ac6db63ba221cfef6e9d7975d09f38d6d" }
+assort-inference = { git = "https://github.com/Obiente/assort.git", rev = "d6cf161ac6db63ba221cfef6e9d7975d09f38d6d" }
+assort-model = { git = "https://github.com/Obiente/assort.git", rev = "d6cf161ac6db63ba221cfef6e9d7975d09f38d6d" }
+assort-tokenizer = { git = "https://github.com/Obiente/assort.git", rev = "d6cf161ac6db63ba221cfef6e9d7975d09f38d6d" }
+assort-transcript = { git = "https://github.com/Obiente/assort.git", rev = "d6cf161ac6db63ba221cfef6e9d7975d09f38d6d" }
+burn = { version = "=0.21.0", default-features = false, features = ["std", "flex"] }
 anyhow = "1"
 cpal = "0.16"
 eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
-egui_extras = { version = "0.33.3", default-features = false, features = ["svg"] }
+egui_extras = { version = "0.33.3", default-features = false, features = ["svg", "image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 hound = "3.5"
 ringbuf = "0.4"
 rubato = "0.16"
@@ -31,7 +43,7 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.3", features = ["Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 winit = { version = "0.30", default-features = false }
@@ -44,3 +56,6 @@ strip = "debuginfo"
 
 [profile.dev]
 opt-level = 1
+# Full type debug information from the model backend exceeds MSVC's PDB limit.
+# Keep source/line information while making development and test links reliable.
+debug = 1

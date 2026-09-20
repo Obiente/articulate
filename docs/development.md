@@ -15,7 +15,7 @@ Build once with Rust and Visual Studio C++ Build Tools installed:
 
 The build script needs GitHub CLI (`gh`) and downloads a pinned, SHA-256 verified CPU/Vulkan runtime. It constructs an MSVC import library from the official DLL's exports and links the matching `transcribe-cpp` 0.2.3 bindings. DLLs must stay beside the executable. The runtime selects a compatible CPU implementation; GPU acceleration uses Vulkan if available.
 
-In Settings, choose **Download recommended model**, or enter a compatible GGUF model path and choose **Load local model**. Model downloads require internet; the optional Discord connector communicates only with the local Discord client. Once a model is installed, dictation works offline. Models and preferences retain the existing `%LOCALAPPDATA%\TranscribeLocal` location so upgrading to Articulate preserves your local library. The executable keeps its existing `transcribe-local.exe` name for launch-script compatibility.
+In Settings, choose **Download recommended model**, or enter a compatible GGUF model path and choose **Load local model**. Model downloads require internet; the optional Discord connector communicates only with the local Discord client. Once a model is installed, dictation works offline. Models and preferences retain the existing `%LOCALAPPDATA%\TranscribeLocal` location so upgrading to Articulate preserves your local library. The Cargo package and executable are named `articulate`; the installer presents it as Articulate.
 
 Choose a microphone in Settings, click **Start dictation**, and speak. Provisional text appears while you speak and is revised with additional context. Dictation continues until you stop it, committing sections near quiet boundaries about every 18 to 20 seconds. Click **Finish dictation** to check the remaining audio. Edit or copy the result. **Ctrl+Alt+Space** toggles recording by default. Change it in **Settings > Change keyboard shortcut** using Ctrl, Alt, Shift, Win and a supported key. Apply the change without restarting; if Windows rejects it, the previous binding remains active. Choose **Type live** in Dictate (or insertion on finish in Settings), click an editable field in another app, and use the shortcut to start and finish. A small, non-focusing indicator shows recording and completion. With **Type into the app while I speak** enabled, provisional text appears directly in supported fields and is revised as speech recognition gains context. Only the changed suffix of the current dictation is replaced. The final pass revises the same text instead of appending a duplicate. Moving the caret, changing the selection, editing the field, or switching fields pauses live typing; dictation continues inside Articulate. Fields without a usable TextPattern receive text after you finish.
 
@@ -48,7 +48,7 @@ The microphone track is labelled **You**. Calls use the same loaded speech model
 
 The pinned native diarizer exposes offline windows, not a usable persistent public streaming API. This app prepends a bounded clean voice reference for each established speaker and remaps each new window by reference overlap. This is best-effort continuity, not guaranteed stable identity. The trailing transcript refreshes after roughly two seconds of new audio plus inference time. A bounded draft stays revisable until both tracks are quiet or the 24-second context cap is reached. A call itself has no duration cap. Slower CPUs combine pending audio into the next revision. Brief diarizer changes are grouped into contiguous speech blocks so ASR receives more context; mixed speaker blocks remain uncertain instead of assigning generated words to guessed timestamps. Short replies are retained. Window boundaries can still affect words and punctuation. No automatic text cleanup is applied to call transcripts. Consecutive sections from the same identified speaker share one label. **Copy transcript** copies the grouped, timestamped transcript, and **History** retains saved sessions locally.
 
-**Create notes** selects up to six verbatim highlights and eight possible action excerpts from the current transcript, with speaker labels and source time ranges. Selection uses local word frequency and English decision/action cues. These are extractive notes, not a generative summary, and possible actions need review. Existing notes refresh with transcript revisions; speaker renames are reflected immediately. Notes are saved with their transcript for later review in **History**.
+**Create notes** uses the included pretrained Assort classifier to suggest up to six verbatim highlights, with speaker labels and source time ranges. Review suggestions before adding them. These are extractive notes, not a generative summary. An advanced fallback uses local word frequency and English decision/action cues. Notes are saved with their transcript for later review in **History**.
 
 ## Saved sessions
 
@@ -81,13 +81,13 @@ Use the [offline accuracy evaluator](../scripts/accuracy.md) with reference tran
 .\scripts\build-windows.ps1 -Test
 .\scripts\build-windows.ps1 -Check
 cargo fmt --all -- --check
-.\target\release\transcribe-local.exe --devices
-.\target\release\transcribe-local.exe --transcribe sample.wav --repeat 3
-.\target\release\transcribe-local.exe --transcribe sample.wav --cpu --repeat 3
-.\target\release\transcribe-local.exe --transcribe sample.wav --model alternate.gguf
-.\target\release\transcribe-local.exe --transcribe sample.wav --live
-.\target\release\transcribe-local.exe --call-file multi-speaker.wav
-.\target\release\transcribe-local.exe --capture-check
+.\target\release\articulate.exe --devices
+.\target\release\articulate.exe --transcribe sample.wav --repeat 3
+.\target\release\articulate.exe --transcribe sample.wav --cpu --repeat 3
+.\target\release\articulate.exe --transcribe sample.wav --model alternate.gguf
+.\target\release\articulate.exe --transcribe sample.wav --live
+.\target\release\articulate.exe --call-file multi-speaker.wav
+.\target\release\articulate.exe --capture-check
 ```
 
 The CLI emits JSON with text, actual backend, audio duration, model-load time, and inference time. Model load (including GPU warmup) and warm inference are reported separately. The first GPU setup may take tens of seconds while shaders compile. `--live` replays growing audio prefixes as fast as inference permits, for inspecting provisional revisions; it is not a wall-clock latency benchmark. WAV import supports integer PCM and float audio, with resampling and mono mixing. Use actual speaker recordings to compare word error rate and errors in names, numbers, dates, and negations. Synthetic speech and public samples are smoke tests, not evidence of performance on a particular person's voice.
@@ -97,7 +97,7 @@ The optional real-engine contract test uses a locally installed model and suppli
 ```powershell
 $env:TRANSCRIBE_DIR = Join-Path $PWD '.local\native\install'
 $env:TRANSCRIBE_TEST_WAV = 'sample.wav'
-cargo test --release --features dynamic-backends -- --ignored
+cargo test --release --features dynamic-backends engine::tests::local_inference_cancellation_and_reuse -- --ignored --exact
 ```
 
 An alternative source-build path is `cargo build --release` for a static CPU build, or `cargo build --release --features vulkan` with the Vulkan SDK and a working CMake C++ environment. The supplied Windows script avoids the native CMake build by using the verified upstream runtime. Building and testing the static/source configurations on a hardware matrix remains separate work.

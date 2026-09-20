@@ -1,6 +1,6 @@
 use super::*;
 use crate::history::{Event as HistoryEvent, Kind, Session, Summary, Worker};
-use theme::{INK, MUTED, SURFACE};
+use theme::{INK, MUTED};
 
 #[derive(Default)]
 pub(super) struct State {
@@ -14,6 +14,8 @@ pub(super) struct State {
     pub dictation_deleted: bool,
     pub call_deleted: bool,
     pub search: String,
+    pub kind_filter: usize,
+    pub detail_search: String,
     pub error: Option<String>,
     pub notice: String,
     pub rename: String,
@@ -217,7 +219,7 @@ impl App {
     pub(super) fn history_ui(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
         ui.spacing_mut().button_padding = egui::vec2(12.0, 6.0);
-        ui.spacing_mut().interact_size.y = 30.0;
+        ui.spacing_mut().interact_size.y = 38.0;
         if let Some(error) = self.history.error.clone() {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(Color32::LIGHT_YELLOW, "Could not save or open history.");
@@ -245,7 +247,7 @@ impl App {
             return;
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("History").size(28.0));
+            ui.label(RichText::new("Your history").size(36.0));
             ui.label(
                 RichText::new(format!("{} saved", self.history.items.len()))
                     .small()
@@ -258,18 +260,25 @@ impl App {
             }
         });
         ui.label(
-            RichText::new("Transcripts and notes stay on this device until you delete them.")
+            RichText::new("Transcripts and notes, saved on this device.")
                 .small()
                 .color(MUTED),
         );
         ui.add(
             egui::TextEdit::singleline(&mut self.history.search)
-                .hint_text("Search titles or words")
+                .hint_text("Search titles or previews")
+                .margin(egui::vec2(14.0, 12.0))
                 .desired_width(f32::INFINITY),
         );
         if !self.history.notice.is_empty() {
             ui.label(RichText::new(&self.history.notice).small().color(ACCENT));
         }
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.history.kind_filter, 0, "All");
+            ui.selectable_value(&mut self.history.kind_filter, 1, "Dictations");
+            ui.selectable_value(&mut self.history.kind_filter, 2, "Calls");
+        });
+        ui.add_space(14.0);
         let query = self.history.search.trim().to_lowercase();
         let mut open = None;
         let mut count = 0;
@@ -277,7 +286,13 @@ impl App {
             .id_salt("history_list")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                let mut previous_date = String::new();
                 for item in &self.history.items {
+                    if (self.history.kind_filter == 1 && !matches!(item.kind, Kind::Dictation))
+                        || (self.history.kind_filter == 2 && !matches!(item.kind, Kind::Call))
+                    {
+                        continue;
+                    }
                     if !query.is_empty()
                         && !format!("{} {}", item.title, item.preview)
                             .to_lowercase()
@@ -286,35 +301,61 @@ impl App {
                         continue;
                     }
                     count += 1;
+                    let day = date(item.created_ms);
+                    if previous_date != day {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new(&day).size(18.0));
+                        ui.add_space(6.0);
+                        previous_date = day;
+                    }
                     egui::Frame::new()
-                        .fill(SURFACE)
+                        .fill(Color32::TRANSPARENT)
                         .corner_radius(16)
                         .inner_margin(14.0)
                         .show(ui, |ui| {
                             ui.set_min_width((ui.available_width() - 1.0).max(0.0));
-                            ui.horizontal_wrapped(|ui| {
-                                if ui
-                                    .add(
-                                        egui::Button::new(
-                                            RichText::new(&item.title).size(18.0).color(INK),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .clicked()
-                                {
-                                    open = Some(item.id.clone());
-                                }
-                                ui.label(
-                                    RichText::new(kind_name(&item.kind)).small().color(ACCENT),
+                            ui.horizontal(|ui| {
+                                ui.add(if matches!(item.kind, Kind::Call) {
+                                    theme::Icon::Phone.image(28.0, INK)
+                                } else {
+                                    theme::Icon::Mic.image(28.0, INK)
+                                });
+                                let width = ui.available_width();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(width * 0.4, 66.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_min_width(width * 0.4);
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    RichText::new(&item.title)
+                                                        .size(18.0)
+                                                        .color(INK),
+                                                )
+                                                .frame(false),
+                                            )
+                                            .clicked()
+                                        {
+                                            open = Some(item.id.clone());
+                                        }
+                                        ui.label(
+                                            RichText::new(kind_name(&item.kind))
+                                                .small()
+                                                .color(MUTED),
+                                        );
+                                    },
                                 );
-                                ui.label(RichText::new(date(item.created_ms)).small().color(MUTED));
+                                ui.vertical(|ui| {
+                                    ui.set_max_width((width * 0.53).max(180.0));
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&item.preview).color(MUTED))
+                                            .wrap(),
+                                    );
+                                });
                             });
-                            ui.add(
-                                egui::Label::new(RichText::new(&item.preview).color(MUTED))
-                                    .truncate(),
-                            );
                         });
-                    ui.add_space(4.0);
+                    ui.separator();
                 }
                 if count == 0 {
                     ui.add_space(28.0);
@@ -367,11 +408,24 @@ impl App {
                     .as_ref()
                     .is_some_and(|s| s.id == session.id));
         let mut remove = false;
+        if ui
+            .add(egui::Button::new("Back to history").frame(false))
+            .clicked()
+        {
+            keep_selected = false;
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new(&session.title).size(34.0));
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Back to history").clicked() {
-                keep_selected = false;
-            }
-            if ui.button("Copy transcript").clicked() {
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Copy transcript").color(Color32::from_rgb(13, 34, 30)),
+                    )
+                    .fill(ACCENT),
+                )
+                .clicked()
+            {
                 self.history.notice = match platform::copy(&session.text) {
                     Ok(()) => "Transcript copied".into(),
                     Err(error) => error.to_string(),
@@ -425,7 +479,7 @@ impl App {
                 self.history.confirm_delete = true;
             }
         });
-        ui.label(RichText::new(&session.title).size(25.0));
+
         ui.label(
             RichText::new(format!(
                 "{} · {} · Saved on this device",
@@ -482,65 +536,98 @@ impl App {
             if !session.original.is_empty() && session.original != session.text {
                 ui.selectable_value(&mut self.history.detail_tab, 2, "Original");
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.history.detail_search)
+                        .hint_text("Find words or a speaker")
+                        .desired_width(260.0)
+                        .margin(egui::vec2(10.0, 8.0)),
+                );
+            });
         });
-        egui::ScrollArea::vertical()
-            .id_salt(("history_detail", &session.id, self.history.detail_tab))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if self.history.detail_tab == 1 {
-                    if let Some(notes) = &session.notes {
-                        let text = notes.text(&session.speaker_names);
-                        ui.horizontal(|ui| {
-                            if ui.button("Copy notes").clicked() {
-                                self.history.notice = match platform::copy(&text) {
-                                    Ok(()) => "Notes copied".into(),
-                                    Err(error) => error.to_string(),
-                                };
-                            }
-                            if ui.button("Export notes").clicked() {
-                                self.history.notice = match crate::export_file::save(&text, "txt") {
-                                    Ok(true) => "Notes exported".into(),
-                                    Ok(false) => "Export cancelled".into(),
-                                    Err(error) => error.to_string(),
-                                };
-                            }
-                        });
-                        ui.add(egui::Label::new(RichText::new(text).size(18.0)).selectable(true));
-                    }
-                } else if self.history.detail_tab == 2 {
-                    ui.add(
-                        egui::Label::new(RichText::new(&session.original).size(18.0))
-                            .selectable(true),
-                    );
-                } else if session.rows.is_empty() {
-                    ui.add(
-                        egui::Label::new(RichText::new(&session.text).size(19.0)).selectable(true),
-                    );
-                } else {
-                    for row in &session.rows {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(calls::label(row, &session.speaker_names))
-                                    .strong()
-                                    .color(ACCENT),
-                            );
-                            ui.label(
-                                RichText::new(format!(
-                                    "{:02}:{:02}",
-                                    row.start_ms / 60_000,
-                                    row.start_ms / 1000 % 60
-                                ))
-                                .small()
-                                .color(MUTED),
-                            );
-                        });
-                        ui.add(
-                            egui::Label::new(RichText::new(&row.text).size(18.0)).selectable(true),
-                        );
-                        ui.add_space(18.0);
-                    }
+        ui.separator();
+        let available = ui.available_rect_before_wrap();
+        let rail = available.width() > 1020.0 && !session.rows.is_empty();
+        if rail {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(available.right() - 220.0, available.top() + 12.0),
+                available.max,
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                theme::people(ui, &session.rows, &session.speaker_names, &self.avatars);
+                if session.notes.is_some() && ui.button("Open notes").clicked() {
+                    self.history.detail_tab = 1;
                 }
             });
+        }
+        let width = if rail {
+            available.width() - 260.0
+        } else {
+            available.width()
+        };
+        let reader =
+            egui::Rect::from_min_size(available.min, egui::vec2(width, available.height()));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(reader), |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(("history_detail", &session.id, self.history.detail_tab))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_max_width(840.0_f32.min(width));
+                    ui.add_space(16.0);
+                    if self.history.detail_tab == 1 {
+                        if let Some(notes) = &session.notes {
+                            let text = notes.text(&session.speaker_names);
+                            ui.horizontal(|ui| {
+                                if ui.button("Copy notes").clicked() {
+                                    self.history.notice = match platform::copy(&text) {
+                                        Ok(()) => "Notes copied".into(),
+                                        Err(error) => error.to_string(),
+                                    };
+                                }
+                                if ui.button("Export notes").clicked() {
+                                    self.history.notice =
+                                        match crate::export_file::save(&text, "txt") {
+                                            Ok(true) => "Notes exported".into(),
+                                            Ok(false) => "Export cancelled".into(),
+                                            Err(error) => error.to_string(),
+                                        };
+                                }
+                            });
+                            ui.add(
+                                egui::Label::new(RichText::new(text).size(18.0)).selectable(true),
+                            );
+                        }
+                    } else if self.history.detail_tab == 2 {
+                        ui.add(
+                            egui::Label::new(RichText::new(&session.original).size(18.0))
+                                .selectable(true),
+                        );
+                    } else if session.rows.is_empty() {
+                        ui.add(
+                            egui::Label::new(RichText::new(&session.text).size(19.0))
+                                .selectable(true),
+                        );
+                    } else {
+                        let query = self.history.detail_search.trim().to_lowercase();
+                        let mut first = true;
+                        for row in &session.rows {
+                            if !query.is_empty()
+                                && !row.text.to_lowercase().contains(&query)
+                                && !calls::label(row, &session.speaker_names)
+                                    .to_lowercase()
+                                    .contains(&query)
+                            {
+                                continue;
+                            }
+                            if !first {
+                                ui.add_space(24.0);
+                            }
+                            first = false;
+                            theme::transcript_row(ui, row, &session.speaker_names, &self.avatars);
+                        }
+                    }
+                });
+        });
         if remove && let Some(worker) = &self.history.worker {
             worker.delete(session.id.clone());
             self.history.confirm_delete = false;

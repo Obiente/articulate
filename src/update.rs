@@ -273,6 +273,10 @@ fn agent(seconds: u64) -> ureq::Agent {
 }
 
 fn check_release() -> Result<Option<Release>> {
+    check_release_for(env!("CARGO_PKG_VERSION"))
+}
+
+fn check_release_for(current: &str) -> Result<Option<Release>> {
     let mut response = agent(30)
         .get(API)
         .header(
@@ -291,7 +295,7 @@ fn check_release() -> Result<Option<Release>> {
     select_release(
         serde_json::from_slice(&bytes)
             .context("The update service returned invalid release information.")?,
-        env!("CARGO_PKG_VERSION"),
+        current,
     )
 }
 
@@ -434,6 +438,19 @@ fn verify_reader(reader: &mut impl Read, size: u64, digest: &[u8; 32]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "Downloads the latest public installer from GitHub; never launches it"]
+    fn published_installer_download_passes_the_real_update_path() {
+        let release = check_release_for("0.0.0")
+            .expect("fetch public release")
+            .expect("a public release newer than 0.0.0");
+        let request = download_release(&release, |_| {}).expect("download verified installer");
+        let mut file = fs::File::open(&request.path).expect("download exists");
+        verify_reader(&mut file, request.size, &request.digest).expect("installer unchanged");
+        drop(file);
+        fs::remove_file(&request.path).expect("remove this test's installer");
+        fs::remove_dir(request.path.parent().unwrap()).expect("remove empty test folder");
+    }
     fn fixture(version: &str) -> ApiRelease {
         let name = format!("Articulate-{version}-windows-x86_64-setup.exe");
         ApiRelease {

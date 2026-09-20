@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "architecture": "assort-candidate-scoring-v1",
+  "burn_version": "0.21.0",
+  "config": {
+    "vocab_size": 488,
+    "hidden_size": 64,
+    "num_heads": 4,
+    "state_layers": 1,
+    "query_layers": 1,
+    "ffn_size": 128,
+    "max_positions": 512,
+    "dropout": 0.2,
+    "candidate_state_attention": false,
+    "max_attention_elements": 16777216
+  },
+  "tokenizer": {
+    "kind": "huggingface-json-v1",
+    "fingerprint": "206a16453fa8cd7d80e11f26c64c34b44cad045f7a9ad0815705786189483f02",
+    "vocab_size": 488,
+    "pad_id": 0
+  },
+  "weights_status": "trained",
+  "weights_sha256": "25bce3bde07c89a54db964c35f1407304411f5c10f3bc2eff617d015ef060b22"
+}

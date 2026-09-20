@@ -147,3 +147,190 @@ pub(super) fn keycap(ui: &mut egui::Ui, label: &str) {
             ui.label(RichText::new(label).size(13.0));
         });
 }
+
+/// A shared reading rhythm for live calls and saved transcripts.
+pub(super) fn transcript_row(
+    ui: &mut egui::Ui,
+    row: &calls::Row,
+    names: &[String; 4],
+    avatars: &crate::discord::avatar::Cache,
+) {
+    ui.push_id((row.start_ms, row.microphone, &row.text), |ui| {
+        ui.horizontal(|ui| {
+            if let Some(named) = row
+                .discord
+                .as_ref()
+                .filter(|named| named.speakers.len() == 1)
+                .and_then(|named| named.speakers.first())
+            {
+                avatar(ui, &named.name, named.avatar.as_ref(), avatars, 26.0);
+            }
+            ui.label(
+                RichText::new(calls::label(row, names))
+                    .size(17.0)
+                    .color(ACCENT),
+            );
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(format!(
+                    "{:02}:{:02}",
+                    row.start_ms / 60_000,
+                    row.start_ms / 1000 % 60
+                ))
+                .small()
+                .color(MUTED),
+            );
+        });
+        ui.add_space(2.0);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            &row.text,
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(20.0),
+                color: INK,
+                line_height: Some(30.0),
+                ..Default::default()
+            },
+        );
+        ui.add(egui::Label::new(job).wrap().selectable(true));
+    });
+}
+
+pub(super) fn people(
+    ui: &mut egui::Ui,
+    rows: &[calls::Row],
+    names: &[String; 4],
+    avatars: &crate::discord::avatar::Cache,
+) {
+    ui.label(RichText::new("In this conversation").size(18.0));
+    ui.add_space(14.0);
+    let mut people: Vec<(String, String, Option<crate::discord::avatar::Avatar>)> = Vec::new();
+    for row in rows {
+        if let Some(named) = &row.discord {
+            for speaker in &named.speakers {
+                let key = speaker
+                    .avatar
+                    .as_ref()
+                    .map(|avatar| avatar.user_id.clone())
+                    .unwrap_or_else(|| {
+                        if speaker.id.is_empty() {
+                            speaker.name.clone()
+                        } else {
+                            speaker.id.clone()
+                        }
+                    });
+                if !people.iter().any(|person| person.0 == key) {
+                    people.push((key, speaker.name.clone(), speaker.avatar.clone()));
+                }
+            }
+        } else {
+            let label = calls::label(row, names);
+            if !people.iter().any(|person| person.0 == label) {
+                people.push((label.clone(), label, None));
+            }
+        }
+    }
+    for (_, label, picture) in people.iter().take(32) {
+        ui.horizontal_wrapped(|ui| {
+            avatar(ui, label, picture.as_ref(), avatars, 34.0);
+            ui.label(label);
+        });
+        ui.add_space(8.0);
+    }
+    ui.separator();
+    ui.label(
+        RichText::new("Transcripts stay on this device.")
+            .small()
+            .color(MUTED),
+    );
+}
+
+fn avatar(
+    ui: &mut egui::Ui,
+    label: &str,
+    picture: Option<&crate::discord::avatar::Avatar>,
+    cache: &crate::discord::avatar::Cache,
+    size: f32,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    if let Some(picture) = picture {
+        cache.request(picture);
+        if let Some(bytes) = cache.bytes(picture) {
+            egui::Image::from_bytes(picture.uri(), bytes)
+                .fit_to_exact_size(rect.size())
+                .corner_radius(egui::CornerRadius::same((size * 0.5) as u8))
+                .paint_at(ui, rect);
+            return;
+        }
+    }
+    ui.painter()
+        .circle_filled(rect.center(), size * 0.5, Color32::from_rgb(32, 58, 52));
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label.chars().next().unwrap_or('?'),
+        egui::FontId::proportional(size * 0.47),
+        INK,
+    );
+}
+
+pub(super) fn preference_switch(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    title: &str,
+    description: &str,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let text_width = (ui.available_width() - 80.0).max(180.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(text_width, 46.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.label(RichText::new(title).size(16.0));
+                ui.label(RichText::new(description).small().color(MUTED));
+            },
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let (rect, mut response) =
+                ui.allocate_exact_size(egui::vec2(44.0, 24.0), egui::Sense::click());
+            if response.clicked() {
+                *value = !*value;
+                response.mark_changed();
+                changed = true;
+            }
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Checkbox,
+                    ui.is_enabled(),
+                    *value,
+                    title,
+                )
+            });
+            let t = ui.ctx().animate_bool_with_time(response.id, *value, 0.14);
+            let fill = if *value { ACCENT } else { LINE };
+            ui.painter().rect_filled(
+                rect,
+                12.0,
+                if ui.is_enabled() {
+                    fill
+                } else {
+                    fill.gamma_multiply(0.4)
+                },
+            );
+            let center = egui::pos2(rect.left() + 12.0 + t * 20.0, rect.center().y);
+            ui.painter().circle_filled(center, 9.0, INK);
+            if response.has_focus() {
+                ui.painter().rect_stroke(
+                    rect.expand(3.0),
+                    14.0,
+                    egui::Stroke::new(1.0_f32, ACCENT),
+                    egui::StrokeKind::Outside,
+                );
+            }
+        });
+    });
+    ui.separator();
+    changed
+}

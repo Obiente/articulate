@@ -25,8 +25,8 @@ letters, digits, underscores, or hyphens. An empty reference can test silence.
 From the repository root in PowerShell:
 
 ```powershell
-python scripts/evaluate.py .local/accuracy/manifest.json --exe target/release/transcribe-local.exe > .local/accuracy/gpu-report.json
-python scripts/evaluate.py .local/accuracy/manifest.json --exe target/release/transcribe-local.exe --cpu > .local/accuracy/cpu-report.json
+python scripts/evaluate.py .local/accuracy/manifest.json --exe target/release/articulate.exe > .local/accuracy/gpu-report.json
+python scripts/evaluate.py .local/accuracy/manifest.json --exe target/release/articulate.exe --cpu > .local/accuracy/cpu-report.json
 python -B -m unittest discover -s scripts -p "test_evaluate.py"
 ```
 

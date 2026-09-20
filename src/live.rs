@@ -21,6 +21,13 @@ struct FieldText {
 
 #[cfg(any(windows, test))]
 impl FieldText {
+    // Slate exposes an empty editor as a zero-width marker and a synthetic
+    // paragraph break. Both disappear on its first input. Recognize only the
+    // observed empty caret layout, never trim characters from real content.
+    fn empty_placeholder(&self) -> bool {
+        self.matches("\u{feff}\n", "\u{feff}", "", "\n")
+    }
+
     fn consistent(&self) -> bool {
         self.document == format!("{}{}{}", self.left, self.selected, self.right)
     }
@@ -60,7 +67,9 @@ impl OwnUpdate<'_> {
     fn observe(&mut self, field: &FieldText) -> Acknowledgement {
         let wanted_left = format!("{}{}", self.left, self.inserted);
         let wanted = format!("{}{}", wanted_left, self.right);
-        if field.matches(&wanted, &wanted_left, "", self.right) {
+        if field.matches(&wanted, &wanted_left, "", self.right)
+            || (wanted.is_empty() && field.empty_placeholder())
+        {
             self.confirmations += 1;
             return if self.confirmations >= 2 {
                 Acknowledgement::Confirmed
@@ -88,7 +97,7 @@ impl OwnUpdate<'_> {
 #[cfg(windows)]
 pub mod win {
     use crate::platform::{self, Target};
-    use anyhow::{Result, ensure};
+    use anyhow::{Context, Result, ensure};
     use windows::Win32::UI::Accessibility::*;
 
     pub struct Session {
@@ -100,6 +109,7 @@ pub mod win {
         suffix: String,
         previous: String,
         written: bool,
+        empty_placeholder: bool,
     }
     fn selection(pattern: &IUIAutomationTextPattern) -> Result<IUIAutomationTextRange> {
         unsafe {
@@ -149,6 +159,12 @@ pub mod win {
         }
     }
     impl Session {
+        #[cfg(test)]
+        pub fn diagnostic_snapshot(field: &IUIAutomationElement) -> Result<String> {
+            let pattern: IUIAutomationTextPattern =
+                unsafe { field.GetCurrentPatternAs(UIA_TextPatternId)? };
+            Ok(format!("{:?}", snapshot(&pattern)?.0))
+        }
         pub fn new(field: &IUIAutomationElement) -> Result<Self> {
             unsafe {
                 let pattern: IUIAutomationTextPattern =
@@ -158,11 +174,17 @@ pub mod win {
                     field.consistent(),
                     "This app does not expose a stable text selection"
                 );
+                let empty_placeholder = field.empty_placeholder();
                 Ok(Self {
+                    empty_placeholder,
                     pattern,
                     selected: field.selected,
                     current: field.document.clone(),
-                    before: field.document,
+                    before: if empty_placeholder {
+                        String::new()
+                    } else {
+                        field.document
+                    },
                     prefix: field.left,
                     suffix: field.right,
                     previous: String::new(),
@@ -196,7 +218,18 @@ pub mod win {
             if next == self.previous {
                 return Ok(());
             }
-            let expected = format!("{}{}{}", self.prefix, next, self.suffix);
+            let replacing_placeholder = self.empty_placeholder && !self.written;
+            let output_prefix = if replacing_placeholder {
+                ""
+            } else {
+                &self.prefix
+            };
+            let output_suffix = if replacing_placeholder {
+                ""
+            } else {
+                &self.suffix
+            };
+            let expected = format!("{output_prefix}{next}{output_suffix}");
             ensure!(
                 expected.len() <= 16000,
                 "Live typing paused in this large field. Your transcript continues in Articulate."
@@ -284,6 +317,51 @@ pub mod win {
                     );
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
+                if !selected && self.written && !old_tail.is_empty() {
+                    // Some Chromium editors expose accurate text ranges but
+                    // silently ignore a subrange Select(). Extend the verified
+                    // caret with real navigation, checking every selection before
+                    // taking another step. Never guess deletion counts.
+                    let original_left = format!("{}{}", self.prefix, self.previous);
+                    let (mut prior, _) = snapshot(&self.pattern)?;
+                    ensure!(
+                        prior.matches(&self.current, &original_left, "", &self.suffix),
+                        "The caret changed before selection. Live typing paused."
+                    );
+                    for _ in 0..old_tail.chars().count().min(256) {
+                        platform::select_previous_character(target, || {
+                            guard()
+                                && snapshot(&self.pattern).is_ok_and(|(field, _)| field == prior)
+                        })?;
+                        let mut advanced = None;
+                        for _ in 0..20 {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            ensure!(guard(), "Focus changed. Live typing paused.");
+                            let (field, _) = snapshot(&self.pattern)?;
+                            if !field.consistent() || field == prior {
+                                continue;
+                            }
+                            let expected_left = original_left.strip_suffix(&field.selected);
+                            ensure!(
+                                field.document == self.current
+                                    && field.right == self.suffix
+                                    && old_tail.ends_with(&field.selected)
+                                    && field.selected.len() > prior.selected.len()
+                                    && expected_left == Some(field.left.as_str()),
+                                "The selection changed unexpectedly. Live typing paused."
+                            );
+                            advanced = Some(field);
+                            break;
+                        }
+                        prior = advanced.context(
+                            "The app did not confirm keyboard selection. Live typing paused.",
+                        )?;
+                        if prior.matches(&self.current, &replacement_left, old_tail, &self.suffix) {
+                            selected = true;
+                            break;
+                        }
+                    }
+                }
                 ensure!(
                     selected,
                     "The app did not confirm the selection. Live typing paused."
@@ -301,9 +379,13 @@ pub mod win {
                 })?;
                 let mut acknowledgement = super::OwnUpdate {
                     before: &self.current,
-                    left: &replacement_left,
+                    left: if replacing_placeholder {
+                        ""
+                    } else {
+                        &replacement_left
+                    },
                     inserted: new_tail,
-                    right: &self.suffix,
+                    right: output_suffix,
                     confirmations: 0,
                 };
                 for _ in 0..24 {
@@ -314,8 +396,21 @@ pub mod win {
                         super::Acknowledgement::Confirmed => {
                             self.selected.clear();
                             self.previous = next.into();
-                            self.current = expected;
-                            self.written = true;
+                            if next.is_empty() && field.empty_placeholder() {
+                                self.current = field.document;
+                                self.prefix = field.left;
+                                self.suffix = field.right;
+                                self.empty_placeholder = true;
+                                self.written = false;
+                            } else {
+                                self.current = expected;
+                                if replacing_placeholder {
+                                    self.prefix.clear();
+                                    self.suffix.clear();
+                                }
+                                self.empty_placeholder = false;
+                                self.written = true;
+                            }
                             return Ok(());
                         }
                         super::Acknowledgement::Changed => {
@@ -352,6 +447,56 @@ mod tests {
             selected: selected.into(),
             right: right.into(),
         }
+    }
+
+    #[test]
+    fn slate_placeholder_is_exact_and_disappears_only_for_our_empty_editor_update() {
+        let placeholder = field("\u{feff}", "", "\n");
+        assert!(placeholder.empty_placeholder());
+        for ordinary in [
+            field("", "", "\n"),
+            field("text\u{feff}", "", "\n"),
+            field("\u{feff}", "\n", ""),
+            field("", "", "\u{feff}\n"),
+        ] {
+            assert!(!ordinary.empty_placeholder());
+        }
+        let mut insert = OwnUpdate {
+            before: "\u{feff}\n",
+            left: "",
+            inserted: "Hello.",
+            right: "",
+            confirmations: 0,
+        };
+        assert_eq!(insert.observe(&placeholder), Acknowledgement::Pending);
+        assert_eq!(
+            insert.observe(&field("Hello.", "", "")),
+            Acknowledgement::Pending
+        );
+        assert_eq!(
+            insert.observe(&field("Hello.", "", "")),
+            Acknowledgement::Confirmed
+        );
+        let mut remove = OwnUpdate {
+            before: "Hello.",
+            left: "",
+            inserted: "",
+            right: "",
+            confirmations: 0,
+        };
+        assert_eq!(remove.observe(&placeholder), Acknowledgement::Pending);
+        assert_eq!(remove.observe(&placeholder), Acknowledgement::Confirmed);
+        let mut wrong = OwnUpdate {
+            before: "\u{feff}\n",
+            left: "",
+            inserted: "Hello.",
+            right: "",
+            confirmations: 0,
+        };
+        assert_eq!(
+            wrong.observe(&field("Other text", "", "")),
+            Acknowledgement::Changed
+        );
     }
 
     #[test]

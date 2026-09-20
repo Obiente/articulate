@@ -1,0 +1,9 @@
+{
+  "max_batch_size": 1,
+  "max_questions": 8,
+  "max_candidates": 4,
+  "max_state_tokens": 384,
+  "max_question_tokens": 128,
+  "max_candidate_tokens": 64,
+  "max_padded_tokens": 262144
+}
