@@ -74,11 +74,14 @@ fn page_app(page: &str) -> App {
             app.history.call = Some(session);
         }
 
-        "dictate" | "correction-review" => {
+        "dictate" | "correction-review" | "polish" => {
             app.page = 0;
             app.text = "Hi Casey, could you review the updated plan before tomorrow? I moved the launch check-in to Thursday at three.".into();
             app.raw = app.text.clone();
             app.status = "Your transcript is ready".into();
+            if page == "polish" {
+                app.prepare_polish_capture();
+            }
             if page == "correction-review" {
                 app.prepare_assort_review_capture(false);
             }

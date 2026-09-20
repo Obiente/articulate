@@ -218,6 +218,7 @@ impl App {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        self.polish_button(ui);
                                         self.assort_correction_button(ui);
                                     },
                                 );
@@ -380,6 +381,7 @@ impl App {
                     });
                 if idle && !self.preview_inflight && !self.text.is_empty() {
                     self.assort_correction_ui(ui);
+                    self.polish_ui(ui);
                 }
                 self.learning_notice(ui);
                 if !self.ready && !self.loading && ui.button("Set up your speech model").clicked() {

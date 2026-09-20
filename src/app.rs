@@ -24,6 +24,7 @@ mod discord_ui;
 mod editors;
 mod file_picker;
 mod history_ui;
+mod polish_ui;
 mod preferences;
 mod shortcut_gesture;
 mod surface;
@@ -61,6 +62,7 @@ struct Settings {
     vencord_source: String,
     vencord_auto_update: bool,
     assort: assort_ui::Configuration,
+    polish_style: crate::polish::Style,
 }
 fn enabled() -> bool {
     true
@@ -90,6 +92,7 @@ impl Default for Settings {
             vencord_source: String::new(),
             vencord_auto_update: false,
             assort: Default::default(),
+            polish_style: Default::default(),
         }
     }
 }
@@ -112,6 +115,7 @@ enum Event {
 
 pub struct App {
     assort: assort_ui::State,
+    polish: polish_ui::State,
     updates: crate::update::State,
     pending_install: Option<crate::update::InstallRequest>,
     history: history_ui::State,
@@ -265,6 +269,7 @@ impl App {
             integration::start(move || integration_ctx.request_repaint());
         let mut app = Self {
             assort: assort_ui::State::configured(settings.assort.clone()),
+            polish: Default::default(),
             updates: Default::default(),
             pending_install: None,
             history: history_ui::State::start(),
@@ -979,6 +984,7 @@ impl App {
             self.shortcut_gesture = Default::default();
         }
         self.history_poll();
+        self.polish_poll();
         self.preview();
     }
 
@@ -1271,6 +1277,8 @@ impl App {
         ui.label(RichText::new(&self.status).small().color(muted));
 
                         ui.add_space(16.0);
+                        self.polish_settings_ui(ui);
+                        ui.separator();
                         self.assort_settings_ui(ui);
                         if ui.button("Speaker recognition and call audio").clicked() { self.page = 3; self.call_tab = 2; }
                     }
@@ -2443,6 +2451,7 @@ mod tests {
         (
             App {
                 assort: Default::default(),
+                polish: Default::default(),
                 updates: Default::default(),
                 pending_install: None,
                 history: history_ui::State::default(),
