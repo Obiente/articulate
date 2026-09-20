@@ -6,7 +6,7 @@
 lowercase a in the user-selected Articulate design. It uses a closed SVG path with
 an even-odd counter, with no font dependency or embedded raster image. The mark is
 part of this project's own visual identity and is distributed under the project's
-MIT license. It is not part of Inter or Phosphor Icons.
+AGPL-3.0-or-later license. It is not part of Inter or Phosphor Icons.
 
 ## Inter
 

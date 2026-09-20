@@ -74,12 +74,13 @@ try {
     $licenses = Join-Path $stage 'licenses'
     New-Item -ItemType Directory -Force $licenses | Out-Null
     Copy-Item -LiteralPath (Join-Path $native 'licenses') -Destination (Join-Path $licenses 'native') -Recurse
-    Copy-Item -LiteralPath LICENSE -Destination (Join-Path $licenses 'Articulate-MIT.txt')
+    Copy-Item -LiteralPath LICENSE -Destination (Join-Path $licenses 'Articulate-AGPL-3.0-or-later.txt')
+    Copy-Item -LiteralPath NOTICE -Destination (Join-Path $licenses 'Articulate-NOTICE.txt')
     Copy-Item -LiteralPath assets/fonts/OFL.txt -Destination (Join-Path $licenses 'Inter-OFL.txt')
     Copy-Item -LiteralPath assets/icons/LICENSE.txt -Destination (Join-Path $licenses 'Phosphor-MIT.txt')
     Copy-Item -LiteralPath packaging/START-HERE.txt -Destination $stage
     @('Microsoft Visual C++ Runtime', 'App-local redistributable files from the Visual Studio x64 CRT distribution.', 'Copyright Microsoft Corporation. All rights reserved.', 'https://visualstudio.microsoft.com/license-terms/') | Set-Content -LiteralPath (Join-Path $licenses 'Microsoft-runtime.txt')
-    # Preserve the installed distribution's actual notices. Articulate's MIT
+    # Preserve the installed distribution's actual notices. Articulate's license
     # license does not relicense Microsoft's runtime files.
     Copy-Item -LiteralPath (Join-Path $vs 'Licenses/1033/Redist.txt') -Destination (Join-Path $licenses 'Microsoft-Redist.txt')
     Copy-Item -LiteralPath (Join-Path $vs 'Licenses/1033/ThirdPartyNotices.txt') -Destination (Join-Path $licenses 'Microsoft-ThirdPartyNotices.txt')

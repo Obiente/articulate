@@ -125,7 +125,7 @@ Local recordings, diagnostics, builds, models and captures belong in ignored `.l
 
 ## Licenses
 
-Application: MIT. Qwen3-ASR model: Apache-2.0. Sortformer model: NVIDIA Open Model License. `transcribe.cpp` and `ggml`: MIT. The build copies the native runtime's supplied license notices beside the binary. Rust dependencies retain their respective licenses. Model weights are downloaded separately, not included in this repository.
+Application: AGPL-3.0-or-later. Qwen3-ASR model: Apache-2.0. Sortformer model: NVIDIA Open Model License. `transcribe.cpp` and `ggml`: MIT. The build copies the native runtime's supplied license notices beside the binary. Rust dependencies retain their respective licenses. Model weights are downloaded separately, not included in this repository.
 
 ## Writing styles and call exports
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Your words, ready to use. Local dictation and call transcripts."
-license = "MIT"
+license = "AGPL-3.0-or-later"
 repository = "https://github.com/Obiente/articulate"
 homepage = "https://github.com/Obiente/articulate"
 
