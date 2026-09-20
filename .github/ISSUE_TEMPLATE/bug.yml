@@ -1,0 +1,24 @@
+name: Bug report
+description: Something did not work as expected
+body:
+  - type: markdown
+    attributes:
+      value: Please remove private words, account names, recordings, and pairing keys before sharing examples.
+  - type: input
+    id: version
+    attributes:
+      label: Articulate version
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What happened?
+      description: Include steps, expected behavior, and actual result. Use a synthetic example where possible.
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Windows and hardware
+      description: Windows version, CPU, RAM, GPU, microphone, and whether CPU-only mode was selected.

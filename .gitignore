@@ -1,0 +1,15 @@
+/target/
+/.local/
+/models/
+*.wav
+*.gguf
+*.log
+*.part
+__pycache__/
+*.pyc
+/dist/
+/docs/acceptance.md
+/docs/feature-audit.md
+*.pdb
+*.ggml
+*.onnx

@@ -1,0 +1,792 @@
+use anyhow::{Result, bail};
+use std::sync::mpsc::Sender;
+
+/// A portable shortcut preference. Key names are independent of Windows codes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Hotkey {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub win: bool,
+    pub key: String,
+}
+
+pub const HOTKEY_KEYS: &[&str] = &[
+    "Space",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "0",
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5",
+    "F6",
+    "F7",
+    "F8",
+    "F9",
+    "F10",
+    "F11",
+    "F12",
+    "F13",
+    "F14",
+    "F15",
+    "F16",
+    "F17",
+    "F18",
+    "F19",
+    "F20",
+    "F21",
+    "F22",
+    "F23",
+    "F24",
+    "Tab",
+    "Enter",
+    "Escape",
+    "Backspace",
+    "Delete",
+    "Insert",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+    "ArrowUp",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+];
+
+impl Default for Hotkey {
+    fn default() -> Self {
+        Self {
+            ctrl: true,
+            alt: true,
+            shift: false,
+            win: false,
+            key: "Space".into(),
+        }
+    }
+}
+
+impl Hotkey {
+    pub fn validate(&self) -> Result<(), String> {
+        if !HOTKEY_KEYS.contains(&self.key.as_str()) {
+            return Err("Choose a supported shortcut key.".into());
+        }
+        if !(self.ctrl || self.alt || self.win) {
+            return Err("Include Ctrl, Alt, or Win so ordinary typing stays available.".into());
+        }
+        Ok(())
+    }
+
+    pub fn label(&self) -> String {
+        let mut parts = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.alt {
+            parts.push("Alt");
+        }
+        if self.shift {
+            parts.push("Shift");
+        }
+        if self.win {
+            parts.push("Win");
+        }
+        parts.push(&self.key);
+        parts.join(" + ")
+    }
+}
+
+#[derive(Debug)]
+pub enum HotkeyEvent {
+    Registered(Hotkey),
+    Pressed(Target),
+    Error { requested: Hotkey, message: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    window: isize,
+    focus: isize,
+    process: u32,
+}
+
+impl Target {
+    pub fn is_external(self) -> bool {
+        self.window != 0 && self.process != 0
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn shortcut_settings_round_trip_and_old_settings_use_default() {
+        assert_eq!(
+            serde_json::from_str::<Hotkey>("{}").unwrap(),
+            Hotkey::default()
+        );
+        let custom = Hotkey {
+            ctrl: false,
+            alt: true,
+            shift: true,
+            win: true,
+            key: "F8".into(),
+        };
+        let restored: Hotkey =
+            serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
+        assert_eq!(restored, custom);
+        assert_eq!(restored.label(), "Alt + Shift + Win + F8");
+    }
+
+    #[test]
+    fn ordinary_typing_and_unknown_keys_cannot_be_registered() {
+        let mut custom = Hotkey {
+            ctrl: false,
+            alt: false,
+            key: "A".into(),
+            ..Hotkey::default()
+        };
+        assert!(custom.validate().is_err());
+        custom.shift = true;
+        assert!(custom.validate().is_err());
+        custom.ctrl = true;
+        assert!(custom.validate().is_ok());
+        custom.key = "F25".into();
+        assert!(custom.validate().is_err());
+    }
+
+    #[test]
+    fn app_focused_shortcut_has_no_external_insertion_target() {
+        assert!(!test_target().is_external());
+        assert!(
+            Target {
+                window: 1,
+                focus: 0,
+                process: 2,
+            }
+            .is_external()
+        );
+    }
+}
+
+#[cfg(test)]
+pub fn test_target() -> Target {
+    Target {
+        window: 0,
+        focus: 0,
+        process: 0,
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use super::*;
+    use windows_sys::Win32::{
+        Foundation::*,
+        System::{
+            DataExchange::*,
+            Memory::*,
+            Threading::{
+                GetCurrentProcessId, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+                QueryFullProcessImageNameW,
+            },
+        },
+        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    };
+
+    pub fn target() -> Option<Target> {
+        unsafe {
+            let window = GetForegroundWindow();
+            if window.is_null() {
+                return None;
+            }
+            let mut process = 0;
+            let thread = GetWindowThreadProcessId(window, &mut process);
+            if process == GetCurrentProcessId() {
+                return None;
+            }
+            let mut info: GUITHREADINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+            if GetGUIThreadInfo(thread, &mut info) == 0 {
+                return None;
+            }
+            Some(Target {
+                window: window as isize,
+                focus: info.hwndFocus as isize,
+                process,
+            })
+        }
+    }
+    pub fn app_name(target: Target) -> Option<String> {
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, target.process);
+            if process.is_null() {
+                return None;
+            }
+            let mut path = [0u16; 32768];
+            let mut size = path.len() as u32;
+            let ok = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut size);
+            CloseHandle(process);
+            if ok == 0 {
+                return None;
+            }
+            let full = String::from_utf16(&path[..size as usize]).ok()?;
+            std::path::Path::new(&full)
+                .file_name()?
+                .to_str()
+                .map(str::to_lowercase)
+        }
+    }
+
+    fn key_code(key: &str) -> u32 {
+        match key {
+            "Space" => VK_SPACE as u32,
+            "Tab" => VK_TAB as u32,
+            "Enter" => VK_RETURN as u32,
+            "Escape" => VK_ESCAPE as u32,
+            "Backspace" => VK_BACK as u32,
+            "Delete" => VK_DELETE as u32,
+            "Insert" => VK_INSERT as u32,
+            "Home" => VK_HOME as u32,
+            "End" => VK_END as u32,
+            "PageUp" => VK_PRIOR as u32,
+            "PageDown" => VK_NEXT as u32,
+            "ArrowUp" => VK_UP as u32,
+            "ArrowDown" => VK_DOWN as u32,
+            "ArrowLeft" => VK_LEFT as u32,
+            "ArrowRight" => VK_RIGHT as u32,
+            _ if key.len() == 1 => key.as_bytes()[0] as u32,
+            _ => VK_F1 as u32 + key[1..].parse::<u32>().expect("validated function key") - 1,
+        }
+    }
+
+    fn modifiers(shortcut: &Hotkey) -> u32 {
+        MOD_NOREPEAT
+            | if shortcut.ctrl { MOD_CONTROL } else { 0 }
+            | if shortcut.alt { MOD_ALT } else { 0 }
+            | if shortcut.shift { MOD_SHIFT } else { 0 }
+            | if shortcut.win { MOD_WIN } else { 0 }
+    }
+
+    trait HotkeyRegistry {
+        fn register(&mut self, id: i32, shortcut: &Hotkey) -> std::io::Result<()>;
+        fn unregister(&mut self, id: i32);
+    }
+
+    struct WindowsRegistry;
+
+    impl HotkeyRegistry for WindowsRegistry {
+        fn register(&mut self, id: i32, shortcut: &Hotkey) -> std::io::Result<()> {
+            unsafe {
+                if RegisterHotKey(
+                    std::ptr::null_mut(),
+                    id,
+                    modifiers(shortcut),
+                    key_code(&shortcut.key),
+                ) == 0
+                {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        fn unregister(&mut self, id: i32) {
+            unsafe {
+                UnregisterHotKey(std::ptr::null_mut(), id);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct HotkeyRegistration {
+        active: Option<(i32, Hotkey)>,
+    }
+
+    impl HotkeyRegistration {
+        fn replace(
+            &mut self,
+            requested: Hotkey,
+            registry: &mut impl HotkeyRegistry,
+        ) -> Result<(), String> {
+            requested.validate()?;
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|(_, current)| current == &requested)
+            {
+                return Ok(());
+            }
+            let next_id = if self.active.as_ref().is_some_and(|(id, _)| *id == 1) {
+                2
+            } else {
+                1
+            };
+            // Claim the new chord first. A conflict must never discard the
+            // working shortcut or claim success in the saved preferences.
+            registry.register(next_id, &requested).map_err(|error| {
+                let fallback = self.active.as_ref().map_or_else(
+                    || "Use the Record button.".to_owned(),
+                    |(_, current)| format!("{} still works.", current.label()),
+                );
+                format!("{} is unavailable ({error}). {fallback}", requested.label())
+            })?;
+            if let Some((id, _)) = self.active.take() {
+                registry.unregister(id);
+            }
+            self.active = Some((next_id, requested));
+            Ok(())
+        }
+
+        fn accepts(&self, id: usize, chord: isize) -> bool {
+            self.active.as_ref().is_some_and(|(active_id, shortcut)| {
+                *active_id as usize == id
+                    && (chord as u32 & 0xffff) == (modifiers(shortcut) & !MOD_NOREPEAT)
+                    && ((chord as u32 >> 16) & 0xffff) == key_code(&shortcut.key)
+            })
+        }
+
+        fn clear(&mut self, registry: &mut impl HotkeyRegistry) {
+            if let Some((id, _)) = self.active.take() {
+                registry.unregister(id);
+            }
+        }
+    }
+
+    pub fn hotkey(initial: Hotkey, tx: Sender<HotkeyEvent>) -> Sender<Hotkey> {
+        let (updates, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || unsafe {
+            let mut registration = HotkeyRegistration::default();
+            let mut registry = WindowsRegistry;
+            let apply = |requested: Hotkey,
+                         registration: &mut HotkeyRegistration,
+                         registry: &mut WindowsRegistry| {
+                let event = match registration.replace(requested.clone(), registry) {
+                    Ok(()) => HotkeyEvent::Registered(requested),
+                    Err(message) => HotkeyEvent::Error { requested, message },
+                };
+                tx.send(event).is_ok()
+            };
+            if !apply(initial, &mut registration, &mut registry) {
+                registration.clear(&mut registry);
+                return;
+            }
+            'worker: loop {
+                // Sleep on the command channel between message polls. This
+                // also notices controller shutdown without an orphaned thread.
+                match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                    Ok(requested) => {
+                        if !apply(requested, &mut registration, &mut registry) {
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                let mut msg: MSG = std::mem::zeroed();
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    if msg.message == WM_QUIT {
+                        break 'worker;
+                    }
+                    if msg.message == WM_HOTKEY && registration.accepts(msg.wParam, msg.lParam) {
+                        let target = target().unwrap_or(Target {
+                            window: 0,
+                            focus: 0,
+                            process: 0,
+                        });
+                        if tx.send(HotkeyEvent::Pressed(target)).is_err() {
+                            break 'worker;
+                        }
+                    }
+                }
+            }
+            registration.clear(&mut registry);
+        });
+        updates
+    }
+
+    pub fn insert(expected: Target, text: &str, same_field: impl Fn() -> bool) -> Result<()> {
+        send_text(expected, text, false, same_field)
+    }
+
+    pub fn replace_selection(
+        expected: Target,
+        text: &str,
+        same_field: impl Fn() -> bool,
+    ) -> Result<()> {
+        send_text(expected, text, true, same_field)
+    }
+
+    fn send_text(
+        expected: Target,
+        text: &str,
+        delete_empty: bool,
+        same_field: impl Fn() -> bool,
+    ) -> Result<()> {
+        unsafe {
+            // Let the shortcut modifiers go before emitting Unicode packets.
+            for _ in 0..50 {
+                if [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                    .iter()
+                    .all(|k| GetAsyncKeyState(*k as i32) >= 0)
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+                .iter()
+                .any(|k| GetAsyncKeyState(*k as i32) < 0)
+            {
+                bail!("Release the modifier keys. Your transcript is ready to copy.");
+            }
+            let current = target();
+            if !same_field()
+                || !current.is_some_and(|t| {
+                    t.window == expected.window
+                        && t.focus == expected.focus
+                        && t.process == expected.process
+                })
+            {
+                bail!("Focus changed. Your transcript is ready to copy.");
+            }
+            let mut input = Vec::new();
+            if text.is_empty() && delete_empty {
+                for flags in [0, KEYEVENTF_KEYUP] {
+                    input.push(INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_BACK,
+                                wScan: 0,
+                                dwFlags: flags,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    });
+                }
+            }
+            for code in text.encode_utf16() {
+                for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+                    input.push(INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: 0,
+                                wScan: code,
+                                dwFlags: flags,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    });
+                }
+            }
+            if input.is_empty() {
+                return Ok(());
+            }
+            let sent = SendInput(
+                input.len() as u32,
+                input.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            );
+            if sent != input.len() as u32 {
+                bail!(
+                    "Windows blocked some or all of the insertion. Check the destination before copying to avoid duplicates."
+                );
+            }
+            Ok(())
+        }
+    }
+
+    pub fn copy(text: &str) -> Result<()> {
+        unsafe {
+            if OpenClipboard(GetForegroundWindow()) == 0 {
+                bail!("Clipboard is busy. Please try again.");
+            }
+            struct Close;
+            impl Drop for Close {
+                fn drop(&mut self) {
+                    unsafe {
+                        CloseClipboard();
+                    }
+                }
+            }
+            let _close = Close;
+            if EmptyClipboard() == 0 {
+                bail!("Could not clear the clipboard");
+            }
+            // Exclusion flags must be written before the text. Abort if the
+            // platform cannot set them, rather than leaking text to history.
+            for name in ["CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"] {
+                let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+                let format = RegisterClipboardFormatW(wide.as_ptr());
+                anyhow::ensure!(format != 0, "Could not set clipboard privacy flags");
+                put(format, &0u32.to_ne_bytes())?;
+            }
+            let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+            let bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
+            put(13, bytes)
+        }
+    }
+
+    unsafe fn put(format: u32, bytes: &[u8]) -> Result<()> {
+        unsafe {
+            let memory = GlobalAlloc(GMEM_MOVEABLE, bytes.len());
+            anyhow::ensure!(!memory.is_null(), "Could not allocate clipboard memory");
+            let ptr = GlobalLock(memory);
+            if ptr.is_null() {
+                GlobalFree(memory);
+                bail!("Could not access clipboard memory");
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+            GlobalUnlock(memory);
+            if SetClipboardData(format, memory).is_null() {
+                GlobalFree(memory);
+                bail!("Could not update clipboard");
+            }
+            Ok(())
+        }
+    }
+    #[cfg(test)]
+    mod hotkey_tests {
+        use super::*;
+
+        #[derive(Default)]
+        struct Registry {
+            fail: bool,
+            calls: Vec<(bool, i32)>,
+        }
+        impl HotkeyRegistry for Registry {
+            fn register(&mut self, id: i32, _: &Hotkey) -> std::io::Result<()> {
+                self.calls.push((true, id));
+                if self.fail {
+                    Err(std::io::Error::from_raw_os_error(1409))
+                } else {
+                    Ok(())
+                }
+            }
+            fn unregister(&mut self, id: i32) {
+                self.calls.push((false, id));
+            }
+        }
+
+        #[test]
+        fn conflict_retains_working_shortcut_and_retry_replaces_it_atomically() {
+            let mut registration = HotkeyRegistration::default();
+            let mut registry = Registry::default();
+            registration
+                .replace(Hotkey::default(), &mut registry)
+                .unwrap();
+            let requested = Hotkey {
+                key: "F9".into(),
+                ..Hotkey::default()
+            };
+            registry.fail = true;
+            let error = registration
+                .replace(requested.clone(), &mut registry)
+                .unwrap_err();
+            assert!(error.contains("Ctrl + Alt + Space still works"));
+            assert_eq!(registration.active.as_ref().unwrap().1, Hotkey::default());
+            assert_eq!(registry.calls, vec![(true, 1), (true, 2)]);
+            registry.fail = false;
+            registration
+                .replace(requested.clone(), &mut registry)
+                .unwrap();
+            assert_eq!(registration.active.as_ref().unwrap().1, requested);
+            assert_eq!(
+                registry.calls,
+                vec![(true, 1), (true, 2), (true, 2), (false, 1)]
+            );
+        }
+
+        #[test]
+        fn rejected_validation_and_unchanged_settings_do_not_disturb_registration() {
+            let mut registration = HotkeyRegistration::default();
+            let mut registry = Registry::default();
+            registration
+                .replace(Hotkey::default(), &mut registry)
+                .unwrap();
+            registration
+                .replace(Hotkey::default(), &mut registry)
+                .unwrap();
+            assert!(
+                registration
+                    .replace(
+                        Hotkey {
+                            key: "unknown".into(),
+                            ..Hotkey::default()
+                        },
+                        &mut registry
+                    )
+                    .is_err()
+            );
+            assert_eq!(registry.calls, vec![(true, 1)]);
+        }
+
+        #[test]
+        fn queued_events_from_replaced_shortcuts_are_ignored() {
+            let mut registration = HotkeyRegistration::default();
+            let mut registry = Registry::default();
+            registration
+                .replace(Hotkey::default(), &mut registry)
+                .unwrap();
+            let old_chord = ((VK_SPACE as u32) << 16 | MOD_CONTROL | MOD_ALT) as isize;
+            assert!(registration.accepts(1, old_chord));
+            registration
+                .replace(
+                    Hotkey {
+                        key: "F9".into(),
+                        ..Hotkey::default()
+                    },
+                    &mut registry,
+                )
+                .unwrap();
+            assert!(!registration.accepts(1, old_chord));
+            assert!(!registration.accepts(2, old_chord));
+            registration.clear(&mut registry);
+            assert!(registration.active.is_none());
+            assert_eq!(registry.calls.last(), Some(&(false, 2)));
+        }
+
+        #[test]
+        fn every_selectable_key_has_a_windows_mapping() {
+            for &key in HOTKEY_KEYS {
+                let hotkey = Hotkey {
+                    key: key.into(),
+                    ..Hotkey::default()
+                };
+                hotkey.validate().unwrap();
+                assert_ne!(key_code(key), 0);
+            }
+        }
+
+        #[test]
+        #[ignore = "Temporarily registers rare function-key shortcuts; uses no injected keypresses"]
+        fn windows_conflict_preserves_existing_registration() {
+            let blocked = Hotkey {
+                shift: true,
+                key: "F24".into(),
+                ..Hotkey::default()
+            };
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let mut registry = WindowsRegistry;
+                let result = registry.register(21, &blocked);
+                let succeeded = result.is_ok();
+                ready_tx.send(result).unwrap();
+                let _ = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+                if succeeded {
+                    registry.unregister(21);
+                }
+            });
+            let ready = ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let outcome = (|| {
+                ready?;
+                let mut registration = HotkeyRegistration::default();
+                let mut registry = WindowsRegistry;
+                let existing = Hotkey {
+                    shift: true,
+                    key: "F23".into(),
+                    ..Hotkey::default()
+                };
+                registration
+                    .replace(existing.clone(), &mut registry)
+                    .map_err(std::io::Error::other)?;
+                let result = registration.replace(
+                    Hotkey {
+                        shift: true,
+                        key: "F24".into(),
+                        ..Hotkey::default()
+                    },
+                    &mut registry,
+                );
+                let retained = registration
+                    .active
+                    .as_ref()
+                    .is_some_and(|(_, current)| current == &existing);
+                registration.clear(&mut registry);
+                if result.is_ok() || !retained {
+                    return Err(std::io::Error::other(
+                        "The conflicting shortcut must fail and preserve the existing registration",
+                    ));
+                }
+                Ok::<(), std::io::Error>(())
+            })();
+            let _ = done_tx.send(());
+            holder.join().unwrap();
+            outcome.unwrap();
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use win::{app_name, copy, hotkey, insert, replace_selection, target};
+
+#[cfg(not(windows))]
+pub fn app_name(_: Target) -> Option<String> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn hotkey(initial: Hotkey, tx: Sender<HotkeyEvent>) -> Sender<Hotkey> {
+    let (updates, _) = std::sync::mpsc::channel();
+    let _ = tx.send(HotkeyEvent::Error {
+        requested: initial,
+        message: "Global shortcuts are currently available on Windows.".into(),
+    });
+    updates
+}
+#[cfg(not(windows))]
+pub fn insert(_: Target, _: &str, _: impl Fn() -> bool) -> Result<()> {
+    bail!("Insertion is currently available on Windows");
+}
+#[cfg(not(windows))]
+pub fn target() -> Option<Target> {
+    None
+}
+#[cfg(not(windows))]
+pub fn copy(_: &str) -> Result<()> {
+    bail!("Clipboard is currently available on Windows");
+}

@@ -1,0 +1,62 @@
+name: Draft Windows release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+      - name: Validate version and install Rust tools
+        shell: pwsh
+        run: |
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "(\d+\.\d+\.\d+)"').Groups[1].Value
+          if (!$version -or $env:RELEASE_TAG -cne "v$version") { throw 'Tag must match the stable Cargo package version.' }
+          git show-ref --verify "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Release tag does not exist.' }
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Validate and package
+        shell: pwsh
+        run: |
+          cargo fmt --check
+          if ($LASTEXITCODE -ne 0) { throw 'Formatting failed.' }
+          $env:PATH = (Join-Path $PWD '.local/native/install/bin') + ';' + $env:PATH
+          ./scripts/build-windows.ps1 -Test
+          cargo clippy --release --locked --features dynamic-backends --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
+          ./scripts/package-windows.ps1
+      - name: Preserve artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Articulate-${{ env.RELEASE_TAG }}-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+      - name: Create draft release for review
+        shell: pwsh
+        run: |
+          $assets = @(Get-ChildItem dist -File | Select-Object -ExpandProperty FullName)
+          gh release create $env:RELEASE_TAG @assets --repo $env:GITHUB_REPOSITORY --verify-tag --draft --title "Articulate $env:RELEASE_TAG" --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }

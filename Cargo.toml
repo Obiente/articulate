@@ -1,0 +1,46 @@
+[package]
+name = "transcribe-local"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Your words, ready to use. Local dictation and call transcripts."
+license = "MIT"
+repository = "https://github.com/Obiente/articulate"
+homepage = "https://github.com/Obiente/articulate"
+
+[features]
+default = []
+dynamic-backends = ["transcribe-cpp/dynamic-backends"]
+vulkan = ["transcribe-cpp/vulkan"]
+
+[dependencies]
+anyhow = "1"
+cpal = "0.16"
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+egui_extras = { version = "0.33.3", default-features = false, features = ["svg"] }
+hound = "3.5"
+ringbuf = "0.4"
+rubato = "0.16"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+transcribe-cpp = { version = "=0.2.3", default-features = false }
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = ["Win32_UI_Accessibility", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+winit = { version = "0.30", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+opt-level = 1
