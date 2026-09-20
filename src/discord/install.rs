@@ -1175,25 +1175,44 @@ mod tests {
         let fixture = Fixture::new();
         let pid_file = fixture.0.join("child-pid.txt");
         let log = fixture.0.join("synthetic-tool.log");
-        let mut command = Command::new(
-            PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-                .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
-        );
-        command.args(["-NoProfile", "-NonInteractive", "-Command", r#"
-$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 30') -WindowStyle Hidden -PassThru
-[System.IO.File]::WriteAllText($env:ARTICULATE_TOOL_TEST_PID, [string]$child.Id)
-Start-Sleep -Seconds 30
-"#]).env("ARTICULATE_TOOL_TEST_PID", &pid_file);
+        // A second PowerShell startup can exceed the readiness deadline on a
+        // busy Windows runner. Exercise the same process tree using our own
+        // test executable, without profiles, modules, or external programs.
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "discord::install::tests::build_timeout_process_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ARTICULATE_TOOL_TEST_ROLE", "parent")
+            .env("ARTICULATE_TOOL_TEST_PID", &pid_file);
         let directory = fixture.0.clone();
-        let running = thread::spawn(move || run(command, &directory, &log, Duration::from_secs(8)));
-        let deadline = Instant::now() + Duration::from_secs(6);
+        let worker_log = log.clone();
+        let running =
+            thread::spawn(move || run(command, &directory, &worker_log, Duration::from_secs(15)));
+        let deadline = Instant::now() + Duration::from_secs(12);
         while !pid_file.exists() && Instant::now() < deadline {
+            if running.is_finished() {
+                break;
+            }
             thread::sleep(Duration::from_millis(20));
         }
-        let pid: u32 = fs::read_to_string(&pid_file)
-            .expect("Synthetic child should start")
-            .parse()
-            .unwrap();
+        let pid = fs::read_to_string(&pid_file).and_then(|text| {
+            text.parse::<u32>()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        });
+        let pid = match pid {
+            Ok(pid) => pid,
+            Err(error) => {
+                let result = running.join().unwrap();
+                panic!(
+                    "Synthetic child did not become ready: {error}; runner: {result:?}; log: {}",
+                    fs::read_to_string(&log).unwrap_or_default()
+                );
+            }
+        };
         let handle = unsafe {
             OpenProcess(
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
@@ -1201,8 +1220,15 @@ Start-Sleep -Seconds 30
                 pid,
             )
         };
-        assert!(!handle.is_null());
-        assert!(running.join().unwrap().is_err());
+        let result = running.join().unwrap();
+        assert!(
+            !handle.is_null(),
+            "Synthetic child must be alive before timeout"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("timed out"),
+            "The runner must stop for its timeout, not a fixture failure"
+        );
         let stopped = unsafe { WaitForSingleObject(handle, 1000) };
         unsafe {
             CloseHandle(handle);
@@ -1211,6 +1237,37 @@ Start-Sleep -Seconds 30
             stopped, WAIT_OBJECT_0,
             "The build job must terminate its descendant"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Synthetic subprocess helper, launched only by the process cleanup test"]
+    fn build_timeout_process_fixture() {
+        match std::env::var("ARTICULATE_TOOL_TEST_ROLE").as_deref() {
+            Ok("parent") => {
+                use std::os::windows::process::CommandExt;
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "discord::install::tests::build_timeout_process_fixture",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .creation_flags(0x0800_0000)
+                    .env("ARTICULATE_TOOL_TEST_ROLE", "child")
+                    .spawn()
+                    .unwrap();
+                let _ = child.wait();
+            }
+            Ok("child") => {
+                let path = PathBuf::from(std::env::var_os("ARTICULATE_TOOL_TEST_PID").unwrap());
+                let ready = path.with_extension("ready");
+                fs::write(&ready, std::process::id().to_string()).unwrap();
+                fs::rename(ready, path).unwrap();
+                thread::sleep(Duration::from_secs(60));
+            }
+            _ => panic!("This fixture must be started by its supervising test"),
+        }
     }
 
     #[test]
