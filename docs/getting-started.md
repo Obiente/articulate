@@ -22,6 +22,12 @@ Correct a short word or phrase after dictation. A learning notice offers Undo. R
 
 In Shortcuts, save a trigger such as `signature` and a text expansion. Say “bang signature” as its own dictation. A template can contain one `{text}` slot for words spoken after the trigger. Macros expand text only; they never execute commands or send Enter.
 
+## Polish finished dictation
+
+Choose **Polish** beside your latest dictation, then download the local editor once (about 852 MB). Select Clear, Professional or Casual and choose **Polish text**. Compare Before and After, then choose **Apply changes** or **Keep current text**. Applying updates the saved Articulate preview; use Copy text to take it elsewhere. The original transcription remains available.
+
+This works on short passages, up to 200 words and 1,600 UTF-8 bytes. Some wording is deliberately left unchanged. Expanded vocal shortcuts keep their exact contents. Live dictation continues to use the instant Rust cleanup rules. If a download is damaged, use **Settings > Audio & models > Advanced cleanup > Download options > Repair editor download**.
+
 ## Updates and removal
 
 Settings > Updates & about checks GitHub only when requested. Finish recording before installing. Pending history saves must complete before the installer opens. Retry failed saves before updating.

@@ -274,6 +274,22 @@ impl App {
 }
 
 #[cfg(test)]
+impl App {
+    pub(super) fn prepare_polish_capture(&mut self) {
+        self.polish.open = true;
+        self.raw = "um hi Casey can you review the plan before tomorrow I moved the check in to Thursday at three".into();
+        self.text = "Hi Casey can you review the plan before tomorrow I moved the check in to Thursday at three".into();
+        self.polish.context = Some(Context {
+            utterance: self.utterance,
+            original: self.raw.clone(),
+            source: self.text.clone(),
+        });
+        self.polish.preview = Some(Preview { original: self.raw.clone(), source: self.text.clone(), text: "Hi Casey, can you review the plan before tomorrow? I moved the check in to Thursday at three.".into(), blocked: None, elapsed_ms: 950 });
+        self.polish.status = "Review the changes before using them.".into();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::Context;
     #[test]
@@ -314,21 +330,5 @@ mod tests {
         app.polish_apply();
         assert_eq!(app.text, "A newer draft.");
         assert!(app.polish.preview.is_none());
-    }
-}
-
-#[cfg(test)]
-impl App {
-    pub(super) fn prepare_polish_capture(&mut self) {
-        self.polish.open = true;
-        self.raw = "um hi Casey can you review the plan before tomorrow I moved the check in to Thursday at three".into();
-        self.text = "Hi Casey can you review the plan before tomorrow I moved the check in to Thursday at three".into();
-        self.polish.context = Some(Context {
-            utterance: self.utterance,
-            original: self.raw.clone(),
-            source: self.text.clone(),
-        });
-        self.polish.preview = Some(Preview { original: self.raw.clone(), source: self.text.clone(), text: "Hi Casey, can you review the plan before tomorrow? I moved the check in to Thursday at three.".into(), blocked: None, elapsed_ms: 950 });
-        self.polish.status = "Review the changes before using them.".into();
     }
 }

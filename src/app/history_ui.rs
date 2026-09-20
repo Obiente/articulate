@@ -148,7 +148,7 @@ impl App {
                     if let Some(current) = &self.history.call
                         && current.id == session.id
                     {
-                        session = Box::new(current.clone());
+                        *session = current.clone();
                     }
                     self.history.notetaker_tab = 0;
                     self.history.notetaker_assort =

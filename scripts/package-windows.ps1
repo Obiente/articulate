@@ -96,6 +96,7 @@ try {
     Copy-Item -LiteralPath $nativeAudioLicenses -Destination (Join-Path $licenses 'discord-audio') -Recurse
     Copy-Item -LiteralPath assets/fonts/OFL.txt -Destination (Join-Path $licenses 'Inter-OFL.txt')
     Copy-Item -LiteralPath assets/icons/LICENSE.txt -Destination (Join-Path $licenses 'Phosphor-MIT.txt')
+    Copy-Item -LiteralPath assets/polish -Destination (Join-Path $licenses 'local-editor') -Recurse
     Copy-Item -LiteralPath packaging/START-HERE.txt -Destination $stage
     @('Microsoft Visual C++ Runtime', 'App-local redistributable files from the Visual Studio x64 CRT distribution.', 'Copyright Microsoft Corporation. All rights reserved.', 'https://visualstudio.microsoft.com/license-terms/') | Set-Content -LiteralPath (Join-Path $licenses 'Microsoft-runtime.txt')
     # Preserve the installed distribution's actual notices. Articulate's license

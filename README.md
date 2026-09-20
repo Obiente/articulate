@@ -9,6 +9,7 @@ Built with Rust, a native egui interface, and a local C/C++ inference runtime. W
 ## Make room for your voice
 
 - **Dictate into your apps.** Hold a customizable shortcut to speak, or double-press for hands-free dictation. Toggle mode also supports live insertion in compatible text fields.
+- **Polish a finished thought.** Optional local cleanup previews punctuation, grammar and repeated wording with Clear, Professional or Casual styling. Review changes before applying them; your original stays available.
 - **Teach it your vocabulary.** Correct a short word or phrase, review the learning notice, and undo it if needed. Vocabulary can be scoped to an app or nearby words.
 - **Say your shortcuts.** Say “bang signature” to expand a snippet, or use a template with a spoken `{text}` argument.
 - **Keep the conversation.** Open [Notetaker](docs/notetaker.md) to write personal notes, capture calls, and return to saved meetings. Your writing stays separate from the transcript and reviewed highlights.
@@ -20,6 +21,8 @@ Built with Rust, a native egui interface, and a local C/C++ inference runtime. W
 Download the **Windows x86_64 setup** from [Releases](https://github.com/Obiente/articulate/releases/latest). A portable ZIP is also available. The installer runs for your user without administrator access.
 
 Open **Settings → Audio & models**. Qwen3-ASR 1.7B Q8_0 is a separate download of about **2.19 GB**. Calls can additionally use a **237 MB** acoustic speaker model when Discord activity is unavailable. These large speech models are not bundled; downloads are size- and SHA-256-verified before use. The small pretrained Assort notes and vocabulary classifiers are included in the application and work without a download or manual model setup.
+
+For optional advanced cleanup, choose **Polish** after dictation or open **Settings > Audio & models > Advanced cleanup**. The Qwen3.5 0.8B Q8 editor and CPU tools download separately (about **852 MB**). Short passages run locally with explicit review. [Editing behavior and limits](docs/local-cleanup.md).
 
 Assort's included models use authored synthetic English training examples. They score source passages or existing vocabulary choices; they do not provide general language understanding or generate new prose. Review their suggestions, especially for unfamiliar names, ambiguous wording, and other languages. [How classification works →](docs/classification.md)
 

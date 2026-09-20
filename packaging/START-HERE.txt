@@ -25,6 +25,12 @@ Recognition works locally after download. A recent PC with 16 GB RAM is
 recommended; CPU-only operation is supported. If GPU loading fails, choose
 CPU only in Settings. First GPU loading can take longer while it warms up.
 
+LOCAL TEXT CLEANUP
+Choose Polish after dictation to preview punctuation and grammar changes.
+The optional local editor downloads once (about 852 MB). Compare the result
+before applying it. The original remains available. Copy the polished text
+to use it elsewhere; text already inserted into another app is not replaced.
+
 UPDATES
 Settings > Updates & about checks GitHub only when you request it. Available updates
 download separately and are checked against the release's SHA-256 digest.
