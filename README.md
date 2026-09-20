@@ -13,6 +13,8 @@ Built with Rust, a native egui interface, and a local C/C++ inference runtime. W
 - **Teach it your vocabulary.** Correct a short word or phrase, review the learning notice, and undo it if needed. Vocabulary can be scoped to an app or nearby words.
 - **Say your shortcuts.** Say “bang signature” to expand a snippet, or use a template with a spoken `{text}` argument.
 - **Keep the conversation.** Open [Notetaker](docs/notetaker.md) to write personal notes, capture calls, and return to saved meetings. Your writing stays separate from the transcript and reviewed highlights.
+- **Find what matters.** Generate reviewed [local summaries](docs/local-summaries.md) of calls and dictations, with facts, decisions, actions and exact source excerpts. Search full saved transcripts and personal notes from the sidebar.
+- **See your progress.** [Insights](docs/insights.md) shows retained dictation words, measured pace, vocabulary and cleanup changes, app usage and daily activity. Everything stays on this device.
 - **Return to it later.** Local History keeps transcripts, originals, notes, and speaker names. Search, rename, copy, export, or delete a session.
 - **Review context with Assort.** Included pretrained classifiers suggest meeting highlights and review saved vocabulary choices against the sentence and destination app. Choose **Create notes** or **Review vocabulary** without configuring model paths, then review the suggestions before applying them.
 
@@ -46,7 +48,7 @@ The initial Windows build is **unsigned**, so Windows may show an unknown-publis
 
 ## Current limits
 
-Recognition can make mistakes, particularly with noise, names, overlap, and short utterances. Call text is revisable within bounded context windows; continuous speech still needs periodic commits. Notes quote highlights and possible actions rather than generating a narrative summary. App insertion depends on Windows accessibility support. Native participant audio remains experimental. macOS, mobile keyboards and automatic sync are not yet implemented.
+Recognition can make mistakes, particularly with noise, names, overlap, and short utterances. Call text is revisable within bounded context windows; continuous speech still needs periodic commits. Highlights quote the transcript. Optional generated summaries need review; longer conversations are summarized in sections and may contain decisions later amended elsewhere in the call. App insertion depends on Windows accessibility support. Native participant audio remains experimental. macOS, mobile keyboards and automatic sync are not yet implemented.
 
 ## Contribute
 

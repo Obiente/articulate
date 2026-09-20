@@ -36,6 +36,8 @@ impl App {
                         3 => self.calls_ui(ui, ctx),
                         5 => self.history_ui(ui),
                         6 => self.notetaker_ui(ui),
+                        7 => self.insights_ui(ui),
+                        8 => self.saved_search_ui(ui),
                         4 => self.macros_ui(ui),
                         1 => self.vocabulary_surface(ui),
                         _ => {
@@ -70,6 +72,8 @@ impl App {
         for (page, label, icon) in [
             (0, "Dictate", Icon::Mic),
             (6, "Notetaker", Icon::Phone),
+            (7, "Insights", Icon::Chart),
+            (8, "Search", Icon::Search),
             (1, "Vocabulary", Icon::Book),
             (4, "Shortcuts", Icon::Bolt),
             (5, "History", Icon::History),

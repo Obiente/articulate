@@ -32,6 +32,15 @@ for Qwen, llama.cpp and LLVM OpenMP accompany the downloaded files. Repair stage
 verified replacements before swapping a damaged runtime, preserving a rollback
 path if the swap fails.
 
+Downloads retain a hash-specific partial file and reconnect up to six times.
+A resumed response must provide the exact expected byte range and total size;
+servers that ignore Range restart the file safely. A 30-second network idle
+limit is separate from the one-hour transfer budget. Cancellation is checked
+between 250-millisecond socket polls. Final size and SHA-256 verification are
+mandatory before a file can be loaded. Failed network transfers can be resumed
+by choosing Download again. The complete first-time editor download is
+852,019,725 bytes; already verified files are reused.
+
 ## Runtime limits and privacy
 
 Rust owns the server process, request queue, verification, cancellation and result

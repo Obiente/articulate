@@ -18,12 +18,14 @@ You can return to Notetaker while capture continues. The active conversation car
 
 The hub lists conversations and personal notes with their title, local date/time, and a text preview. Conversations also show their captured duration. Search matches titles and previews; filters show conversations or personal notes separately.
 
-Open a conversation to edit **My notes**, review **Highlights**, or read and search its **Transcript**. Creating or replacing highlights does not change your own writing. Highlight suggestions require review and quote the transcript; they are not a generated narrative summary. Their timestamps refer to speaker turns.
+Open a conversation to edit **My notes**, generate a reviewed **Summary**, review **Highlights**, or read and search its **Transcript**. Summary uses an optional separately downloaded local model and attaches exact source excerpts to its suggestions. Creating or replacing highlights does not change your own writing. Highlight suggestions require review and quote the transcript; they are not a generated narrative summary. Their timestamps refer to speaker turns.
 
 ## Copy, export, and delete
 
-**Copy notes** and **Export notes** use only the text in My notes. **More → Copy full note** and **Export full note** include personal notes, saved highlights, and the transcript. Review that complete export before sharing it.
+**Copy notes** and **Export notes** use only the text in My notes. **More → Copy full note** and **Export full note** include personal notes, a saved generated summary with its sources, saved highlights, and the transcript. Summaries made before a transcript edit are marked as an earlier version. Review that complete export before sharing it.
 
 Transcript exports remain available as plain text, Markdown, SRT, and WebVTT. **More → Delete note** asks for confirmation and removes the saved item from this device.
 
 Notes use the same local history storage as transcripts. Older history files open with an empty My notes field. Nothing is sent to a cloud notes service, and this workspace does not connect to a calendar or save audio.
+
+Use **Search** in the sidebar to find words or phrases throughout saved transcripts and personal notes, beyond the hub's title and preview search. Results open the original session.

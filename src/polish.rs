@@ -1,7 +1,9 @@
 //! Optional, local dictation editing. Every result is a reviewable draft.
 mod guard;
 mod install;
-mod runtime;
+pub(crate) mod runtime;
+mod transfer;
+mod transport;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -12,7 +14,14 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-pub use install::{MODEL_BYTES, MODEL_NAME, installed};
+pub use install::{
+    DOWNLOAD_BYTES, MODEL_NAME, SUMMARY_DOWNLOAD_BYTES, installed, profile_installed,
+};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelProfile {
+    Polish,
+    Summary,
+}
 pub const MAX_WORDS: usize = 200;
 pub const MAX_BYTES: usize = 1600;
 
@@ -193,11 +202,14 @@ impl Worker {
 }
 
 pub fn download() -> Job {
+    download_profile(ModelProfile::Polish)
+}
+pub fn download_profile(profile: ModelProfile) -> Job {
     let (events, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let task_cancel = cancel.clone();
     std::thread::spawn(move || {
-        let result = install::download(&task_cancel, &events);
+        let result = install::download_profile(profile, &task_cancel, &events);
         let event = if task_cancel.load(Ordering::Acquire) {
             Event::Cancelled
         } else {
@@ -262,13 +274,34 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Downloads the pinned summary model into an explicitly selected isolated cache"]
+    fn download_summary_model() {
+        let root =
+            std::env::var_os("ARTICULATE_POLISH_TEST_DIR").expect("Set an isolated model cache");
+        assert!(std::path::Path::new(&root).is_absolute());
+        let job = download_profile(ModelProfile::Summary);
+        loop {
+            match job.events.recv_timeout(Duration::from_secs(120)).unwrap() {
+                Event::Progress { stage, fraction } => {
+                    println!("{stage}: {:?}", fraction.map(|v| (v * 100.0) as u32))
+                }
+                Event::Installed => break,
+                Event::Failed(error) => panic!("{error}"),
+                Event::Cancelled => panic!("Cancelled"),
+                Event::Complete(_) => unreachable!(),
+            }
+        }
+        install::verify_profile(ModelProfile::Summary, &AtomicBool::new(false)).unwrap();
+    }
+
+    #[test]
     #[ignore = "Requires explicitly prepared, ignored ARTICULATE_POLISH_TEST_DIR with pinned model and runtime.zip"]
     fn managed_cpu_editor_smoke() {
         let directory =
             std::env::var_os("ARTICULATE_POLISH_TEST_DIR").expect("Set an isolated test directory");
         assert!(std::path::Path::new(&directory).is_absolute());
         let (tx, _rx) = mpsc::channel();
-        install::download(&AtomicBool::new(false), &tx).unwrap();
+        install::download(&Arc::new(AtomicBool::new(false)), &tx).unwrap();
         let mut worker = Worker::default();
         for (index, (style, source)) in [
             (
@@ -358,8 +391,8 @@ mod tests {
         let missing = install::root().join("runtime").join("ggml-cpu-x64.dll");
         std::fs::remove_file(&missing).unwrap();
         assert!(!installed());
-        install::download(&AtomicBool::new(false), &tx).unwrap();
+        install::download(&Arc::new(AtomicBool::new(false)), &tx).unwrap();
         assert!(installed());
-        install::verify(&AtomicBool::new(false)).unwrap();
+        install::verify_profile(ModelProfile::Polish, &AtomicBool::new(false)).unwrap();
     }
 }

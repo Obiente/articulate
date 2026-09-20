@@ -95,6 +95,7 @@ impl App {
         }
         session.text.clone_from(&self.text);
         session.original.clone_from(&self.raw);
+        session.metrics.clone_from(&self.dictation_metrics);
         if let Some(worker) = &self.history.worker {
             worker.save(session.clone());
         }
@@ -136,8 +137,18 @@ impl App {
             .unwrap_or_default();
         for event in events {
             match event {
+                HistoryEvent::Insights(report) => {
+                    self.insights.report = Some(report);
+                    self.insights.loading = false;
+                    self.insights.error = None;
+                }
+                HistoryEvent::InsightsFailed(error) => {
+                    self.insights.error = Some(error);
+                    self.insights.loading = false;
+                }
                 HistoryEvent::Listed(items) => {
                     self.history.items = items;
+                    self.insights.stale = true;
                     self.history.loading = false;
                 }
                 HistoryEvent::Loaded(mut session) => {
@@ -161,6 +172,7 @@ impl App {
                     self.history.loading = false;
                 }
                 HistoryEvent::Saved { id, updated_ms } => {
+                    self.brain_saved(&id);
                     for session in [
                         &mut self.history.dictation,
                         &mut self.history.call,
@@ -564,6 +576,7 @@ impl App {
         }
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.history.detail_tab, 0, "Transcript");
+            ui.selectable_value(&mut self.history.detail_tab, 3, "Summary");
             if session.notes.is_some() {
                 ui.selectable_value(&mut self.history.detail_tab, 1, "Notes");
             }
@@ -608,7 +621,20 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_max_width(840.0_f32.min(width));
                     ui.add_space(16.0);
-                    if self.history.detail_tab == 1 {
+                    if self.history.detail_tab == 3 {
+                        if self.brain_summary_ui(ui, &mut session) {
+                            if let Some(current) = &mut self.history.dictation
+                                && current.id == session.id
+                            {
+                                current
+                                    .generated_summary
+                                    .clone_from(&session.generated_summary);
+                            }
+                            if let Some(worker) = &self.history.worker {
+                                worker.save(session.clone());
+                            }
+                        }
+                    } else if self.history.detail_tab == 1 {
                         if let Some(notes) = &session.notes {
                             let text = notes.text(&session.speaker_names);
                             ui.horizontal(|ui| {
@@ -705,6 +731,28 @@ fn date(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_edits_preserve_capture_metrics_and_summary() {
+        let (mut app, _) = super::super::tests::app();
+        app.text = "Two words".into();
+        app.raw = app.text.clone();
+        app.dictation_metrics = crate::insights::DictationMetrics {
+            recognized_words: Some(2),
+            audio_duration_ms: Some(1500),
+            app: Some("Editor.exe".into()),
+            ..Default::default()
+        };
+        app.history_save_dictation();
+        let id = app.history.dictation.as_ref().unwrap().id.clone();
+        app.text = "Several manually added words for this note".into();
+        app.history_save_dictation();
+        let saved = app.history.dictation.as_ref().unwrap();
+        assert_eq!(saved.id, id);
+        assert_eq!(saved.metrics.recognized_words, Some(2));
+        assert_eq!(saved.metrics.audio_duration_ms, Some(1500));
+        assert_eq!(saved.original, "Two words");
+    }
 
     #[test]
     fn cleared_preview_overwrites_saved_draft_without_creating_empty_sessions() {

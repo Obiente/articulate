@@ -2,7 +2,7 @@
 "use strict";
 const fs = require("node:fs"), vm = require("node:vm"), assert = require("node:assert/strict");
 const { join } = require("node:path"), { EventEmitter } = require("node:events");
-let api, armed, stopped = 0, posts = 0, active = true;
+let api, armed, stopped = 0, posts = 0, active = false;
 const queue = [];
 const addon = { start: () => 0, arm: (nonce, ids) => { armed = { nonce, ids }; return 0; },
     stop: () => { stopped++; }, poll: () => queue.shift() ?? Buffer.alloc(0) };
@@ -38,6 +38,12 @@ const context = { Buffer, BigInt, Set, Date, JSON, Error, setTimeout, clearTimeo
 vm.runInNewContext(source + ";globalThis.harness = { control, drain };", context);
 (async () => {
     assert(api.enable("0".repeat(64)));
+    // The adapter must advertise readiness before Articulate arms capture.
+    // Waiting for a first audio packet here would deadlock automatic starts.
+    await context.harness.control();
+    assert.equal(api.status().state, "ready");
+    assert.equal(armed, undefined); assert.equal(posts, 0);
+    active = true;
     await context.harness.control();
     assert.equal(armed.nonce, 7n); assert.equal(armed.ids[0], 456n);
     assert.equal(api.status().state, "capturing");

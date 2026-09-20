@@ -3,6 +3,7 @@
 mod app;
 mod audio;
 mod audio_cues;
+mod brain;
 mod call_capture;
 mod call_export;
 mod call_segments;
@@ -17,6 +18,7 @@ mod engine;
 mod export_file;
 mod fonts;
 mod history;
+mod insights;
 mod integration;
 mod learning;
 mod library;

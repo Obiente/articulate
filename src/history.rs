@@ -16,7 +16,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ROWS: usize = 100_000;
@@ -48,6 +48,10 @@ pub struct Session {
     /// Personal writing is independent of source-quoted highlights.
     #[serde(default)]
     pub personal_notes: String,
+    #[serde(default)]
+    pub metrics: crate::insights::DictationMetrics,
+    #[serde(default)]
+    pub generated_summary: Option<crate::brain::Draft>,
 }
 
 impl Session {
@@ -65,6 +69,8 @@ impl Session {
             speaker_names: Default::default(),
             notes: None,
             personal_notes: String::new(),
+            metrics: Default::default(),
+            generated_summary: None,
         }
     }
 }
@@ -138,7 +144,7 @@ impl History {
         Ok(Self { directory })
     }
 
-    pub fn list(&self) -> Result<Vec<Summary>> {
+    fn ids(&self) -> Result<BTreeSet<String>> {
         let mut ids = BTreeSet::new();
         for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
@@ -157,6 +163,21 @@ impl History {
                 "Local history contains too many items"
             );
         }
+        Ok(ids)
+    }
+
+    pub fn insights(&self) -> Result<crate::insights::Report> {
+        let mut aggregate = crate::insights::Aggregate::new(now_ms());
+        for id in self.ids()? {
+            if let Some(session) = self.recover(&id).ok().flatten() {
+                aggregate.push(&session);
+            }
+        }
+        Ok(aggregate.finish())
+    }
+
+    pub fn list(&self) -> Result<Vec<Summary>> {
+        let ids = self.ids()?;
         // A damaged individual item cannot prevent other recordings from opening.
         let mut summaries: Vec<_> = ids
             .into_iter()
@@ -178,6 +199,16 @@ impl History {
     pub fn load(&self, id: &str) -> Result<Session> {
         self.recover(id)?
             .context("This history item is no longer available")
+    }
+
+    /// Read only the committed file. Independent search workers must never
+    /// recover, remove, or quarantine another worker's in-flight save files.
+    pub(crate) fn snapshot(&self, id: &str) -> Result<Session> {
+        let deleted = self.path(id, "deleted")?;
+        ensure!(!deleted.exists(), "This history item was deleted");
+        let session = read_session(&self.path(id, "json")?, id)?;
+        ensure!(!deleted.exists(), "This history item was deleted");
+        Ok(session)
     }
 
     pub fn save(&self, mut session: Session) -> Result<Session> {
@@ -365,7 +396,7 @@ fn read_session(path: &Path, expected_id: &str) -> Result<Session> {
     }
     let stored: Stored = serde_json::from_value(value)?;
     ensure!(
-        stored.schema == SCHEMA && stored.session.id == expected_id,
+        (1..=SCHEMA).contains(&stored.schema) && stored.session.id == expected_id,
         "Invalid history schema or identity"
     );
     validate(&stored.session)?;
@@ -373,6 +404,12 @@ fn read_session(path: &Path, expected_id: &str) -> Result<Session> {
 }
 
 fn validate(session: &Session) -> Result<()> {
+    if let Some(app) = &session.metrics.app {
+        ensure!(
+            crate::dictionary::app_scope(app)?.is_some(),
+            "Invalid dictation app metadata"
+        );
+    }
     ensure!(valid_id(&session.id), "Invalid history identifier");
     ensure!(
         session.title.len() <= 2048 && !session.title.contains('\0'),
@@ -394,6 +431,14 @@ fn validate(session: &Session) -> Result<()> {
         .len()
         .saturating_add(session.original.len())
         .saturating_add(session.personal_notes.len());
+    if let Some(summary) = &session.generated_summary {
+        let bytes = serde_json::to_vec(summary)?.len();
+        ensure!(
+            bytes <= MAX_TEXT_BYTES,
+            "Generated summary exceeds history size limit"
+        );
+        text_bytes = text_bytes.saturating_add(bytes);
+    }
     for row in &session.rows {
         ensure!(
             row.end_ms >= row.start_ms && row.speakers.len() <= 4,
@@ -476,6 +521,8 @@ fn new_id() -> String {
 }
 
 pub enum Event {
+    Insights(crate::insights::Report),
+    InsightsFailed(String),
     Listed(Vec<Summary>),
     Loaded(Box<Session>),
     Saved { id: String, updated_ms: u64 },
@@ -484,6 +531,7 @@ pub enum Event {
 }
 
 enum Command {
+    Insights,
     List,
     Load(String),
     Save(PendingSave),
@@ -562,6 +610,10 @@ impl Worker {
         Self { shared, thread }
     }
 
+    pub fn insights(&self) {
+        self.enqueue(Command::Insights);
+    }
+
     pub fn list(&self) {
         self.enqueue(Command::List);
     }
@@ -633,6 +685,7 @@ impl Worker {
     }
 
     fn enqueue(&self, command: Command) {
+        let insights = matches!(command, Command::Insights);
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         match &command {
             Command::Save(session) => {
@@ -654,6 +707,14 @@ impl Worker {
             {
                 return;
             }
+            Command::Insights
+                if state
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, Command::Insights)) =>
+            {
+                return;
+            }
             Command::Delete(id) => state
                 .commands
                 .retain(|command| !matches!(command, Command::Save(session) if session.id == *id)),
@@ -669,9 +730,11 @@ impl Worker {
             if state.events.len() >= 128 {
                 state.events.pop_front();
             }
-            state.events.push_back(Event::Failed(
-                "History is busy. Please try saving again.".into(),
-            ));
+            state.events.push_back(if insights {
+                Event::InsightsFailed("History is busy. Refresh Insights shortly.".into())
+            } else {
+                Event::Failed("History is busy. Please try saving again.".into())
+            });
         } else {
             state.commands.push_back(command);
             self.shared.wake.notify_one();
@@ -715,12 +778,14 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
         if history.is_err() {
             history = History::open(directory.clone());
         }
+        let insights = matches!(command, Command::Insights);
         let retry = match &command {
             Command::Save(session) => Some(session.clone()),
             _ => None,
         };
         let result = match &history {
             Ok(history) => match command {
+                Command::Insights => history.insights().map(Event::Insights),
                 Command::List => history.list().map(Event::Listed),
                 Command::Load(id) => history
                     .load(&id)
@@ -766,10 +831,21 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
             }
             _ => {}
         }
-        let event = result.unwrap_or_else(|error| Event::Failed(error.to_string()));
+        let event = result.unwrap_or_else(|error| {
+            if insights {
+                Event::InsightsFailed(error.to_string())
+            } else {
+                Event::Failed(error.to_string())
+            }
+        });
         // Keep important acknowledgements, coalesce replaceable list responses.
         if matches!(event, Event::Listed(_)) {
             state.events.retain(|old| !matches!(old, Event::Listed(_)));
+        }
+        if matches!(event, Event::Insights(_) | Event::InsightsFailed(_)) {
+            state
+                .events
+                .retain(|old| !matches!(old, Event::Insights(_) | Event::InsightsFailed(_)));
         }
         if state.events.len() >= 128 {
             state.events.pop_front();
@@ -1127,10 +1203,10 @@ mod tests {
             session: session.clone(),
         })
         .unwrap();
-        stored["session"]
-            .as_object_mut()
-            .unwrap()
-            .remove("personal_notes");
+        stored["schema"] = serde_json::json!(1);
+        for field in ["personal_notes", "metrics", "generated_summary"] {
+            stored["session"].as_object_mut().unwrap().remove(field);
+        }
         fs::write(
             history.path(&session.id, "json").unwrap(),
             serde_json::to_vec(&stored).unwrap(),
@@ -1139,5 +1215,71 @@ mod tests {
         let reopened = history.load(&session.id).unwrap();
         assert!(reopened.personal_notes.is_empty());
         assert_eq!(reopened.rows[0].text, session.rows[0].text);
+    }
+    #[test]
+    fn insights_counts_retained_ids_once_and_removes_deleted_sessions() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = Session::new(Kind::Dictation);
+        session.text = "These are saved words".into();
+        session.metrics = crate::insights::DictationMetrics {
+            recognized_words: Some(4),
+            audio_duration_ms: Some(2000),
+            app: Some("editor.exe".into()),
+            dictionary_replacements: Some(2),
+            cleanup_edits: Some(0),
+        };
+        history.save(session.clone()).unwrap();
+        session.text = "Manually edited to a much longer text afterwards".into();
+        history.save(session.clone()).unwrap();
+        let report = history.insights().unwrap();
+        assert_eq!((report.sessions, report.words), (1, 4));
+        assert_eq!(report.words_per_minute, Some(120.0));
+        assert_eq!(report.dictionary_replacements, 2);
+        assert_eq!(report.correction_sessions, 1);
+        assert_eq!(report.apps[0].app.as_deref(), Some("editor.exe"));
+        history.delete(&session.id).unwrap();
+        assert_eq!(history.insights().unwrap().sessions, 0);
+    }
+
+    #[test]
+    fn legacy_metrics_remain_unknown_and_aggregate_off_worker() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = Session::new(Kind::Dictation);
+        session.text = "Three saved words".into();
+        let mut stored = serde_json::to_value(Stored {
+            schema: SCHEMA,
+            session: session.clone(),
+        })
+        .unwrap();
+        stored["session"].as_object_mut().unwrap().remove("metrics");
+        fs::write(
+            history.path(&session.id, "json").unwrap(),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        let loaded = history.load(&session.id).unwrap();
+        assert!(loaded.metrics.audio_duration_ms.is_none());
+        let worker = Worker::start_directory(directory.0.clone());
+        worker.insights();
+        let start = std::time::Instant::now();
+        loop {
+            for event in worker.drain() {
+                match event {
+                    Event::Insights(report) => {
+                        assert_eq!((report.sessions, report.words), (1, 3));
+                        assert!(report.words_per_minute.is_none());
+                        assert_eq!(report.correction_sessions, 0);
+                        assert!(report.apps[0].app.is_none());
+                        return;
+                    }
+                    Event::InsightsFailed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }

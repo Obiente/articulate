@@ -20,13 +20,16 @@ use transcribe_cpp::CancelToken;
 
 const ACCENT: Color32 = Color32::from_rgb(144, 223, 201);
 mod assort_ui;
+mod brain_ui;
 mod discord_ui;
 mod editors;
 mod file_picker;
 mod history_ui;
+mod insights_ui;
 mod notetaker;
 mod polish_ui;
 mod preferences;
+mod search_ui;
 mod shortcut_gesture;
 mod surface;
 mod theme;
@@ -120,6 +123,10 @@ pub struct App {
     updates: crate::update::State,
     pending_install: Option<crate::update::InstallRequest>,
     history: history_ui::State,
+    insights: insights_ui::State,
+    saved_search: search_ui::State,
+    brain: brain_ui::State,
+    dictation_metrics: crate::insights::DictationMetrics,
     settings: Settings,
     commands: Sender<Command>,
     events: Receiver<Event>,
@@ -274,6 +281,10 @@ impl App {
             updates: Default::default(),
             pending_install: None,
             history: history_ui::State::start(),
+            insights: Default::default(),
+            saved_search: Default::default(),
+            brain: Default::default(),
+            dictation_metrics: Default::default(),
             settings,
             commands,
             events,
@@ -394,6 +405,8 @@ impl App {
             self.hold_recording = false;
             self.shortcut_gesture = Default::default();
             self.last_seconds = recording.seconds() as u64;
+            self.dictation_metrics.audio_duration_ms =
+                Some((f64::from(recording.seconds()) * 1000.0) as u64);
             let result = recording.stop();
             if self.settings.audio_feedback {
                 crate::audio_cues::play(crate::audio_cues::Cue::Stopped);
@@ -446,6 +459,10 @@ impl App {
                     self.last_seconds = 0;
                     self.target = target;
                     self.dictation_app = target.and_then(platform::app_name);
+                    self.dictation_metrics = crate::insights::DictationMetrics {
+                        app: self.dictation_app.clone(),
+                        ..Default::default()
+                    };
                     self.macro_used = None;
                     self.elapsed = None;
                     self.utterance += 1;
@@ -566,6 +583,16 @@ impl App {
         self.history.dictation = None;
         self.history.dictation_deleted = false;
         self.dictation_app = None;
+        self.dictation_metrics = Default::default();
+        // The previous view is already saved. A failed import must not later
+        // create another session containing the previous dictation's words.
+        self.text.clear();
+        self.raw.clear();
+        self.edit_baseline.clear();
+        self.edited_at = None;
+        self.elapsed = None;
+        self.words_changed = 0;
+        self.cleanup_count = 0;
         self.macro_used = None;
         self.committed_raw.clear();
         self.utterance += 1;
@@ -687,6 +714,7 @@ impl App {
             match event {
                 Event::Call(update) => match update {
                     calls::Update::Started => {
+                        self.discord_launch.automation.capture_started();
                         self.call_status = "Listening to your microphone and call audio".into()
                     }
                     calls::Update::NativeAudio(received) => {
@@ -713,6 +741,15 @@ impl App {
                     }
                 },
                 Event::CallFinished(result) => {
+                    if result.is_err() {
+                        self.discord_launch.automation.capture_failed(
+                            Instant::now(),
+                            !self.call_rows.is_empty(),
+                            self.call
+                                .as_ref()
+                                .is_some_and(|control| control.stop_ns.load(Ordering::SeqCst) != 0),
+                        );
+                    }
                     self.history_save_call();
                     self.call = None;
                     self.call_levels = (0.0, 0.0);
@@ -826,6 +863,11 @@ impl App {
                             continue;
                         }
                     }
+                    self.dictation_metrics.recognized_words =
+                        Some(self.raw.split_whitespace().count() as u64);
+                    self.dictation_metrics.dictionary_replacements =
+                        Some(self.words_changed as u64);
+                    self.dictation_metrics.cleanup_edits = Some(self.cleanup_count as u64);
                     self.status = if self.text.is_empty() {
                         "No speech was recognized".into()
                     } else {
@@ -985,7 +1027,9 @@ impl App {
             self.shortcut_gesture = Default::default();
         }
         self.history_poll();
+        self.poll_saved_search();
         self.polish_poll();
+        self.brain_poll();
         self.preview();
     }
 
@@ -1278,6 +1322,8 @@ impl App {
         ui.label(RichText::new(&self.status).small().color(muted));
 
                         ui.add_space(16.0);
+                        self.brain_settings_ui(ui);
+                        ui.separator();
                         self.polish_settings_ui(ui);
                         ui.separator();
                         self.assort_settings_ui(ui);
@@ -1468,7 +1514,7 @@ impl App {
                     });
                 });
                 ui.add_space(2.0);
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     let status = if !self.ready {
                         "Load a speech model in Settings to capture a call."
                     } else if !crate::speakers::path().is_file() && !self.discord_activity_ready() {
@@ -1476,22 +1522,33 @@ impl App {
                     } else {
                         &self.call_status
                     };
-                    ui.label(
-                        RichText::new(if self.call.is_some() {
-                            if self.call_native_audio {
-                                if self.call_native_received {
-                                    "Native participant audio"
+                    // A missing local speaker model must not make this header
+                    // wrap and steal the transcript's reading space.
+                    let reserve = if compact && self.call.is_some() {
+                        410.0
+                    } else {
+                        280.0
+                    };
+                    ui.add_sized(
+                        [(ui.available_width() - reserve).max(80.0), 28.0],
+                        egui::Label::new(
+                            RichText::new(if self.call.is_some() {
+                                if self.call_native_audio {
+                                    if self.call_native_received {
+                                        "Native participant audio"
+                                    } else {
+                                        "Waiting for participant audio"
+                                    }
                                 } else {
-                                    "Waiting for participant audio"
+                                    "Mixed call audio"
                                 }
                             } else {
-                                "Mixed call audio"
-                            }
-                        } else {
-                            status
-                        })
-                        .small()
-                        .color(muted),
+                                status
+                            })
+                            .small()
+                            .color(muted),
+                        )
+                        .truncate(),
                     )
                     .on_hover_text(status);
                     ui.add_space(12.0);
@@ -1499,7 +1556,7 @@ impl App {
                         .discord
                         .as_ref()
                         .map(|connection| connection.snapshot());
-                    let (label, active) = discord_ui::connection_label(snapshot.as_ref());
+                    let (label, active) = self.discord_connection_label(snapshot.as_ref());
                     ui.label(
                         RichText::new(format!("Discord · {label}"))
                             .small()
@@ -2471,6 +2528,10 @@ mod tests {
                 updates: Default::default(),
                 pending_install: None,
                 history: history_ui::State::default(),
+                insights: Default::default(),
+                saved_search: Default::default(),
+                brain: Default::default(),
+                dictation_metrics: Default::default(),
                 settings: Settings::default(),
                 commands,
                 events,
@@ -2782,5 +2843,45 @@ mod tests {
         app.receive();
         assert_eq!(app.text, "First section. Final section.");
         assert!(!app.busy);
+    }
+    #[test]
+    fn failed_audio_import_does_not_duplicate_previous_dictation() {
+        let (mut app, commands) = app();
+        let temporary = std::env::temp_dir();
+        let directory = temporary.join(format!(
+            "articulate-failed-import-{}",
+            crate::history::Session::new(crate::history::Kind::Dictation).id
+        ));
+        assert_eq!(directory.parent(), Some(temporary.as_path()));
+        app.history.worker = Some(crate::history::Worker::test_directory(directory.clone()));
+        app.text = "Previously saved words.".into();
+        app.raw = app.text.clone();
+        app.dictation_metrics.recognized_words = Some(3);
+        app.history_save_dictation();
+        let previous_id = app.history.dictation.as_ref().unwrap().id.clone();
+        app.transcribe(vec![0.0; 3200]);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::Transcribe(_, _, true, _)
+        ));
+        assert!(app.text.is_empty() && app.raw.is_empty());
+        app.event_tx
+            .send(Event::Text(
+                Err("Synthetic recognition failure".into()),
+                0.1,
+                app.utterance,
+                true,
+            ))
+            .unwrap();
+        app.receive();
+        app.history_save_dictation();
+        assert!(app.history.dictation.is_none());
+        drop(app);
+        let history = crate::history::History::open(directory.clone()).unwrap();
+        assert_eq!(history.list().unwrap().len(), 1);
+        let saved = history.load(&previous_id).unwrap();
+        assert_eq!(saved.text, "Previously saved words.");
+        assert_eq!(saved.metrics.recognized_words, Some(3));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

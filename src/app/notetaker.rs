@@ -68,6 +68,9 @@ impl App {
             && current.id == session.id
         {
             current.personal_notes.clone_from(&session.personal_notes);
+            current
+                .generated_summary
+                .clone_from(&session.generated_summary);
             current.title.clone_from(&session.title);
             self.history_call_changed();
         }
@@ -87,6 +90,9 @@ impl App {
             && current.id == session.id
         {
             current.personal_notes.clone_from(&session.personal_notes);
+            current
+                .generated_summary
+                .clone_from(&session.generated_summary);
             current.title.clone_from(&session.title);
             self.history_save_call();
             self.history.selected = self.history.call.clone();
@@ -433,6 +439,7 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.history.notetaker_tab, 0, "My notes");
             if session.kind == Kind::Call {
+                ui.selectable_value(&mut self.history.notetaker_tab, 3, "Summary");
                 ui.selectable_value(&mut self.history.notetaker_tab, 1, "Highlights");
                 ui.selectable_value(&mut self.history.notetaker_tab, 2, "Transcript");
             }
@@ -474,6 +481,9 @@ impl App {
         }
         ui.separator();
         match self.history.notetaker_tab {
+            3 if session.kind == Kind::Call => {
+                changed |= self.brain_summary_ui(ui, &mut session);
+            }
             1 if session.kind == Kind::Call => {
                 egui::ScrollArea::vertical()
                     .id_salt(("saved_highlights", &session.id))
@@ -708,6 +718,18 @@ fn full_note(session: &Session) -> String {
         full_time(session.created_ms),
         session.personal_notes
     );
+    if let Some(summary) = &session.generated_summary {
+        let stale = summary.validate(&super::brain_ui::source(session)).is_err();
+        text.push_str(&format!(
+            "\n## Summary{}\n\n{}\n",
+            if stale {
+                " (earlier transcript version)"
+            } else {
+                ""
+            },
+            super::brain_ui::summary_text(summary)
+        ));
+    }
     if let Some(notes) = &session.notes {
         text.push_str(&format!(
             "\n## Highlights\n\n{}\n",
@@ -867,6 +889,44 @@ mod tests {
         assert_eq!(
             app.history.selected.as_ref().unwrap().personal_notes,
             saved.personal_notes
+        );
+    }
+
+    #[test]
+    fn reviewed_summary_survives_call_snapshot_and_personal_note_save() {
+        let (mut app, _) = super::super::tests::app();
+        let mut session = Session::new(Kind::Call);
+        session.generated_summary = Some(crate::brain::Draft {
+            schema: 1,
+            source_id: session.id.clone(),
+            source_hash: "synthetic".into(),
+            model: crate::brain::MODEL_LABEL.into(),
+            sections: 0,
+            elapsed_ms: 1,
+            items: vec![],
+        });
+        let mut previous = session.clone();
+        previous.generated_summary = None;
+        app.history.call = Some(previous);
+        app.history.selected = Some(session.clone());
+        app.notetaker_changed(&session);
+        app.history_save_call();
+        app.history_save_personal_notes();
+        assert!(
+            app.history
+                .call
+                .as_ref()
+                .unwrap()
+                .generated_summary
+                .is_some()
+        );
+        assert!(
+            app.history
+                .selected
+                .as_ref()
+                .unwrap()
+                .generated_summary
+                .is_some()
         );
     }
 

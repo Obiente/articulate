@@ -36,6 +36,54 @@ fn page_app(page: &str) -> App {
         _ => populated_app(),
     };
     match page {
+        "search" => app.prepare_search_capture(),
+        "insights" => {
+            app.page = 7;
+            app.insights.report = Some(crate::insights::Report {
+                words: 12680,
+                sessions: 104,
+                measured_sessions: 88,
+                audio_duration_ms: 6120000,
+                words_per_minute: Some(112.4),
+                active_days: 18,
+                current_streak: 7,
+                longest_streak: 12,
+                dictionary_replacements: 68,
+                cleanup_edits: 247,
+                correction_sessions: 88,
+                apps: vec![
+                    crate::insights::AppUsage {
+                        app: Some("Discord.exe".into()),
+                        words: 7610,
+                        sessions: 62,
+                    },
+                    crate::insights::AppUsage {
+                        app: Some("Code.exe".into()),
+                        words: 5070,
+                        sessions: 42,
+                    },
+                ],
+                days: (1..=28)
+                    .map(|day| crate::insights::DayActivity {
+                        date: format!("2026-09-{day:02}"),
+                        words: if day % 4 == 0 { 0 } else { day * 43 },
+                        sessions: day % 8,
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+        }
+        "summary" => {
+            app.page = 6;
+            let mut session = crate::history::Session::new(crate::history::Kind::Call);
+            session.title = "Planning the next release".into();
+            session.rows = app.call_rows[..3].to_vec();
+            session.speaker_names = app.speaker_names.clone();
+            session.text = calls::text(&session.rows, &session.speaker_names);
+            app.prepare_summary_capture(&mut session);
+            app.history.selected = Some(session);
+            app.history.notetaker_tab = 3;
+        }
         "notetaker"
         | "notetaker-editor"
         | "notetaker-active"
@@ -170,46 +218,53 @@ fn populated_history_app(detail: bool) -> App {
 #[test]
 fn calls_reserve_readable_transcript_height() {
     for (width, height, minimum) in [(850.0, 620.0, 300.0), (1200.0, 840.0, 450.0)] {
-        let mut app = populated_app();
-        let ctx = egui::Context::default();
-        theme::configure(&ctx);
-        let mut output = None;
-        for _ in 0..3 {
-            output = Some(ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(width, height),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| app.surface(ctx),
-            ));
+        for (ready, recording) in [(false, false), (true, false), (true, true)] {
+            let mut app = populated_app();
+            app.ready = ready;
+            app.call_status="Open Setup to connect Discord or prepare speaker recognition before capturing another conversation.".into();
+            if recording {
+                app.call = Some(call_capture::Control::new());
+            }
+            let ctx = egui::Context::default();
+            theme::configure(&ctx);
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| app.surface(ctx),
+                ));
+            }
+            let output = output.unwrap();
+            let transcript_clip = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text)
+                        if app
+                            .call_rows
+                            .iter()
+                            .any(|row| text.galley.job.text == row.text) =>
+                    {
+                        Some(shape.clip_rect)
+                    }
+                    _ => None,
+                })
+                .expect("Transcript is painted in the default Calls tab");
+            assert!(
+                transcript_clip.height() >= minimum,
+                "Transcript clip too short at {width}x{height}: {transcript_clip:?}"
+            );
+            assert!(
+                transcript_clip.bottom() <= height - 32.0,
+                "Transcript extends beyond the content canvas"
+            );
         }
-        let output = output.unwrap();
-        let transcript_clip = output
-            .shapes
-            .iter()
-            .find_map(|shape| match &shape.shape {
-                egui::epaint::Shape::Text(text)
-                    if app
-                        .call_rows
-                        .iter()
-                        .any(|row| text.galley.job.text == row.text) =>
-                {
-                    Some(shape.clip_rect)
-                }
-                _ => None,
-            })
-            .expect("Transcript is painted in the default Calls tab");
-        assert!(
-            transcript_clip.height() >= minimum,
-            "Transcript clip too short at {width}x{height}: {transcript_clip:?}"
-        );
-        assert!(
-            transcript_clip.bottom() <= height - 32.0,
-            "Transcript extends beyond the content canvas"
-        );
     }
 }
 
@@ -371,7 +426,7 @@ fn capture_calls_ui() {
             };
             if let Some(session) = app.history.selected.as_ref().or(app.history.call.as_ref())
                 && std::env::var("ARTICULATE_UI_PAGE")
-                    .is_ok_and(|page| page.starts_with("notetaker"))
+                    .is_ok_and(|page| page.starts_with("notetaker") || page == "summary")
             {
                 let folder = output
                     .parent()

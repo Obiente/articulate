@@ -25,9 +25,20 @@ impl Context {
 }
 
 impl App {
+    pub(super) fn polish_working(&self) -> bool {
+        self.polish.job.is_some()
+    }
+
+    pub(super) fn release_polish_runtime(&mut self) {
+        if self.polish.job.is_none() {
+            self.polish.worker = Worker::default();
+        }
+    }
+
     fn polish_idle(&self) -> bool {
         self.recording.is_none()
             && self.call.is_none()
+            && !self.brain_working()
             && !self.busy
             && !self.preview_inflight
             && !self.integration_inflight
@@ -170,7 +181,7 @@ impl App {
             if ui
                 .button(format!(
                     "Download editor · {:.0} MB",
-                    polish::MODEL_BYTES as f64 / 1_000_000.0 + 19.0
+                    polish::DOWNLOAD_BYTES as f64 / 1_000_000.0
                 ))
                 .clicked()
             {

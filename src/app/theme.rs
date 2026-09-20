@@ -13,6 +13,8 @@ pub(super) fn page_title(ui: &mut egui::Ui, title: &str) -> egui::Response {
 
 #[derive(Clone, Copy)]
 pub(super) enum Icon {
+    Search,
+    Chart,
     Mic,
     Phone,
     Book,
@@ -27,6 +29,8 @@ pub(super) enum Icon {
 impl Icon {
     pub fn image(self, size: f32, tint: Color32) -> egui::Image<'static> {
         let source = match self {
+            Self::Search => egui::ImageSource::Bytes { uri: "bytes://articulate-search.svg".into(), bytes: br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg>"#.as_slice().into() },
+            Self::Chart => egui::ImageSource::Bytes { uri: "bytes://articulate-chart.svg".into(), bytes: br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round"><path d="M4 4v16h16M9 15v-4m5 4V7m5 8v-5"/></svg>"#.as_slice().into() },
             Self::Mic => egui::include_image!("../../assets/icons/microphone.svg"),
             Self::Phone => egui::include_image!("../../assets/icons/phone.svg"),
             Self::Book => egui::include_image!("../../assets/icons/book-open.svg"),
@@ -42,6 +46,8 @@ impl Icon {
             .fit_to_exact_size(egui::vec2(size, size))
             .tint(tint)
             .alt_text(match self {
+                Self::Search => "Search",
+                Self::Chart => "Insights",
                 Self::Mic => "Dictation",
                 Self::Phone => "Calls",
                 Self::Book => "Vocabulary",

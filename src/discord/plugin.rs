@@ -620,6 +620,10 @@ mod tests {
         .to_string();
         assert!(exchange("POST", "/voice", &token, body.as_bytes()).starts_with("HTTP/1.1 204"));
         assert_eq!(control()["active"], false);
+        assert!(
+            connection.native_audio_ready(),
+            "Native readiness must precede arming and PCM"
+        );
         assert!(exchange("POST", "/pcm", &token, &packet(1, 456, 1)).starts_with("HTTP/1.1 400"));
         let observation = connection.snapshot().observation.unwrap();
         let capture = connection.shared.pcm.begin(&observation).unwrap();

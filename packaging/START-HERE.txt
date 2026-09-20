@@ -64,3 +64,9 @@ synthetic or non-sensitive example and what you expected. Review any screenshot
 or transcript for private content before sharing it.
 
 Licenses for the app, runtime, fonts and dependencies are in licenses/.
+
+SUMMARIES AND INSIGHTS
+Download the optional summary model in Settings (about 3.16 GB on first setup).
+Open a saved call or dictation, choose Summary, generate and review its sources,
+then save. My notes and the transcript stay separate. Search finds phrases in
+saved content. Insights shows your retained dictation usage on this device.

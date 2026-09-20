@@ -15,6 +15,8 @@ pub(super) struct LaunchState {
     companion: CompanionState,
     retry: Retry,
     pub(super) automation: AutoCall,
+    automatic_status: String,
+    automatic_model_attempt: Option<String>,
 }
 
 #[derive(Default)]
@@ -49,8 +51,38 @@ pub(super) struct AutoCall {
     left: Option<Instant>,
     owned: Option<String>,
     suppressed: Option<String>,
+    retry_at: Option<Instant>,
+    failed_attempts: u32,
+    started: bool,
 }
 impl AutoCall {
+    fn start_failed(&mut self, now: Instant) {
+        self.started = false;
+        let channel = self.owned.take();
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+        self.suppressed = if self.failed_attempts >= 3 {
+            channel
+        } else {
+            None
+        };
+        self.retry_at = Some(now + Duration::from_secs(2));
+    }
+    pub(super) fn capture_started(&mut self) {
+        if self.owned.is_some() {
+            self.started = true;
+            self.failed_attempts = 0;
+        }
+    }
+    pub(super) fn capture_failed(&mut self, now: Instant, has_text: bool, stopping: bool) {
+        if self.owned.is_some() && !self.started && !has_text && !stopping {
+            self.start_failed(now);
+        }
+    }
+    fn retry(&mut self) {
+        self.failed_attempts = 0;
+        self.suppressed = None;
+        self.retry_at = None;
+    }
     pub(super) fn manual_finish(&mut self) {
         if let Some(channel) = self.owned.take() {
             self.suppressed = Some(channel);
@@ -84,6 +116,7 @@ impl AutoCall {
                 let since = *self.left.get_or_insert(now);
                 if now.duration_since(since) >= Duration::from_secs(2) {
                     self.suppressed = None;
+                    self.failed_attempts = 0;
                     if active && !stopping && self.owned.is_some() {
                         return Some(AutoAction::Stop);
                     }
@@ -109,11 +142,13 @@ impl AutoCall {
                 } else {
                     self.left = None;
                     if can_start
+                        && self.retry_at.is_none_or(|at| now >= at)
                         && self.suppressed.as_ref() != Some(&channel)
                         && self.joined.as_ref().is_some_and(|(_, at)| {
                             now.duration_since(*at) >= Duration::from_millis(750)
                         })
                     {
+                        self.started = false;
                         self.owned = Some(channel.clone());
                         self.suppressed = Some(channel);
                         return Some(AutoAction::Start);
@@ -291,9 +326,57 @@ impl App {
             && self.integration_pending.is_none()
             && self.pending_final.is_none()
             && self.pending_install.is_none();
+        if self.ready {
+            self.discord_launch.automatic_model_attempt = None;
+        }
+        if self.settings.discord_auto_transcribe
+            && matches!(presence, Presence::In(_))
+            && idle
+            && !self.ready
+            && PathBuf::from(&self.settings.model_path).is_file()
+            && self.discord_launch.automatic_model_attempt.as_ref()
+                != Some(&self.settings.model_path)
+        {
+            self.discord_launch.automatic_model_attempt = Some(self.settings.model_path.clone());
+            self.load();
+        }
+        self.discord_launch.automatic_status = if !self.settings.discord_auto_transcribe {
+            String::new()
+        } else if self.call.is_some() {
+            if self.discord_launch.automation.owned.is_some() {
+                "Automatic capture is running."
+            } else {
+                "This capture is controlled manually."
+            }
+            .into()
+        } else if !matches!(presence, Presence::In(_)) {
+            "Waiting for you to join a Discord voice channel.".into()
+        } else if self.loading {
+            "Loading the speech model for automatic capture…".into()
+        } else if !self.ready {
+            if PathBuf::from(&self.settings.model_path).is_file() {
+                format!("Speech model is not ready. {}", self.status)
+            } else {
+                "Choose and download a speech model in Settings to start automatically.".into()
+            }
+        } else if self.settings.discord_companion && !native_ready {
+            "Speaker names are connected. Waiting for the participant audio adapter. Update the companion and restart Discord if this continues.".into()
+        } else if self
+            .discord_launch
+            .automation
+            .suppressed
+            .as_ref()
+            .is_some_and(|id| matches!(&presence, Presence::In(channel) if channel == id))
+        {
+            "Automatic capture is paused for this voice channel. Retry to start again.".into()
+        } else if !idle {
+            "Waiting for the current dictation or task to finish.".into()
+        } else {
+            "Voice channel detected. Starting automatic capture…".into()
+        };
         let action = self.discord_launch.automation.tick(
             Instant::now(),
-            presence,
+            presence.clone(),
             self.settings.discord_auto_transcribe,
             self.call.is_some(),
             self.call
@@ -305,6 +388,9 @@ impl App {
             Some(AutoAction::Start) => {
                 if self.start_call_capture() {
                     self.call_status = "Joined Discord. Starting your call transcript…".into();
+                } else {
+                    self.discord_launch.automation.start_failed(Instant::now());
+                    self.discord_launch.automatic_status = self.call_status.clone();
                 }
             }
             Some(AutoAction::Stop) => {
@@ -314,6 +400,24 @@ impl App {
                 self.call_status = "Left the voice channel. Saving your call transcript…".into();
             }
             None => {}
+        }
+    }
+
+    pub(super) fn discord_connection_label(
+        &self,
+        snapshot: Option<&Snapshot>,
+    ) -> (&'static str, bool) {
+        let (label, ready) = connection_label(snapshot);
+        if ready
+            && self.settings.discord_companion
+            && !self
+                .discord
+                .as_ref()
+                .is_some_and(|connection| connection.native_audio_ready())
+        {
+            ("Names connected · audio unavailable", false)
+        } else {
+            (label, ready)
         }
     }
 
@@ -376,7 +480,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Discord speakers").strong().size(18.0));
                     ui.add_space(8.0);
-                    let (label, active) = connection_label(snapshot);
+                    let (label, active) = self.discord_connection_label(snapshot);
                     ui.label(RichText::new(label).small().color(if active { ACCENT } else { MUTED }));
                     ui.add_space(8.0);
                     let connected = snapshot.is_some();
@@ -456,6 +560,13 @@ impl App {
                     self.save();
                 }
                 ui.small("Starts when you join a voice channel and saves when you leave. Calls you start yourself stay under your control.");
+                if self.settings.discord_auto_transcribe && !self.discord_launch.automatic_status.is_empty() {
+                    ui.label(RichText::new(&self.discord_launch.automatic_status).color(MUTED));
+                    if self.call.is_none() && ui.button("Retry automatic capture").clicked() {
+                        self.discord_launch.automation.retry();
+                        self.discord_launch.automatic_model_attempt = None;
+                    }
+                }
                 if self.settings.discord_companion {
                     self.discord_companion_ui(ui, ctx);
                     return;
@@ -1573,5 +1684,232 @@ mod tests {
                 "Rendering never initiates a connection"
             );
         }
+    }
+    #[test]
+    fn failed_automatic_start_retries_without_rejoining_and_preserves_native_gate() {
+        let mut state = AutoCall::default();
+        let at = Instant::now();
+        let inside = || Presence::In("123".into());
+        state.tick(at, inside(), true, false, false, true);
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(1),
+                inside(),
+                true,
+                false,
+                false,
+                true
+            ),
+            Some(AutoAction::Start)
+        );
+        state.start_failed(at + Duration::from_secs(1));
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(2),
+                inside(),
+                true,
+                false,
+                false,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(3),
+                inside(),
+                true,
+                false,
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(4),
+                inside(),
+                true,
+                false,
+                false,
+                true
+            ),
+            Some(AutoAction::Start)
+        );
+    }
+    #[test]
+    fn worker_startup_failure_retries_three_times_without_erasing_manual_or_started_calls() {
+        let (mut app, _commands) = super::super::tests::app();
+        let at = Instant::now();
+        app.discord_launch.automation.tick(
+            at,
+            Presence::In("123".into()),
+            true,
+            false,
+            false,
+            true,
+        );
+        for attempt in 0..3 {
+            let time = at + Duration::from_secs(1 + attempt * 4);
+            assert_eq!(
+                app.discord_launch.automation.tick(
+                    time,
+                    Presence::In("123".into()),
+                    true,
+                    false,
+                    false,
+                    true
+                ),
+                Some(AutoAction::Start)
+            );
+            app.call = Some(call_capture::Control::new());
+            app.event_tx
+                .send(Event::CallFinished(Err(
+                    "Synthetic microphone unavailable".into()
+                )))
+                .unwrap();
+            app.receive();
+            assert!(app.call.is_none());
+            assert_eq!(
+                app.discord_launch.automation.failed_attempts,
+                attempt as u32 + 1
+            );
+        }
+        assert_eq!(
+            app.discord_launch.automation.tick(
+                at + Duration::from_secs(30),
+                Presence::In("123".into()),
+                true,
+                false,
+                false,
+                true
+            ),
+            None
+        );
+        app.discord_launch.automation.retry();
+        assert_eq!(
+            app.discord_launch.automation.tick(
+                at + Duration::from_secs(31),
+                Presence::In("123".into()),
+                true,
+                false,
+                false,
+                true
+            ),
+            Some(AutoAction::Start)
+        );
+        app.call = Some(call_capture::Control::new());
+        app.event_tx
+            .send(Event::Call(calls::Update::Started))
+            .unwrap();
+        app.receive();
+        assert_eq!(app.discord_launch.automation.failed_attempts, 0);
+        app.event_tx
+            .send(Event::CallFinished(Err("Synthetic runtime failure".into())))
+            .unwrap();
+        app.receive();
+        assert_eq!(
+            app.discord_launch.automation.tick(
+                at + Duration::from_secs(35),
+                Presence::In("123".into()),
+                true,
+                false,
+                false,
+                true
+            ),
+            None
+        );
+        let mut manual = AutoCall::default();
+        manual.capture_failed(at, false, false);
+        assert_eq!(manual.failed_attempts, 0);
+        let mut stopping = AutoCall {
+            owned: Some("123".into()),
+            ..Default::default()
+        };
+        stopping.capture_failed(at, false, true);
+        assert_eq!(stopping.failed_attempts, 0);
+        let mut with_text = AutoCall {
+            owned: Some("123".into()),
+            ..Default::default()
+        };
+        with_text.capture_failed(at, true, false);
+        assert_eq!(with_text.failed_attempts, 0);
+    }
+    #[test]
+    fn explicit_retry_releases_manual_stop_suppression() {
+        let mut state = AutoCall::default();
+        let at = Instant::now();
+        let inside = || Presence::In("123".into());
+        state.tick(at, inside(), true, false, false, true);
+        state.tick(
+            at + Duration::from_secs(1),
+            inside(),
+            true,
+            false,
+            false,
+            true,
+        );
+        state.manual_finish();
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(2),
+                inside(),
+                true,
+                false,
+                false,
+                true
+            ),
+            None
+        );
+        state.retry();
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(3),
+                inside(),
+                true,
+                false,
+                false,
+                true
+            ),
+            Some(AutoAction::Start)
+        );
+    }
+    #[test]
+    fn repeated_start_failures_pause_until_explicit_retry() {
+        let mut state = AutoCall::default();
+        let at = Instant::now();
+        let inside = || Presence::In("123".into());
+        state.tick(at, inside(), true, false, false, true);
+        for seconds in [1, 3, 5] {
+            let now = at + Duration::from_secs(seconds);
+            assert_eq!(
+                state.tick(now, inside(), true, false, false, true),
+                Some(AutoAction::Start)
+            );
+            state.start_failed(now);
+        }
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(20),
+                inside(),
+                true,
+                false,
+                false,
+                true
+            ),
+            None
+        );
+        state.retry();
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(21),
+                inside(),
+                true,
+                false,
+                false,
+                true
+            ),
+            Some(AutoAction::Start)
+        );
     }
 }

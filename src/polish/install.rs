@@ -4,13 +4,13 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
+        Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::Sender,
     },
-    time::Duration,
 };
 
 pub const MODEL_NAME: &str = "Qwen3.5-0.8B-Q8_0.gguf";
@@ -20,6 +20,19 @@ const MODEL_URL: &str = "https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resol
 const RUNTIME_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b10964/llama-b10964-bin-win-cpu-x64.zip";
 const RUNTIME_SHA: &str = "917f39c076402c421224824607397af20f53625a60defc20e8dd22446bf4c5d7";
 const RUNTIME_BYTES: u64 = 18_427_629;
+pub const DOWNLOAD_BYTES: u64 = MODEL_BYTES + RUNTIME_BYTES;
+pub const SUMMARY_BYTES: u64 = 3_143_656_608;
+pub const SUMMARY_DOWNLOAD_BYTES: u64 = SUMMARY_BYTES + RUNTIME_BYTES;
+const SUMMARY_NAME: &str = "Qwen3.5-4B-Q5_K_M.gguf";
+const SUMMARY_SHA: &str = "8814232b85594dcd46c50e5b8b29324a7efe9e746edbe8a3d1df3d3fce7aad39";
+const SUMMARY_URL: &str = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q5_K_M.gguf";
+use super::ModelProfile;
+fn manifest(profile: ModelProfile) -> (&'static str, u64, &'static str, &'static str) {
+    match profile {
+        ModelProfile::Polish => (MODEL_NAME, MODEL_BYTES, MODEL_SHA, MODEL_URL),
+        ModelProfile::Summary => (SUMMARY_NAME, SUMMARY_BYTES, SUMMARY_SHA, SUMMARY_URL),
+    }
+}
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Deserialize)]
@@ -40,16 +53,21 @@ pub(super) fn root() -> PathBuf {
         .join("polish")
         .join("qwen35-08b-q8-llama-b10964")
 }
-pub(super) fn model() -> PathBuf {
-    root().join(MODEL_NAME)
+pub(super) fn model_for(profile: ModelProfile) -> PathBuf {
+    root().join(manifest(profile).0)
 }
 pub(super) fn executable() -> PathBuf {
     root().join("runtime").join("llama-server.exe")
 }
 
 pub fn installed() -> bool {
+    profile_installed(ModelProfile::Polish)
+}
+pub fn profile_installed(profile: ModelProfile) -> bool {
     cfg!(all(windows, target_arch = "x86_64"))
-        && model().metadata().is_ok_and(|m| m.len() == MODEL_BYTES)
+        && model_for(profile)
+            .metadata()
+            .is_ok_and(|m| m.len() == manifest(profile).1)
         && executable().is_file()
         && root().join("ready").is_file()
         && artifacts().is_ok_and(|files| {
@@ -63,7 +81,7 @@ pub fn installed() -> bool {
         })
 }
 
-fn ordinary(path: &Path) -> Result<()> {
+pub(super) fn ordinary(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
         metadata.is_file() && !metadata.file_type().is_symlink(),
@@ -79,7 +97,7 @@ fn ordinary(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn verified(path: &Path, size: u64, expected: &str, cancel: &AtomicBool) -> Result<()> {
+pub(super) fn verified(path: &Path, size: u64, expected: &str, cancel: &AtomicBool) -> Result<()> {
     ordinary(path)?;
     let mut file = File::open(path)?;
     ensure!(
@@ -102,13 +120,17 @@ fn verified(path: &Path, size: u64, expected: &str, cancel: &AtomicBool) -> Resu
     );
     Ok(())
 }
-pub(super) fn verify(cancel: &AtomicBool) -> Result<()> {
+pub(super) fn verify_profile(profile: ModelProfile, cancel: &AtomicBool) -> Result<()> {
     ensure!(
         cfg!(all(windows, target_arch = "x86_64")),
         "The managed local editor currently requires Windows x64."
     );
-    ensure!(installed(), "Download the local editor in Settings first.");
-    verified(&model(), MODEL_BYTES, MODEL_SHA, cancel)?;
+    ensure!(
+        profile_installed(profile),
+        "Download this local model in Settings first."
+    );
+    let (_, size, sha, _) = manifest(profile);
+    verified(&model_for(profile), size, sha, cancel)?;
     for file in artifacts()? {
         verified(
             &root().join("runtime").join(file.name),
@@ -126,7 +148,15 @@ impl Drop for DownloadLock {
         DOWNLOADING.store(false, Ordering::Release);
     }
 }
-pub(super) fn download(cancel: &AtomicBool, events: &Sender<Event>) -> Result<()> {
+#[cfg(test)]
+pub(super) fn download(cancel: &Arc<AtomicBool>, events: &Sender<Event>) -> Result<()> {
+    download_profile(ModelProfile::Polish, cancel, events)
+}
+pub(super) fn download_profile(
+    profile: ModelProfile,
+    cancel: &Arc<AtomicBool>,
+    events: &Sender<Event>,
+) -> Result<()> {
     ensure!(
         cfg!(all(windows, target_arch = "x86_64")),
         "The managed local editor currently requires Windows x64."
@@ -137,14 +167,19 @@ pub(super) fn download(cancel: &AtomicBool, events: &Sender<Event>) -> Result<()
     );
     let _lock = DownloadLock;
     fs::create_dir_all(root())?;
-    let model = model();
-    if verified(&model, MODEL_BYTES, MODEL_SHA, cancel).is_err() {
+    let model = model_for(profile);
+    let (_, model_size, model_sha, model_url) = manifest(profile);
+    if verified(&model, model_size, model_sha, cancel).is_err() {
         fetch(
-            MODEL_URL,
+            model_url,
             &model,
-            MODEL_BYTES,
-            MODEL_SHA,
-            "Downloading editing model",
+            model_size,
+            model_sha,
+            if profile == ModelProfile::Polish {
+                "Downloading editing model"
+            } else {
+                "Downloading summary model"
+            },
             cancel,
             events,
         )?;
@@ -203,6 +238,10 @@ pub(super) fn download(cancel: &AtomicBool, events: &Sender<Event>) -> Result<()
         fs::write(
             root().join("LICENSE-model.txt"),
             include_bytes!("../../assets/polish/Qwen-LICENSE.txt"),
+        )?;
+        fs::write(
+            root().join("NOTICE.md"),
+            include_bytes!("../../assets/polish/NOTICE.md"),
         )?;
         check_cancel(cancel)?;
         let runtime = root().join("runtime");
@@ -278,71 +317,20 @@ fn fetch(
     size: u64,
     sha: &str,
     stage: &str,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     events: &Sender<Event>,
 ) -> Result<()> {
-    check_cancel(cancel)?;
-    let part = destination.with_extension(format!("part-{}", crate::discord::plugin::new_token()?));
-    let result = (|| -> Result<()> {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(1800)))
-            .timeout_connect(Some(Duration::from_secs(15)))
-            .timeout_recv_body(Some(Duration::from_secs(5)))
-            .build()
-            .into();
-        // These fixed public requests carry no dictation, vocabulary or user ID.
-        let mut response = agent
-            .get(url)
-            .call()
-            .context("Could not download the local editor. Check your connection and retry.")?;
-        let mut reader = response.body_mut().as_reader();
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&part)?;
-        let mut buffer = vec![0; 256 * 1024];
-        let mut received = 0u64;
-        let mut last = 0u64;
-        loop {
-            check_cancel(cancel)?;
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            received += count as u64;
-            ensure!(
-                received <= size,
-                "The editor download exceeded its expected size."
-            );
-            file.write_all(&buffer[..count])?;
-            if received - last >= 1024 * 1024 || received == size {
-                progress(events, stage, Some(received as f32 / size as f32));
-                last = received;
-            }
-        }
-        file.sync_all()?;
-        drop(file);
-        verified(&part, size, sha, cancel)?;
-        // Windows rename cannot replace an existing file. A broken model is
-        // preserved for diagnosis instead of deleting a potentially open file.
-        if destination.exists() {
-            let backup = destination
-                .with_extension(format!("replaced-{}", crate::discord::plugin::new_token()?));
-            fs::rename(destination, &backup)?;
-            if let Err(error) = fs::rename(&part, destination) {
-                let _ = fs::rename(&backup, destination);
-                return Err(error.into());
-            }
-            let _ = fs::remove_file(backup);
-        } else {
-            fs::rename(&part, destination)?;
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(part);
-    }
-    result
+    super::transfer::fetch(
+        super::transfer::Artifact {
+            url,
+            destination,
+            size,
+            sha,
+            stage,
+        },
+        cancel,
+        events,
+    )
 }
 
 #[cfg(test)]
