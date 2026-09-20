@@ -11,7 +11,7 @@ Built with Rust, a native egui interface, and a local C/C++ inference runtime. W
 - **Dictate into your apps.** Hold a customizable shortcut to speak, or double-press for hands-free dictation. Toggle mode also supports live insertion in compatible text fields.
 - **Teach it your vocabulary.** Correct a short word or phrase, review the learning notice, and undo it if needed. Vocabulary can be scoped to an app or nearby words.
 - **Say your shortcuts.** Say “bang signature” to expand a snippet, or use a template with a spoken `{text}` argument.
-- **Keep the conversation.** Capture your microphone and call output, review speaker-labelled transcripts, and create quoted highlights and possible actions.
+- **Keep the conversation.** Open [Notetaker](docs/notetaker.md) to write personal notes, capture calls, and return to saved meetings. Your writing stays separate from the transcript and reviewed highlights.
 - **Return to it later.** Local History keeps transcripts, originals, notes, and speaker names. Search, rename, copy, export, or delete a session.
 - **Review context with Assort.** Included pretrained classifiers suggest meeting highlights and review saved vocabulary choices against the sentence and destination app. Choose **Create notes** or **Review vocabulary** without configuring model paths, then review the suggestions before applying them.
 

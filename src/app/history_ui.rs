@@ -7,6 +7,13 @@ pub(super) struct State {
     pub worker: Option<Worker>,
     pub items: Vec<Summary>,
     pub selected: Option<Session>,
+    pub selected_dirty: Option<Instant>,
+    pub open_requested: Option<String>,
+    pub notetaker_search: String,
+    pub notetaker_filter: usize,
+    pub notetaker_retry: bool,
+    pub notetaker_tab: usize,
+    pub notetaker_assort: assort_ui::State,
     pub dictation: Option<Session>,
     pub call: Option<Session>,
     pub dictation_dirty: Option<Instant>,
@@ -133,7 +140,19 @@ impl App {
                     self.history.items = items;
                     self.history.loading = false;
                 }
-                HistoryEvent::Loaded(session) => {
+                HistoryEvent::Loaded(mut session) => {
+                    if self.history.open_requested.as_deref() != Some(session.id.as_str()) {
+                        continue;
+                    }
+                    self.history.open_requested = None;
+                    if let Some(current) = &self.history.call
+                        && current.id == session.id
+                    {
+                        session = Box::new(current.clone());
+                    }
+                    self.history.notetaker_tab = 0;
+                    self.history.notetaker_assort =
+                        assort_ui::State::configured(self.settings.assort.clone());
                     self.history.rename.clone_from(&session.title);
                     self.history.selected = Some(*session);
                     self.history.renaming = false;
@@ -167,6 +186,17 @@ impl App {
                 }
             }
         }
+        if self.history.notetaker_retry {
+            self.history.notetaker_retry = false;
+            self.history_retry();
+        }
+        if self
+            .history
+            .selected_dirty
+            .is_some_and(|at| at.elapsed() >= Duration::from_millis(700))
+        {
+            self.history_save_personal_notes();
+        }
         if self
             .history
             .dictation_dirty
@@ -185,6 +215,7 @@ impl App {
 
     pub(super) fn history_retry(&mut self) {
         self.history.error = None;
+        self.history_save_personal_notes();
         if self.history.dictation.is_some() {
             self.history_save_dictation();
         }
@@ -193,6 +224,9 @@ impl App {
         }
         if let Some(worker) = &self.history.worker {
             worker.retry();
+            if let Some(id) = &self.history.open_requested {
+                worker.load(id.clone());
+            }
             worker.list();
         }
     }
@@ -241,6 +275,15 @@ impl App {
                     self.page = if self.call.is_some() { 3 } else { 0 };
                 }
             });
+        }
+        if self
+            .history
+            .selected
+            .as_ref()
+            .is_some_and(|session| session.kind != Kind::Dictation)
+        {
+            self.notetaker_detail_ui(ui);
+            return;
         }
         if self.history.selected.is_some() {
             self.history_detail_ui(ui);
@@ -315,10 +358,10 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
                             ui.horizontal_top(|ui| {
-                                ui.add(if matches!(item.kind, Kind::Call) {
-                                    theme::Icon::Phone.image(22.0, MUTED)
-                                } else {
-                                    theme::Icon::Mic.image(22.0, MUTED)
+                                ui.add(match item.kind {
+                                    Kind::Call => theme::Icon::Phone.image(22.0, MUTED),
+                                    Kind::Note => theme::Icon::Book.image(22.0, MUTED),
+                                    Kind::Dictation => theme::Icon::Mic.image(22.0, MUTED),
                                 });
                                 ui.vertical(|ui| {
                                     ui.set_min_width(ui.available_width());
@@ -377,10 +420,7 @@ impl App {
             if self.history.call_dirty.is_some() {
                 self.history_save_call();
             }
-            self.history.loading = true;
-            if let Some(worker) = &self.history.worker {
-                worker.load(id);
-            }
+            self.notetaker_open(id);
         }
     }
 
@@ -645,6 +685,7 @@ fn kind_name(kind: &Kind) -> &'static str {
     match kind {
         Kind::Dictation => "Dictation",
         Kind::Call => "Call",
+        Kind::Note => "Personal note",
     }
 }
 

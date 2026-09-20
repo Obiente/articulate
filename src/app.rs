@@ -24,6 +24,7 @@ mod discord_ui;
 mod editors;
 mod file_picker;
 mod history_ui;
+mod notetaker;
 mod polish_ui;
 mod preferences;
 mod shortcut_gesture;
@@ -1334,6 +1335,7 @@ impl App {
         ) {
             self.history_save_dictation();
             self.history_save_call();
+            self.history_save_personal_notes();
             self.pending_install = Some(request);
             ctx.request_repaint();
         }
@@ -1417,6 +1419,13 @@ impl App {
     }
 
     fn calls_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui
+            .add(egui::Button::new("Back to Notetaker").frame(false))
+            .clicked()
+        {
+            self.notetaker_hub();
+        }
+
         let muted = Color32::from_rgb(157, 172, 174);
         let compact = ui.available_width() < 1000.0;
         // Reserve most of the viewport for the conversation.
@@ -1519,21 +1528,23 @@ impl App {
                 });
             });
         ui.add_space(4.0);
-        let narrow_toolbar = ui.available_width() < 760.0;
+        let narrow_toolbar = ui.available_width() < 900.0;
         ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.call_tab, 3, "My notes");
+            ui.selectable_value(&mut self.call_tab, 1, "Highlights");
             ui.selectable_value(&mut self.call_tab, 0, "Transcript");
-            ui.selectable_value(&mut self.call_tab, 1, "Notes");
             ui.selectable_value(&mut self.call_tab, 2, "Setup");
             if !narrow_toolbar {
                 self.call_reader_actions(ui, compact);
             }
         });
-        if narrow_toolbar {
+        if narrow_toolbar && self.call_tab == 0 {
             ui.horizontal(|ui| self.call_reader_actions(ui, true));
         }
         ui.add_space(6.0);
         ui.separator();
         match self.call_tab {
+            3 => self.call_personal_notes_ui(ui),
             1 => {
                 egui::ScrollArea::vertical()
                     .id_salt("call_notes_panel")
@@ -1560,7 +1571,9 @@ impl App {
                         .margin(egui::vec2(10.0, 8.0)),
                 );
             }
-            self.call_export_actions(ui, compact);
+            if self.call_tab == 0 {
+                self.call_export_actions(ui, compact);
+            }
         });
     }
 
@@ -1653,6 +1666,8 @@ impl App {
         {
             Ok(()) => {
                 self.call = Some(control);
+                self.history.call = Some(crate::history::Session::new(crate::history::Kind::Call));
+                self.history_call_changed();
                 self.call_status = "Preparing call capture...".into();
                 true
             }
@@ -2159,6 +2174,7 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.history_save_personal_notes();
         if self.history.dictation_dirty.is_some() {
             self.history_save_dictation();
         }

@@ -29,6 +29,7 @@ static NEXT_SAVE: AtomicU64 = AtomicU64::new(0);
 pub enum Kind {
     Dictation,
     Call,
+    Note,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -44,6 +45,9 @@ pub struct Session {
     pub rows: Vec<Row>,
     pub speaker_names: [String; 4],
     pub notes: Option<Notes>,
+    /// Personal writing is independent of source-quoted highlights.
+    #[serde(default)]
+    pub personal_notes: String,
 }
 
 impl Session {
@@ -60,6 +64,7 @@ impl Session {
             rows: Vec::new(),
             speaker_names: Default::default(),
             notes: None,
+            personal_notes: String::new(),
         }
     }
 }
@@ -72,11 +77,14 @@ pub struct Summary {
     pub title: String,
     pub kind: Kind,
     pub preview: String,
+    pub duration_ms: u64,
 }
 
 impl From<&Session> for Summary {
     fn from(session: &Session) -> Self {
-        let source = if session.text.trim().is_empty() {
+        let source = if !session.personal_notes.trim().is_empty() {
+            session.personal_notes.as_str()
+        } else if session.text.trim().is_empty() {
             session.rows.first().map_or("", |row| row.text.as_str())
         } else {
             &session.text
@@ -87,6 +95,7 @@ impl From<&Session> for Summary {
             updated_ms: session.updated_ms,
             title: session.title.clone(),
             kind: session.kind,
+            duration_ms: session.rows.iter().map(|row| row.end_ms).max().unwrap_or(0),
             preview: source
                 .split_whitespace()
                 .collect::<Vec<_>>()
@@ -186,7 +195,9 @@ impl History {
             session.updated_ms = now_ms().max(session.created_ms);
         }
         if session.title.trim().is_empty() {
-            let source = if session.text.trim().is_empty() {
+            let source = if !session.personal_notes.trim().is_empty() {
+                session.personal_notes.as_str()
+            } else if session.text.trim().is_empty() {
                 session.rows.first().map_or("", |row| row.text.as_str())
             } else {
                 &session.text
@@ -202,6 +213,7 @@ impl History {
                 session.title = match session.kind {
                     Kind::Dictation => "Dictation",
                     Kind::Call => "Call transcript",
+                    Kind::Note => "Untitled note",
                 }
                 .into();
             }
@@ -369,6 +381,7 @@ fn validate(session: &Session) -> Result<()> {
     ensure!(
         session.text.len() <= MAX_TEXT_BYTES
             && session.original.len() <= MAX_TEXT_BYTES
+            && session.personal_notes.len() <= MAX_TEXT_BYTES
             && session.rows.len() <= MAX_ROWS,
         "Transcript exceeds history size limit"
     );
@@ -376,7 +389,11 @@ fn validate(session: &Session) -> Result<()> {
         session.speaker_names.iter().all(|name| name.len() <= 512),
         "Speaker name exceeds size limit"
     );
-    let mut text_bytes = session.text.len().saturating_add(session.original.len());
+    let mut text_bytes = session
+        .text
+        .len()
+        .saturating_add(session.original.len())
+        .saturating_add(session.personal_notes.len());
     for row in &session.rows {
         ensure!(
             row.end_ms >= row.start_ms && row.speakers.len() <= 4,
@@ -505,6 +522,11 @@ pub struct Worker {
 }
 
 impl Worker {
+    #[cfg(test)]
+    pub(crate) fn test_directory(directory: PathBuf) -> Self {
+        Self::start_directory(directory)
+    }
+
     pub fn start() -> Self {
         Self::start_directory(crate::model::data_dir().join("history"))
     }
@@ -1073,5 +1095,49 @@ mod tests {
             directory.history().load(&session.id).unwrap().text,
             session.text
         );
+    }
+    #[test]
+    fn personal_note_survives_worker_shutdown_and_restart() {
+        let directory = TestDirectory::new();
+        let mut session = Session::new(Kind::Note);
+        session.title = "Ideas for Thursday".into();
+        session.personal_notes = "Question for Casey\nKeep the first step short.".into();
+        let worker = Worker::start_directory(directory.0.clone());
+        worker.save(session.clone());
+        drop(worker);
+        let reopened = directory.history().load(&session.id).unwrap();
+        assert_eq!(reopened.kind, Kind::Note);
+        assert_eq!(reopened.personal_notes, session.personal_notes);
+        assert!(reopened.rows.is_empty());
+        assert!(reopened.notes.is_none());
+        assert!(
+            Summary::from(&reopened)
+                .preview
+                .contains("Question for Casey")
+        );
+    }
+
+    #[test]
+    fn old_history_without_personal_notes_remains_readable() {
+        let directory = TestDirectory::new();
+        let session = meeting();
+        let history = directory.history();
+        let mut stored = serde_json::to_value(Stored {
+            schema: SCHEMA,
+            session: session.clone(),
+        })
+        .unwrap();
+        stored["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("personal_notes");
+        fs::write(
+            history.path(&session.id, "json").unwrap(),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        let reopened = history.load(&session.id).unwrap();
+        assert!(reopened.personal_notes.is_empty());
+        assert_eq!(reopened.rows[0].text, session.rows[0].text);
     }
 }

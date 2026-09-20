@@ -35,6 +35,7 @@ impl App {
                         0 => self.dictation_surface(ui),
                         3 => self.calls_ui(ui, ctx),
                         5 => self.history_ui(ui),
+                        6 => self.notetaker_ui(ui),
                         4 => self.macros_ui(ui),
                         1 => self.vocabulary_surface(ui),
                         _ => {
@@ -68,7 +69,7 @@ impl App {
         ui.add_space(36.0);
         for (page, label, icon) in [
             (0, "Dictate", Icon::Mic),
-            (3, "Calls", Icon::Phone),
+            (6, "Notetaker", Icon::Phone),
             (1, "Vocabulary", Icon::Book),
             (4, "Shortcuts", Icon::Bolt),
             (5, "History", Icon::History),
@@ -98,7 +99,7 @@ impl App {
     }
 
     fn navigation_row(&mut self, ui: &mut egui::Ui, page: usize, label: &str, icon: Icon) {
-        let active = self.page == page;
+        let active = self.page == page || (page == 6 && self.page == 3);
         let tint = if active { ACCENT } else { MUTED };
         let response = ui.add_sized(
             [ui.available_width(), 44.0],
@@ -143,6 +144,10 @@ impl App {
             );
         }
         if response.clicked() {
+            self.history_save_personal_notes();
+            if page == 6 {
+                self.notetaker_hub();
+            }
             self.page = page;
         }
     }

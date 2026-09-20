@@ -15,7 +15,7 @@ FIRST START
 4. Enable Insert into your app and focus its text field before dictating.
    Hold mode inserts after finishing. Toggle mode can type live in supported
    fields. Test in a disposable text field first.
-5. For calls, open Calls > Setup. The Vencord companion needs its separate
+5. For calls, open Notetaker > Record a conversation. The companion needs its separate
    audio connection. For other apps, choose mixed output capture and download
    speaker identification (about 237 MB) when activity names are unavailable.
 
@@ -36,6 +36,11 @@ YOUR DATA
 Transcripts, notes, vocabulary, preferences and models are stored under
 %LOCALAPPDATA%\TranscribeLocal. Audio is not saved. Uninstalling keeps this data.
 There is no cloud transcription, telemetry, account or automatic sync.
+
+NOTETAKER
+Choose New note to write without a microphone or model. Personal notes save
+automatically and remain separate from reviewed Highlights and Transcript.
+The active conversation card returns to capture without restarting it.
 
 CALLS AND DISCORD
 Output capture includes everything playing through the chosen device.

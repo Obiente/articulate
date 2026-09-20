@@ -6,11 +6,13 @@
 4. Hold Ctrl+Alt+Space while speaking and release to finish. Double-press for hands-free dictation, then press once to finish. Settings lets you change the keys, choose press-to-toggle mode, or turn recording sounds off.
 5. To type into another app, enable app insertion and focus its editable field before using the shortcut. Hold mode inserts after finishing, so held modifiers cannot interfere with typing. Toggle mode can update supported fields live. Moving the caret or changing fields pauses insertion while your transcript remains in Articulate.
 
-## Calls
+## Notetaker
 
-Use headphones. In Calls > Setup, select your microphone. With the Vencord companion selected, wait for its separate-audio connection before starting. Each received participant stream carries its own identity, including when people speak at the same time. The native adapter remains experimental; live behavior still needs validation on supported Discord builds. If the audio connection is unavailable, Articulate asks you to connect it instead of silently switching to mixed capture.
+Choose **New note** in Notetaker to write without a microphone or speech model. Personal notes save automatically and remain separate from quoted highlights and transcripts. [Notetaker guide](notetaker.md).
 
-The trailing transcript revises as more context arrives. Finish capture to process remaining audio. Notes contains quoted highlights and possible actions. History lets you revisit saved sessions.
+Use headphones. In Notetaker, choose **Record a conversation** to open audio setup and select your microphone. With the Vencord companion selected, wait for its separate-audio connection before starting. Each received participant stream carries its own identity, including when people speak at the same time. The native adapter remains experimental; live behavior still needs validation on supported Discord builds. If the audio connection is unavailable, Articulate asks you to connect it instead of silently switching to mixed capture.
+
+The trailing transcript revises as more context arrives. Finish capture to process remaining audio. My notes is your own writing; Highlights contains reviewed transcript excerpts and possible actions. The Notetaker hub lets you revisit saved conversations. Its active-conversation card returns to a capture without restarting it.
 
 For other calls, use mixed output capture and choose the output device used by your call. Download the speaker model when activity-based names are unavailable. This output includes every app playing on that device and cannot reliably separate simultaneous voices. The optional [debugger connection](discord-integration.md) provides activity-based names only. See the [Vencord companion setup](vencord.md) for separate Discord audio. Relaunching Discord disconnects an active voice call, so rejoin afterward.
 

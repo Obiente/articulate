@@ -36,6 +36,50 @@ fn page_app(page: &str) -> App {
         _ => populated_app(),
     };
     match page {
+        "notetaker"
+        | "notetaker-editor"
+        | "notetaker-active"
+        | "notetaker-live-editor"
+        | "notetaker-transcript"
+        | "notetaker-highlights" => {
+            app = populated_history_app(false);
+            app.page = 6;
+            let mut note = crate::history::Session::new(crate::history::Kind::Note);
+            note.title = "Ideas for the next release".into();
+            note.personal_notes = "Keep the first recording simple.
+
+Questions for the team
+• Which microphone should we recommend?
+• Can we make the first saved transcript easier to find?
+
+Next steps
+Ask Casey to review the onboarding copy before Thursday."
+                .into();
+            app.history.items.insert(0, (&note).into());
+            if page == "notetaker-editor" {
+                app.history.selected = Some(note);
+            } else if page == "notetaker-active" || page == "notetaker-live-editor" {
+                app.call = Some(call_capture::Control::new());
+                let mut session = crate::history::Session::new(crate::history::Kind::Call);
+                session.title = "Weekly product check-in".into();
+                session.personal_notes = note.personal_notes;
+                app.history.call = Some(session);
+                if page == "notetaker-live-editor" {
+                    app.page = 3;
+                    app.call_tab = 3;
+                }
+            } else if page == "notetaker-transcript" || page == "notetaker-highlights" {
+                let mut session = crate::history::Session::new(crate::history::Kind::Call);
+                session.title = "Planning the next release".into();
+                session.rows = app.call_rows.clone();
+                session.speaker_names = app.speaker_names.clone();
+                session.text = calls::text(&session.rows, &session.speaker_names);
+                session.notes = Some(crate::notes::Notes::build(&session.rows));
+                session.personal_notes = note.personal_notes;
+                app.history.selected = Some(session);
+                app.history.notetaker_tab = if page == "notetaker-transcript" { 2 } else { 1 };
+            }
+        }
         "notes" | "notes-review" => {
             app.call_tab = 1;
             app.call_rows.truncate(3);
@@ -316,16 +360,29 @@ fn capture_calls_ui() {
             theme::configure(&cc.egui_ctx);
             // Capture final visual states, not a timing-dependent window fade.
             cc.egui_ctx.style_mut(|style| style.animation_time = 0.0);
+            let mut app = if let Ok(page) = std::env::var("ARTICULATE_UI_PAGE") {
+                page_app(&page)
+            } else {
+                match std::env::var("ARTICULATE_UI_HISTORY").as_deref() {
+                    Ok("list") => populated_history_app(false),
+                    Ok("detail") => populated_history_app(true),
+                    _ => populated_app(),
+                }
+            };
+            if let Some(session) = app.history.selected.as_ref().or(app.history.call.as_ref())
+                && std::env::var("ARTICULATE_UI_PAGE")
+                    .is_ok_and(|page| page.starts_with("notetaker"))
+            {
+                let folder = output
+                    .parent()
+                    .unwrap()
+                    .join(format!("fixture-{}", session.id));
+                let worker = crate::history::Worker::test_directory(folder);
+                worker.save(session.clone());
+                app.history.worker = Some(worker);
+            }
             Ok(Box::new(Capture {
-                app: if let Ok(page) = std::env::var("ARTICULATE_UI_PAGE") {
-                    page_app(&page)
-                } else {
-                    match std::env::var("ARTICULATE_UI_HISTORY").as_deref() {
-                        Ok("list") => populated_history_app(false),
-                        Ok("detail") => populated_history_app(true),
-                        _ => populated_app(),
-                    }
-                },
+                app,
                 output,
                 frames: 0,
                 card: std::env::var_os("ARTICULATE_UI_CARD").is_some(),
@@ -448,7 +505,7 @@ fn sidebar_navigation_supports_keyboard_activation() {
         ..Default::default()
     };
     let _ = ctx.run(input(), |ctx| app.surface(ctx));
-    for page in [3usize, 1, 4, 5, 2, 0] {
+    for page in [6usize, 1, 4, 5, 2, 0] {
         let id = ctx
             .data_mut(|data| {
                 data.get_temp::<egui::Id>(egui::Id::new(("navigation_response", page)))
