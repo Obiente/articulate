@@ -2,6 +2,7 @@
 
 mod app;
 mod audio;
+mod audio_cues;
 mod call_capture;
 mod call_export;
 mod call_segments;

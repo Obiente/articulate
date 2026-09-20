@@ -1,8 +1,9 @@
-"""Reproduce the bundled English notes candidate from authored synthetic data.
+"""Train an English notes candidate from authored synthetic data.
 
 The trainer selects a checkpoint by validation loss. Only after training finishes
 does this recipe evaluate the fixed test split. Reports and model artifacts stay
 in the explicitly selected new output directory, which should be ignored.
+This does not replace the release model or constitute approval to bundle it.
 """
 import argparse
 import collections
@@ -35,7 +36,9 @@ def model_inputs(training_file, output):
     for item in corpus:
         texts.append(item["transcript"]["goal"])
         for segment in item["transcript"]["segments"]:
-            texts.extend([segment["text"], segment["speaker"]])
+            texts.append(segment["text"])
+            if segment["speaker"]:
+                texts.append(segment["speaker"])
     counts = collections.Counter(token for text in texts for token in re.findall(r"\w+|[^\w\s]+", text.lower()))
     omit = {"casey", "jordan"} | {word for topic in TOPICS["train"] for word in topic.split()}
     vocabulary = {"[PAD]": 0, "[UNK]": 1}
@@ -109,7 +112,8 @@ def bundle(model, destination, seed=42, epochs=32):
     repository = Path(__file__).resolve().parents[2]
     shutil.copyfile(repository / "LICENSE", destination / "LICENSE.txt")
     (destination / "evaluation.json").write_text(json.dumps({
-        "version": 1, "model_id": "articulate-notes-en-v1",
+        "version": 1, "model_id": "articulate-notes-en-candidate",
+        "distribution_status": "Candidate; independent evaluation required before release selection",
         "training_source": "Authored synthetic English meeting passages; no user or account data",
         "selection": "Minimum validation cross entropy; test split excluded from training and checkpoint selection",
         "held_out_scope": "Disjoint sentence template families and topic names; English synthetic examples only",
@@ -122,7 +126,10 @@ def bundle(model, destination, seed=42, epochs=32):
         "seed": seed, "epochs": epochs,
     }, indent=2) + "\n", encoding="utf-8")
     (destination / "MODEL-CARD.md").write_text(
-        "# Articulate English notes model\n\n"
+        "# Articulate English notes training candidate\n\n"
+        "This staged candidate has not been selected for release. Compare it with the "
+        "existing model on unchanged regression cases and a separately authored sealed audit "
+        "before deciding whether to distribute it. Training metrics alone are insufficient.\n\n"
         "This small Assort model was trained before distribution on authored synthetic English "
         "meeting passages. It scores decision, action, key_fact and background categories. "
         "It is a review assistant, not a general language model or a verified record of a meeting.\n\n"
@@ -143,7 +150,7 @@ def bundle(model, destination, seed=42, epochs=32):
                                                   "bytes": p.stat().st_size}
              for p in sorted(destination.rglob("*")) if p.is_file()}
     (destination / "bundle.json").write_text(json.dumps({
-        "id": "articulate-notes-en-v1", "version": 1, "task": "meeting-notes-review",
+        "id": "articulate-notes-en-candidate", "version": 1, "task": "meeting-notes-review",
         "language": "en", "license": "AGPL-3.0-or-later", "assort_revision": ASSORT_REVISION,
         "automatic_actions": False, "files": files,
     }, indent=2) + "\n", encoding="utf-8")

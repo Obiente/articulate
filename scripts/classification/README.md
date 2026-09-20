@@ -1,8 +1,9 @@
 # Articulate classification training
 
-## Bundled English notes candidate
+## English notes training candidate
 
-The release notes classifier has a separate reproduction recipe:
+The notes classifier has a candidate training recipe. Running it does not replace
+the bundled model or approve new weights for release:
 
 ```powershell
 python scripts/classification/train_notes.py --assort /path/to/assort.exe --output .local/assort-notes-run
@@ -13,7 +14,12 @@ Use the Assort CLI built from revision
 English examples with separate sentence families and topic names for training,
 validation, and test. Examples include negated decisions, actual constraints,
 quoted assignments, conditional promises and unconfirmed numbers. Conversations
-do not have a fixed one-passage-per-category distribution. Training entity words
+do not have a fixed one-passage-per-category distribution. Training also includes
+short greetings, direct questions, ordinary factual statements and quoted or
+hypothetical commitments. Two shuffled training views vary the number of passages
+from one to eight, the summary goal, and named or absent speaker labels. This
+reduces dependence on the original fixed four-passage conversation format.
+Training entity words
 are mapped to the unknown token so unseen participant names receive a trained
 embedding instead of becoming an untested special case.
 
@@ -23,6 +29,32 @@ the checkpoint, tokenizer, inference limits, license, model card and public
 provenance in `bundle/`. Datasets, detailed evaluations and logs remain in the
 ignored run directory. Reproducing the recipe does not publish any files.
 CPU/library versions can affect floating-point training results.
+For a particular release, use the recipe snapshot from that release and verify
+the corpus hash recorded in its model card. A newer development recipe may
+produce an unapproved candidate rather than the weights currently distributed.
+
+Before a candidate is considered for bundling, compare it with the prior model
+on the same frozen, separately authored fixtures. Keep greetings, facts,
+decisions, actions, negations, questions, hypotheticals and reported speech in
+that evaluation, and retain the original family-disjoint test as a regression
+check. A changed goal or surrounding conversation should also be evaluated.
+Never alter evaluation cases after looking at candidate predictions to improve
+the reported result. A separate reviewer should author and seal an additional
+audit before seeing the training corpus or predictions, then release it only
+after the candidate weights are selected and hashed. Treat a failed audit as a
+veto, even when development fixtures improve. If later work uses those failures
+as regression cases, commission a new independent audit for that later candidate.
+The comparison script checks fixture hashes and records
+per-category errors without relabeling or filtering model predictions:
+
+```powershell
+python scripts/classification/compare_notes.py --assort /path/to/assort.exe --baseline /path/to/prior-model --candidate /path/to/new-model --evaluation /path/to/frozen-synthetic-cases.json --output .local/notes-comparison
+```
+
+Both model directories must contain a checkpoint and tokenizer. Limits may be
+named `inference-limits.json` or `preprocessing-limits.json`. Repeat `--evaluation`
+to compare additional unchanged fixtures. Reports remain local; public model
+cards describe training provenance and limitations, not private evaluation scores.
 
 Bundling makes review suggestions usable without model-path configuration. It
 does not make synthetic results evidence of real-call accuracy: the limited
@@ -165,3 +197,30 @@ compatible retraining and an adapter change, not relabeling an old manifest.
 Do not copy a failed model into a release just to populate its files. Keep
 private evaluations local, and do not describe synthetic training or hash
 verification as proof of real-world transcription or classification quality.
+
+## Correction context research
+
+`correction_corpus.py` adds paired contexts in which the same registered phrase
+is a person or product name in one sentence and ordinary wording in another.
+It also covers quotations, questions that actually refer to a person or app,
+literal language questions, unrelated app scope, and protected numbers and
+negations. The vocabulary is fitted only on training examples.
+
+```powershell
+python scripts/classification/train_corrections.py --assort /path/to/assort.exe --baseline assets/assort/corrections --output .local/correction-context-run
+```
+
+The recipe freezes a separate authored challenge before training and compares
+the prior model and candidate on that identical file and the original disjoint
+test. `--regularized` compares a smaller model with label smoothing and training
+examples for unknown entity tokens. Both variants use the same runtime prompt
+contract. Evaluation validates task identity, candidate order, probabilities,
+and response counts, and uses raw model scores without UI abstention rules.
+
+These are research candidates, not automatic replacements for the bundled
+model. A reduction in false replacements is insufficient if useful corrections
+are also lost. Select checkpoints using validation, retain independently authored
+cases outside training, and disclose exploratory comparisons rather than tuning
+to a test and calling it untouched. Model files, detailed errors and score reports
+stay in the ignored run directory. The script never copies weights into public
+assets or updates the release manifest; an unsuccessful candidate stays local.

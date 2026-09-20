@@ -1,6 +1,16 @@
 use anyhow::{Result, bail};
 use std::sync::mpsc::Sender;
 
+mod hotkey_lifecycle;
+
+/// How the app interprets a shortcut gesture. Explicit choices are preserved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HotkeyMode {
+    Toggle,
+    #[default]
+    Hold,
+}
+
 /// A portable shortcut preference. Key names are independent of Windows codes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -135,8 +145,13 @@ impl Hotkey {
 #[derive(Debug)]
 pub enum HotkeyEvent {
     Registered(Hotkey),
-    Pressed(Target),
-    Error { requested: Hotkey, message: String },
+    Pressed(Target, std::time::Instant),
+    /// The accepted chord was released. Never captures a new foreground target.
+    Released(std::time::Instant),
+    Error {
+        requested: Hotkey,
+        message: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,6 +173,11 @@ mod target_tests {
 
     #[test]
     fn shortcut_settings_round_trip_and_old_settings_use_default() {
+        assert_eq!(HotkeyMode::default(), HotkeyMode::Hold);
+        assert_eq!(
+            serde_json::from_str::<HotkeyMode>("\"Hold\"").unwrap(),
+            HotkeyMode::Hold
+        );
         assert_eq!(
             serde_json::from_str::<Hotkey>("{}").unwrap(),
             Hotkey::default()
@@ -305,6 +325,24 @@ mod win {
             | if shortcut.win { MOD_WIN } else { 0 }
     }
 
+    fn chord_state(shortcut: &Hotkey) -> (bool, bool) {
+        let down = |key: u32| unsafe { GetAsyncKeyState(key as i32) < 0 };
+        let mut any = down(key_code(&shortcut.key));
+        let mut complete = any;
+        for (required, held) in [
+            (shortcut.ctrl, down(VK_CONTROL as u32)),
+            (shortcut.alt, down(VK_MENU as u32)),
+            (shortcut.shift, down(VK_SHIFT as u32)),
+            (shortcut.win, down(VK_LWIN as u32) || down(VK_RWIN as u32)),
+        ] {
+            if required {
+                any |= held;
+                complete &= held;
+            }
+        }
+        (any, complete)
+    }
+
     trait HotkeyRegistry {
         fn register(&mut self, id: i32, shortcut: &Hotkey) -> std::io::Result<()>;
         fn unregister(&mut self, id: i32);
@@ -395,16 +433,32 @@ mod win {
         std::thread::spawn(move || unsafe {
             let mut registration = HotkeyRegistration::default();
             let mut registry = WindowsRegistry;
+            let mut lifecycle = hotkey_lifecycle::Lifecycle::default();
             let apply = |requested: Hotkey,
                          registration: &mut HotkeyRegistration,
-                         registry: &mut WindowsRegistry| {
+                         registry: &mut WindowsRegistry,
+                         lifecycle: &mut hotkey_lifecycle::Lifecycle| {
+                let changed = registration
+                    .active
+                    .as_ref()
+                    .is_none_or(|(_, key)| *key != requested);
                 let event = match registration.replace(requested.clone(), registry) {
-                    Ok(()) => HotkeyEvent::Registered(requested),
+                    Ok(()) => {
+                        if changed
+                            && lifecycle.register(chord_state(&requested).0)
+                            && tx
+                                .send(HotkeyEvent::Released(std::time::Instant::now()))
+                                .is_err()
+                        {
+                            return false;
+                        }
+                        HotkeyEvent::Registered(requested)
+                    }
                     Err(message) => HotkeyEvent::Error { requested, message },
                 };
                 tx.send(event).is_ok()
             };
-            if !apply(initial, &mut registration, &mut registry) {
+            if !apply(initial, &mut registration, &mut registry, &mut lifecycle) {
                 registration.clear(&mut registry);
                 return;
             }
@@ -413,7 +467,7 @@ mod win {
                 // also notices controller shutdown without an orphaned thread.
                 match rx.recv_timeout(std::time::Duration::from_millis(20)) {
                     Ok(requested) => {
-                        if !apply(requested, &mut registration, &mut registry) {
+                        if !apply(requested, &mut registration, &mut registry, &mut lifecycle) {
                             break;
                         }
                     }
@@ -425,15 +479,34 @@ mod win {
                     if msg.message == WM_QUIT {
                         break 'worker;
                     }
-                    if msg.message == WM_HOTKEY && registration.accepts(msg.wParam, msg.lParam) {
+                    if msg.message == WM_HOTKEY
+                        && registration.accepts(msg.wParam, msg.lParam)
+                        && lifecycle.press()
+                    {
                         let target = target().unwrap_or(Target {
                             window: 0,
                             focus: 0,
                             process: 0,
                         });
-                        if tx.send(HotkeyEvent::Pressed(target)).is_err() {
+                        if tx
+                            .send(HotkeyEvent::Pressed(target, std::time::Instant::now()))
+                            .is_err()
+                        {
                             break 'worker;
                         }
+                    }
+                }
+                // Drain queued presses before rearming a registration which
+                // began while keys were held. Release only ends the existing
+                // gesture; it must never retarget a newly focused app.
+                if let Some((_, shortcut)) = &registration.active {
+                    let (any, complete) = chord_state(shortcut);
+                    if lifecycle.poll(any, complete)
+                        && tx
+                            .send(HotkeyEvent::Released(std::time::Instant::now()))
+                            .is_err()
+                    {
+                        break;
                     }
                 }
             }

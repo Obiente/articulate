@@ -25,6 +25,7 @@ mod editors;
 mod file_picker;
 mod history_ui;
 mod preferences;
+mod shortcut_gesture;
 mod surface;
 mod theme;
 #[cfg(test)]
@@ -48,6 +49,8 @@ struct Settings {
     #[serde(default = "enabled")]
     live_insert: bool,
     hotkey: platform::Hotkey,
+    hotkey_mode: platform::HotkeyMode,
+    audio_feedback: bool,
     styles: Vec<crate::writing_style::StyleRule>,
     discord_companion: bool,
     discord_pairing_key: String,
@@ -76,6 +79,8 @@ impl Default for Settings {
             learn_corrections: true,
             live_insert: true,
             hotkey: platform::Hotkey::default(),
+            hotkey_mode: platform::HotkeyMode::default(),
+            audio_feedback: true,
             styles: Vec::new(),
             discord_companion: false,
             discord_pairing_key: String::new(),
@@ -118,6 +123,8 @@ pub struct App {
     hotkey_tx: Sender<platform::Hotkey>,
     hotkey_draft: platform::Hotkey,
     hotkey_pending: bool,
+    hold_recording: bool,
+    shortcut_gesture: shortcut_gesture::Gesture,
     style_app: String,
     style_draft: crate::writing_style::WritingStyle,
     style_message: String,
@@ -196,6 +203,7 @@ impl App {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
             Err(e) => (Settings::default(), Some(format!("Could not read saved settings: {e}"))),
         };
+        dictionary::deduplicate(&mut settings.entries);
         if settings.model_path.is_empty() {
             settings.model_path = model::default_path().to_string_lossy().into_owned();
         }
@@ -268,6 +276,8 @@ impl App {
             hotkey_tx,
             hotkey_draft,
             hotkey_pending: true,
+            hold_recording: false,
+            shortcut_gesture: Default::default(),
             style_app: String::new(),
             style_draft: crate::writing_style::WritingStyle::Clean,
             style_message: String::new(),
@@ -374,17 +384,15 @@ impl App {
     }
 
     fn toggle(&mut self, target: Option<Target>) {
-        if self.busy
-            || self.loading
-            || !self.ready
-            || self.downloading.is_some()
-            || self.call.is_some()
-        {
-            return;
-        }
         if let Some(recording) = self.recording.take() {
+            self.hold_recording = false;
+            self.shortcut_gesture = Default::default();
             self.last_seconds = recording.seconds() as u64;
-            match recording.stop() {
+            let result = recording.stop();
+            if self.settings.audio_feedback {
+                crate::audio_cues::play(crate::audio_cues::Cue::Stopped);
+            }
+            match result {
                 Ok(pcm)
                     if pcm.len() >= 3200
                         || !self.committed_raw.is_empty()
@@ -411,6 +419,14 @@ impl App {
                 }
             }
         } else {
+            if self.busy
+                || self.loading
+                || !self.ready
+                || self.downloading.is_some()
+                || self.call.is_some()
+            {
+                return;
+            }
             match Recording::start(self.settings.microphone.as_deref()) {
                 Ok(recording) => {
                     self.history_save_dictation();
@@ -418,6 +434,9 @@ impl App {
                     self.history.dictation_deleted = false;
                     self.status = format!("Listening on {}", recording.device);
                     self.recording = Some(recording);
+                    if self.settings.audio_feedback {
+                        crate::audio_cues::play(crate::audio_cues::Cue::Started);
+                    }
                     self.last_seconds = 0;
                     self.target = target;
                     self.dictation_app = target.and_then(platform::app_name);
@@ -428,8 +447,10 @@ impl App {
                     self.insertion_cancel = CancelToken::new();
                     self.integration_inflight = false;
                     self.integration_pending = None;
-                    self.live_mode =
-                        self.settings.insert && self.settings.live_insert && target.is_some();
+                    self.live_mode = self.settings.insert
+                        && self.settings.live_insert
+                        && target.is_some()
+                        && !self.hold_recording;
                     let _ = self.integration_tx.send(integration::Action::Cancel);
                     if self.settings.insert
                         && let Some(target) = target
@@ -455,7 +476,15 @@ impl App {
         }
     }
 
-    fn shortcut(&mut self, target: Target) {
+    fn shortcut(&mut self, target: Target, at: Instant) {
+        if self.recording.is_some() {
+            if self.settings.hotkey_mode == platform::HotkeyMode::Toggle
+                || (self.hold_recording && self.shortcut_gesture.press_again(at))
+            {
+                self.toggle(None);
+            }
+            return;
+        }
         let blocked = if self.call.is_some() {
             Some("Finish your call recording before starting dictation.")
         } else if self.downloading.is_some() {
@@ -475,7 +504,55 @@ impl App {
             self.overlay_until = Some(Instant::now() + Duration::from_secs(4));
             return;
         }
-        self.toggle(target.is_external().then_some(target));
+        if self.settings.hotkey_mode == platform::HotkeyMode::Hold {
+            // A release may finish only the recording this press started. A
+            // manual capture must remain under its explicit Finish control.
+            self.hold_recording = true;
+            self.shortcut_gesture.start(at);
+            self.toggle(target.is_external().then_some(target));
+            if self.recording.is_none() {
+                self.hold_recording = false;
+                self.shortcut_gesture = Default::default();
+            }
+        } else {
+            self.toggle(target.is_external().then_some(target));
+        }
+    }
+
+    fn release_shortcut(&mut self, at: Instant) {
+        if self.hold_recording {
+            if self.recording.is_some() && self.shortcut_gesture.release(at) {
+                self.toggle(None);
+            } else if self.recording.is_none() {
+                self.hold_recording = false;
+                self.shortcut_gesture = Default::default();
+            }
+        }
+    }
+
+    fn shortcut_instruction(&self) -> String {
+        let key = self.settings.hotkey.label();
+        match self.settings.hotkey_mode {
+            platform::HotkeyMode::Hold
+                if self.hold_recording && self.shortcut_gesture.hands_free =>
+            {
+                format!("Hands-free · Press {key} to finish")
+            }
+            platform::HotkeyMode::Hold
+                if self.hold_recording && self.shortcut_gesture.awaiting_second_press() =>
+            {
+                "Press again for hands-free".into()
+            }
+            platform::HotkeyMode::Hold if self.hold_recording => format!("Release {key} to finish"),
+            platform::HotkeyMode::Hold if self.recording.is_some() => {
+                "Choose Finish to end this recording".into()
+            }
+            platform::HotkeyMode::Hold => format!("Hold {key} to speak"),
+            platform::HotkeyMode::Toggle if self.recording.is_some() => {
+                format!("Press {key} to finish")
+            }
+            platform::HotkeyMode::Toggle => format!("Press {key} to start"),
+        }
     }
 
     fn transcribe(&mut self, pcm: Vec<f32>) {
@@ -547,6 +624,8 @@ impl App {
                 Ok(None) => {}
                 Err(error) => {
                     self.recording = None;
+                    self.hold_recording = false;
+                    self.shortcut_gesture = Default::default();
                     self.status = error.to_string();
                     return;
                 }
@@ -659,6 +738,8 @@ impl App {
                             }
                             Err(error) => {
                                 self.recording = None;
+                                self.hold_recording = false;
+                                self.shortcut_gesture = Default::default();
                                 self.busy = false;
                                 self.pending_final = None;
                                 self.target = None;
@@ -794,10 +875,11 @@ impl App {
         }
         while let Ok(event) = self.hotkeys.try_recv() {
             match event {
-                platform::HotkeyEvent::Pressed(target) if self.pending_install.is_none() => {
-                    self.shortcut(target)
+                platform::HotkeyEvent::Pressed(target, at) if self.pending_install.is_none() => {
+                    self.shortcut(target, at)
                 }
-                platform::HotkeyEvent::Pressed(_) => {}
+                platform::HotkeyEvent::Pressed(_, _) => {}
+                platform::HotkeyEvent::Released(at) => self.release_shortcut(at),
                 platform::HotkeyEvent::Registered(hotkey) => {
                     let changed = self.settings.hotkey != hotkey;
                     self.settings.hotkey = hotkey;
@@ -889,6 +971,13 @@ impl App {
         {
             self.toggle(None);
         }
+        if self.hold_recording && self.shortcut_gesture.expired(Instant::now()) {
+            if self.recording.is_some() {
+                self.toggle(None);
+            }
+            self.hold_recording = false;
+            self.shortcut_gesture = Default::default();
+        }
         self.history_poll();
         self.preview();
     }
@@ -898,8 +987,16 @@ impl App {
             return;
         };
         self.overlay_message = format!(
-            "Remembered: {} → {}. Undo in Articulate.",
-            change.entry.heard, change.entry.wanted
+            "{}: {} → {}. Undo in Articulate.",
+            if change.updated_context() {
+                "Updated context"
+            } else if change.updated_existing() {
+                "Updated correction"
+            } else {
+                "Remembered"
+            },
+            change.entry.heard,
+            change.entry.wanted
         );
         self.overlay_until = Some(Instant::now() + Duration::from_secs(7));
         self.remembered.push(change);
@@ -925,8 +1022,16 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!(
-                            "Remembered: {} → {}",
-                            change.entry.heard, change.entry.wanted
+                            "{}: {} → {}",
+                            if change.updated_context() {
+                                "Updated context"
+                            } else if change.updated_existing() {
+                                "Updated correction"
+                            } else {
+                                "Remembered"
+                            },
+                            change.entry.heard,
+                            change.entry.wanted
                         ))
                         .color(ACCENT),
                     );
@@ -958,10 +1063,10 @@ impl App {
         let message = if recording {
             let seconds = self.recording.as_ref().unwrap().seconds() as u64;
             format!(
-                "Listening  {:02}:{:02}\n{} to finish",
+                "Listening  {:02}:{:02}\n{}",
                 seconds / 60,
                 seconds % 60,
-                self.settings.hotkey.label()
+                self.shortcut_instruction()
             )
         } else if finishing {
             "Finishing your transcript...".into()
@@ -1029,33 +1134,38 @@ impl App {
             && self.recording.is_none()
             && self.downloading.is_none();
 
-        ui.label(RichText::new("Settings").size(36.0));
-        ui.label(
-            RichText::new("Set up your voice, your shortcuts, and your device.")
-                .size(18.0)
-                .color(muted),
-        );
-        ui.add_space(22.0);
+        theme::page_title(ui, "Settings");
+        ui.add_space(16.0);
         let section_id = egui::Id::new("settings_section");
         let mut section = ctx.data_mut(|data| data.get_temp::<usize>(section_id).unwrap_or(0));
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(egui::vec2(150.0, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                for (index, (label,icon)) in [("General",theme::Icon::Gear), ("Audio & models",theme::Icon::Mic), ("Integrations",theme::Icon::Phone), ("Files & library",theme::Icon::Book), ("Updates & about",theme::Icon::History)].iter().enumerate() {
-                    ui.add_sized([150.0, 44.0], egui::Button::image_and_text(icon.image(18.0,if section==index {ACCENT}else{muted}),RichText::new(*label).size(13.0)).frame(section==index).selected(section == index)).clicked().then(|| section = index);
-                }
-            });
-            ui.add_space(18.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 7.0;
+        ui.horizontal_wrapped(|ui| {
+            for (index, label) in [
+                "General",
+                "Audio & models",
+                "Integrations",
+                "Files & library",
+                "Updates & about",
+            ]
+            .iter()
+            .enumerate()
+            {
+                ui.selectable_value(&mut section, index, *label);
+            }
+        });
+        ui.add_space(18.0);
+        egui::Frame::new().fill(theme::SURFACE).corner_radius(12).inner_margin(20.0).show(ui,|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y=8.0;
                 match section {
                     0 => {
-                        ui.label(RichText::new("Dictation").size(22.0));
+                        ui.label(RichText::new("General").size(20.0).strong());
                         ui.separator();
                         self.shortcut_preferences(ui,idle);
                         ui.separator();
                         let changed=ui.add_enabled_ui(idle, |ui| {
                             let mut changed=theme::preference_switch(ui,&mut self.settings.insert,"Insert into your app","Write into the focused text field without pressing Enter.");
-                            changed |= ui.add_enabled_ui(self.settings.insert, |ui| theme::preference_switch(ui,&mut self.settings.live_insert,"Live insertion","Type as you speak. Editing or moving the caret pauses typing.")).inner;
+                            let toggle_mode = self.settings.hotkey_mode == platform::HotkeyMode::Toggle;
+                            changed |= ui.add_enabled_ui(self.settings.insert && toggle_mode, |ui| theme::preference_switch(ui,&mut self.settings.live_insert,"Live insertion",if toggle_mode { "Type as you speak. Editing or moving the caret pauses typing." } else { "Available in Press to toggle mode. Hold mode inserts after finishing." })).inner;
                             changed |= theme::preference_switch(ui,&mut self.settings.clean_speech,"Natural cleanup","Clean up repeated words and spoken corrections. Keep the original.");
                             changed
                         }).inner;
@@ -1067,18 +1177,6 @@ impl App {
                             self.save();
                         }
                         self.style_preferences(ui,idle);
-                        ui.add_space(18.0);
-                        ui.label(RichText::new("Models on this device").size(22.0));
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label("Qwen3-ASR 1.7B");
-                                ui.label(RichText::new(if self.ready {"Ready for dictation"} else {"Download or load a model to begin"}).small().color(muted));
-                            });
-                            if ui.button("Manage models").clicked() {section=1;}
-                        });
-                        ui.add_space(16.0);
-                        ui.label(RichText::new("Models download separately. Your voice is processed on this device.").small().color(muted));
                     }
                     1 => {
         ui.label(RichText::new("Audio & recognition").size(20.0).strong());
@@ -1088,7 +1186,7 @@ impl App {
             let old = self.settings.microphone.clone();
             ui.horizontal_wrapped(|ui| {
                 egui::ComboBox::from_id_salt("microphone")
-                    .width(300.0)
+                    .width((ui.available_width()-110.0).clamp(180.0,440.0))
                     .selected_text(
                         self.settings
                             .microphone
@@ -1242,7 +1340,6 @@ impl App {
                         });
                     }
                 }
-            });
         });
         ctx.data_mut(|data| data.insert_temp(section_id, section));
     }
@@ -1414,22 +1511,18 @@ impl App {
                 });
             });
         ui.add_space(4.0);
+        let narrow_toolbar = ui.available_width() < 760.0;
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.call_tab, 0, "Transcript");
             ui.selectable_value(&mut self.call_tab, 1, "Notes");
             ui.selectable_value(&mut self.call_tab, 2, "Setup");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.call_tab == 0 && !self.call_rows.is_empty() {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.call_search)
-                            .hint_text("Find in transcript")
-                            .desired_width(if compact { 180.0 } else { 240.0 })
-                            .margin(egui::vec2(10.0, 8.0)),
-                    );
-                }
-                self.call_export_actions(ui, compact);
-            });
+            if !narrow_toolbar {
+                self.call_reader_actions(ui, compact);
+            }
         });
+        if narrow_toolbar {
+            ui.horizontal(|ui| self.call_reader_actions(ui, true));
+        }
         ui.add_space(6.0);
         ui.separator();
         match self.call_tab {
@@ -1447,6 +1540,20 @@ impl App {
             }
             _ => self.call_transcript_ui(ui),
         }
+    }
+
+    fn call_reader_actions(&mut self, ui: &mut egui::Ui, compact: bool) {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if self.call_tab == 0 && !self.call_rows.is_empty() {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.call_search)
+                        .hint_text("Find in transcript")
+                        .desired_width(if compact { 180.0 } else { 240.0 })
+                        .margin(egui::vec2(10.0, 8.0)),
+                );
+            }
+            self.call_export_actions(ui, compact);
+        });
     }
 
     fn discord_activity_ready(&self) -> bool {
@@ -1497,6 +1604,19 @@ impl App {
     }
 
     fn start_call_capture(&mut self) -> bool {
+        let native_audio = match calls::select_native_source(
+            self.settings.discord_companion,
+            self.discord
+                .as_ref()
+                .is_some_and(|connection| connection.native_audio_ready()),
+        ) {
+            Ok(native_audio) => native_audio,
+            Err(message) => {
+                self.call_status = message.to_string();
+                self.call_tab = 2;
+                return false;
+            }
+        };
         self.save();
         self.history_save_call();
         self.history.call = None;
@@ -1510,10 +1630,7 @@ impl App {
         let control = call_capture::Control::new();
         control.set_discord(self.discord.clone());
         self.cancel = CancelToken::new();
-        self.call_native_audio = self
-            .discord
-            .as_ref()
-            .is_some_and(|connection| connection.native_audio_ready());
+        self.call_native_audio = native_audio;
         self.call_native_received = false;
         let request = calls::Request {
             microphone: self.settings.microphone.clone(),
@@ -2168,6 +2285,12 @@ mod tests {
     #[test]
     fn old_preferences_leave_companion_off_and_update_requires_history() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.hotkey_mode, platform::HotkeyMode::Hold);
+        assert!(settings.audio_feedback);
+        let explicit: Settings =
+            serde_json::from_str(r#"{"hotkey_mode":"Toggle","audio_feedback":false}"#).unwrap();
+        assert_eq!(explicit.hotkey_mode, platform::HotkeyMode::Toggle);
+        assert!(!explicit.audio_feedback);
         assert!(!settings.discord_companion);
         assert!(settings.discord_pairing_key.is_empty());
         let (mut app, _) = app();
@@ -2179,6 +2302,61 @@ mod tests {
                 .unwrap_err()
                 .contains("Retry saving")
         );
+    }
+    #[test]
+    fn shortcut_modes_preserve_defaults_and_release_cannot_start_audio() {
+        let (mut app, commands) = app();
+        app.settings.hotkey_mode = platform::HotkeyMode::Hold;
+        app.settings.hotkey.key = "F8".into();
+        assert_eq!(
+            app.shortcut_instruction(),
+            format!("Hold {} to speak", app.settings.hotkey.label())
+        );
+        let settings: Settings =
+            serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
+        assert_eq!(settings.hotkey_mode, platform::HotkeyMode::Hold);
+        app.release_shortcut(Instant::now());
+        assert!(app.recording.is_none() && commands.try_recv().is_err());
+        app.hold_recording = true;
+        app.release_shortcut(Instant::now());
+        assert!(!app.hold_recording && app.recording.is_none());
+        app.ready = false;
+        app.shortcut(platform::test_target(), Instant::now());
+        assert!(!app.hold_recording && app.recording.is_none());
+        assert!(app.overlay_message.contains("set up your speech model"));
+    }
+
+    #[test]
+    fn failed_recording_releases_hold_ownership() {
+        let (mut app, commands) = app();
+        app.hold_recording = true;
+        app.chunk_inflight = true;
+        app.event_tx
+            .send(Event::Text(
+                Err("Synthetic failure".into()),
+                0.0,
+                app.utterance,
+                true,
+            ))
+            .unwrap();
+        app.receive();
+        assert!(!app.hold_recording);
+        assert!(app.recording.is_none());
+        app.release_shortcut(Instant::now());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn companion_without_audio_does_not_start_mixed_capture_or_clear_transcript() {
+        let (mut app, commands) = app();
+        app.settings.discord_companion = true;
+        app.call_rows
+            .push(call_row(1, 0, "A saved synthetic sentence."));
+        assert!(!app.start_call_capture());
+        assert_eq!(app.call_rows.len(), 1);
+        assert_eq!(app.call_tab, 2);
+        assert!(app.call.is_none());
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]
@@ -2239,18 +2417,18 @@ mod tests {
     fn shortcut_explains_unavailable_dictation_without_starting_audio() {
         let (mut app, _) = app();
         app.loading = true;
-        app.shortcut(platform::test_target());
+        app.shortcut(platform::test_target(), Instant::now());
         assert!(app.overlay_message.contains("getting ready"));
         assert!(app.overlay_until.is_some());
         assert!(app.recording.is_none());
         app.loading = false;
         app.busy = true;
-        app.shortcut(platform::test_target());
+        app.shortcut(platform::test_target(), Instant::now());
         assert!(app.overlay_message.contains("Finishing"));
         assert!(app.recording.is_none());
         app.busy = false;
         app.ready = false;
-        app.shortcut(platform::test_target());
+        app.shortcut(platform::test_target(), Instant::now());
         assert!(app.overlay_message.contains("Settings"));
         assert!(app.recording.is_none());
     }
@@ -2276,6 +2454,8 @@ mod tests {
                 hotkey_tx,
                 hotkey_draft: platform::Hotkey::default(),
                 hotkey_pending: false,
+                hold_recording: false,
+                shortcut_gesture: Default::default(),
                 style_app: String::new(),
                 style_draft: crate::writing_style::WritingStyle::Clean,
                 style_message: String::new(),

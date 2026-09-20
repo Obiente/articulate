@@ -50,7 +50,7 @@ pub(crate) struct Output {
 }
 
 fn protected(text: &str) -> Vec<String> {
-    let lower = text.to_lowercase();
+    let lower = text.to_lowercase().replace('’', "'");
     let mut words: Vec<_> = lower
         .split(|c: char| !c.is_alphanumeric() && c != '\'')
         .filter(|word| {
@@ -65,6 +65,18 @@ fn protected(text: &str) -> Vec<String> {
                     | "don't"
                     | "isn't"
                     | "wasn't"
+                    | "won't"
+                    | "wouldn't"
+                    | "shouldn't"
+                    | "couldn't"
+                    | "mustn't"
+                    | "aren't"
+                    | "weren't"
+                    | "doesn't"
+                    | "didn't"
+                    | "hasn't"
+                    | "haven't"
+                    | "hadn't"
                     | "zero"
                     | "one"
                     | "two"
@@ -128,13 +140,14 @@ pub fn prepare(text: &str, entries: &[Entry], app: Option<&str>) -> Result<Reque
         app,
         candidates: Vec::new(),
     };
-    for entry in entries {
+    for entry in entries.iter().flat_map(Entry::variants) {
         if !entry.enabled || protected(&entry.heard) != protected(&entry.wanted) {
             continue;
         }
         let (proposed, count) =
-            dictionary::apply_in(text, std::slice::from_ref(entry), app_ref(&request));
-        if count == 0
+            dictionary::apply_in(text, std::slice::from_ref(&entry), app_ref(&request));
+        if count != 1
+            || occurrences(text, &entry.heard, entry.ignore_case).len() != 1
             || proposed == text
             || request.candidates.iter().any(|c| c.proposed == proposed)
         {
@@ -188,7 +201,7 @@ pub(crate) fn validate(request: &Request) -> Result<()> {
     );
     ensure!(
         !request.candidates.is_empty() && request.candidates.len() <= MAX_CANDIDATES,
-        "No matching saved vocabulary corrections need review in this passage."
+        "No unique saved vocabulary matches need review. Repeated phrases can be edited directly."
     );
     for candidate in &request.candidates {
         dictionary::validate(&candidate.entry.heard, &candidate.entry.wanted)?;
@@ -208,7 +221,16 @@ pub(crate) fn validate(request: &Request) -> Result<()> {
             app_ref(request),
         );
         ensure!(
-            count > 0 && expected != request.original && expected == candidate.proposed,
+            count == 1
+                && occurrences(
+                    &request.original,
+                    &candidate.entry.heard,
+                    candidate.entry.ignore_case
+                )
+                .len()
+                    == 1
+                && expected != request.original
+                && expected == candidate.proposed,
             "This correction is not eligible in the supplied app and sentence."
         );
     }
@@ -284,7 +306,10 @@ pub fn accept(
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("Unknown correction suggestion."))?;
     ensure!(
-        entries.contains(&candidate.entry),
+        entries
+            .iter()
+            .flat_map(Entry::variants)
+            .any(|entry| entry == candidate.entry),
         "The vocabulary rule changed. Review it again before applying a suggestion."
     );
     Ok(candidate.proposed.clone())
@@ -296,6 +321,97 @@ pub struct Preview<'a> {
     pub raw: &'a str,
     pub text: &'a str,
     pub baseline: &'a str,
+}
+
+fn occurrences(text: &str, phrase: &str, ignore_case: bool) -> Vec<std::ops::Range<usize>> {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '\'' || c == '’';
+    let length = phrase.chars().count();
+    let folded = phrase.to_lowercase();
+    text.char_indices()
+        .filter_map(|(start, _)| {
+            let bytes = text[start..]
+                .chars()
+                .take(length)
+                .map(char::len_utf8)
+                .sum::<usize>();
+            let end = start + bytes;
+            let found = &text[start..end];
+            let matches = if ignore_case {
+                found.to_lowercase() == folded
+            } else {
+                found == phrase
+            };
+            (matches
+                && (start == 0 || !text[..start].chars().next_back().is_some_and(word))
+                && !text[end..].chars().next().is_some_and(word))
+            .then_some(start..end)
+        })
+        .collect()
+}
+
+/// Explicit literal-wording cues suppress a recommendation, not the user's choice.
+/// This limited English guard is not a substitute for semantic understanding.
+pub fn literal_context(review: &Review, index: usize) -> bool {
+    let Some(candidate) = review.request.candidates.get(index) else {
+        return false;
+    };
+    let Some(span) = occurrences(
+        &review.request.original,
+        &candidate.entry.heard,
+        candidate.entry.ignore_case,
+    )
+    .into_iter()
+    .next() else {
+        return false;
+    };
+    let start = review.request.original[..span.start]
+        .rfind(['.', '!', '?', '\n'])
+        .map_or(0, |i| i + 1);
+    let end = review.request.original[span.end..]
+        .find(['.', '!', '?', '\n'])
+        .map_or(review.request.original.len(), |i| span.end + i);
+    let sentence = review.request.original[start..end].to_lowercase();
+    let words: Vec<_> = sentence
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    words
+        .iter()
+        .any(|word| matches!(*word, "literal" | "verbatim" | "quote" | "quoted"))
+        || words.windows(2).any(|pair| {
+            matches!(
+                pair,
+                ["exact", "words"] | ["exact", "wording"] | ["spelled", "as"]
+            )
+        })
+}
+
+/// Show the concrete effect of one choice without exposing the model prompt.
+pub fn excerpt(text: &str, phrase: &str, ignore_case: bool) -> String {
+    let Some(span) = occurrences(text, phrase, ignore_case).into_iter().next() else {
+        return text.chars().take(260).collect();
+    };
+    let before: String = text[..span.start]
+        .chars()
+        .rev()
+        .take(100)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let after: String = text[span.end..].chars().take(140).collect();
+    format!(
+        "{}{}{}{}{}",
+        if before.len() < span.start { "…" } else { "" },
+        before,
+        &text[span.clone()],
+        after,
+        if after.len() < text.len() - span.end {
+            "…"
+        } else {
+            ""
+        }
+    )
 }
 
 pub fn apply_choice(
@@ -317,29 +433,29 @@ pub fn apply_choice(
         "The edited preview changed. Review it again first."
     );
     let candidate = &review.request.candidates[index];
-    let (from, to) = if saved_spelling {
-        (&candidate.entry.heard, &candidate.entry.wanted)
-    } else {
-        (&candidate.entry.wanted, &candidate.entry.heard)
-    };
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    let matches: Vec<_> = preview
-        .match_indices(from)
-        .filter(|(at, _)| {
-            (*at == 0 || !preview[..*at].chars().next_back().is_some_and(is_word))
-                && !preview[*at + from.len()..]
-                    .chars()
-                    .next()
-                    .is_some_and(is_word)
-        })
-        .map(|(at, _)| at)
-        .collect();
+    let original = occurrences(raw, &candidate.entry.heard, candidate.entry.ignore_case);
     ensure!(
-        matches.len() == 1,
-        "This spelling appears more than once or changed. Edit it directly in the preview."
+        original.len() == 1,
+        "This phrase is no longer uniquely identifiable."
+    );
+    let heard = &raw[original[0].clone()];
+    let (from, to) = if saved_spelling {
+        (heard, candidate.entry.wanted.as_str())
+    } else {
+        (candidate.entry.wanted.as_str(), heard)
+    };
+    let matches = occurrences(preview, from, candidate.entry.ignore_case);
+    let target_matches = occurrences(preview, to, candidate.entry.ignore_case);
+    if matches.is_empty() && target_matches.len() == 1 {
+        return Ok(preview.to_owned());
+    }
+    ensure!(
+        matches.len() == 1
+            && (target_matches.is_empty() || from.to_lowercase() == to.to_lowercase()),
+        "This spelling appears more than once or both spellings are present. Edit it directly in the preview."
     );
     let mut result = preview.to_owned();
-    result.replace_range(matches[0]..matches[0] + from.len(), to);
+    result.replace_range(matches[0].clone(), to);
     Ok(result)
 }
 
@@ -348,6 +464,34 @@ mod tests {
     use super::*;
     fn entry() -> Entry {
         dictionary::validate("cube win", "Qwen").unwrap()
+    }
+
+    #[test]
+    fn merged_context_review_keeps_the_matching_case_policy_and_rejects_removed_clause() {
+        let mut entry = entry();
+        entry.cues = vec!["engine".into()];
+        entry.contexts.push(dictionary::Context {
+            cues: vec!["model".into()],
+            ignore_case: true,
+        });
+        let text = "Load the CUBE WIN model.";
+        let review = reviewed(text, std::slice::from_ref(&entry));
+        assert!(review.request.candidates[0].entry.ignore_case);
+        assert!(review.request.candidates[0].entry.contexts.is_empty());
+        assert_eq!(
+            accept(&review, 0, text, std::slice::from_ref(&entry), None).unwrap(),
+            "Load the Qwen model."
+        );
+        assert!(
+            prepare(
+                "Load the CUBE WIN engine.",
+                std::slice::from_ref(&entry),
+                None
+            )
+            .is_err()
+        );
+        entry.contexts.clear();
+        assert!(accept(&review, 0, text, &[entry], None).is_err());
     }
 
     #[test]
@@ -414,6 +558,9 @@ mod tests {
     fn protects_numbers_negations_and_rejects_forged_candidates() {
         for (before, after) in [
             ("not ready", "ready"),
+            ("won’t finish", "will finish"),
+            ("didn't agree", "did agree"),
+            ("shouldn’t change", "should change"),
             ("two days", "three days"),
             ("10 euros", "100 euros"),
         ] {
@@ -507,5 +654,168 @@ mod tests {
         output.scores[0].candidate = 0;
         output.request_hash = "different".into();
         assert!(review(request, &serde_json::to_vec(&output).unwrap()).is_err());
+    }
+
+    fn reviewed(text: &str, entries: &[Entry]) -> Review {
+        let request = prepare(text, entries, None).unwrap();
+        let scores = (0..request.candidates.len())
+            .map(|candidate| Score {
+                candidate,
+                replace_score: 0.9,
+            })
+            .collect();
+        Review { request, scores }
+    }
+
+    #[test]
+    fn repeated_rules_are_not_offered_as_unusable_choices() {
+        assert!(prepare("cube win and cube win", &[entry()], None).is_err());
+        let entries = [
+            entry(),
+            dictionary::validate("post grass", "Postgres").unwrap(),
+        ];
+        let request = prepare("cube win and cube win use post grass", &entries, None).unwrap();
+        assert_eq!(request.candidates.len(), 1);
+        assert_eq!(request.candidates[0].entry.wanted, "Postgres");
+        let mut scoped = entry();
+        scoped.cues = vec!["model".into()];
+        assert!(prepare("Load the cube win model. Quote cube win.", &[scoped], None).is_err());
+    }
+
+    #[test]
+    fn review_choices_handle_case_and_already_applied_spelling() {
+        let entries = [dictionary::validate("at Casey", "@Casey").unwrap()];
+        let raw = "At Casey please reply.";
+        let review = reviewed(raw, &entries);
+        let saved = "@Casey please reply.";
+        for (text, use_saved, expected) in [
+            (raw, true, saved),
+            (saved, true, saved),
+            (saved, false, raw),
+            (raw, false, raw),
+        ] {
+            assert_eq!(
+                apply_choice(
+                    &review,
+                    0,
+                    use_saved,
+                    Preview {
+                        raw,
+                        text,
+                        baseline: text
+                    },
+                    &entries,
+                    None
+                )
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn choices_for_separate_rules_preserve_each_other() {
+        let entries = [
+            entry(),
+            dictionary::validate("post grass", "Postgres").unwrap(),
+        ];
+        let raw = "Load cube win and post grass.";
+        let review = reviewed(raw, &entries);
+        let first = apply_choice(
+            &review,
+            0,
+            true,
+            Preview {
+                raw,
+                text: raw,
+                baseline: raw,
+            },
+            &entries,
+            None,
+        )
+        .unwrap();
+        let second = apply_choice(
+            &review,
+            1,
+            true,
+            Preview {
+                raw,
+                text: &first,
+                baseline: &first,
+            },
+            &entries,
+            None,
+        )
+        .unwrap();
+        assert_eq!(second, "Load Qwen and Postgres.");
+        let restored = apply_choice(
+            &review,
+            0,
+            false,
+            Preview {
+                raw,
+                text: &second,
+                baseline: &second,
+            },
+            &entries,
+            None,
+        )
+        .unwrap();
+        assert_eq!(restored, "Load cube win and Postgres.");
+    }
+
+    #[test]
+    fn both_spellings_in_preview_cannot_select_the_wrong_occurrence() {
+        let entries = [entry()];
+        let raw = "Compare cube win with Qwen.";
+        let review = reviewed(raw, &entries);
+        for saved in [false, true] {
+            assert!(
+                apply_choice(
+                    &review,
+                    0,
+                    saved,
+                    Preview {
+                        raw,
+                        text: raw,
+                        baseline: raw
+                    },
+                    &entries,
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn literal_abstention_is_explicit_and_sentence_local() {
+        for text in [
+            "Quote cube win exactly.",
+            "Keep the exact words cube win.",
+            "Write cube win verbatim.",
+        ] {
+            let review = reviewed(text, &[entry()]);
+            assert!(literal_context(&review, 0));
+            assert_eq!(review.scores[0].replace_score, 0.9);
+        }
+        for text in [
+            "Load cube win for the model.",
+            "Quote the next sentence. Load cube win.",
+            "Load cube win. Quote something else.",
+        ] {
+            assert!(!literal_context(&reviewed(text, &[entry()]), 0));
+        }
+    }
+
+    #[test]
+    fn unicode_excerpt_and_matches_preserve_boundaries() {
+        assert_eq!(occurrences("Änne and Ännes", "änne", true), vec![0..5]);
+        assert!(occurrences("speaker’s", "speaker", true).is_empty());
+        let text = format!("{} cube win {}", "é".repeat(200), "世".repeat(200));
+        let shown = excerpt(&text, "cube win", false);
+        assert!(shown.starts_with('…') && shown.ends_with('…'));
+        assert!(shown.contains("cube win"));
+        assert!(shown.chars().count() <= 250);
     }
 }

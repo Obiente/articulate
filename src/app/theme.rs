@@ -3,6 +3,13 @@ pub(super) const INK: Color32 = Color32::from_rgb(241, 239, 230);
 pub(super) const MUTED: Color32 = Color32::from_rgb(165, 178, 182);
 pub(super) const SURFACE: Color32 = Color32::from_rgb(24, 33, 35);
 pub(super) const LINE: Color32 = Color32::from_rgb(48, 63, 65);
+pub(super) const BASE: Color32 = Color32::from_rgb(15, 21, 23);
+pub(super) const CANVAS: Color32 = Color32::from_rgb(18, 26, 28);
+pub(super) const SELECTED: Color32 = Color32::from_rgb(32, 56, 51);
+
+pub(super) fn page_title(ui: &mut egui::Ui, title: &str) -> egui::Response {
+    ui.label(RichText::new(title).size(28.0).strong().color(INK))
+}
 
 #[derive(Clone, Copy)]
 pub(super) enum Icon {
@@ -13,7 +20,6 @@ pub(super) enum Icon {
     Gear,
     Copy,
     Undo,
-    Bulb,
     Lock,
     Close,
     History,
@@ -28,7 +34,6 @@ impl Icon {
             Self::Gear => egui::include_image!("../../assets/icons/gear.svg"),
             Self::Copy => egui::include_image!("../../assets/icons/copy.svg"),
             Self::Undo => egui::include_image!("../../assets/icons/arrow-counter-clockwise.svg"),
-            Self::Bulb => egui::include_image!("../../assets/icons/lightbulb.svg"),
             Self::Lock => egui::include_image!("../../assets/icons/lock.svg"),
             Self::Close => egui::include_image!("../../assets/icons/x.svg"),
             Self::History => egui::ImageSource::Bytes { uri: "bytes://articulate-history.svg".into(), bytes: br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11a9 9 0 1 1 2.5 7M3 5v6h6M12 7v5l3 2"/></svg>"#.as_slice().into() },
@@ -44,7 +49,6 @@ impl Icon {
                 Self::Gear => "Settings",
                 Self::Copy => "Copy text",
                 Self::Undo => "Undo",
-                Self::Bulb => "Shortcuts",
                 Self::Lock => "Local",
                 Self::Close => "Close",
                 Self::History => "History",
@@ -58,8 +62,8 @@ pub(super) fn configure(ctx: &egui::Context) {
     ctx.set_visuals(egui::Visuals::dark());
     let mut style = (*ctx.style()).clone();
     style.animation_time = 0.18;
-    style.spacing.item_spacing = egui::vec2(12.0, 14.0);
-    style.spacing.button_padding = egui::vec2(18.0, 12.0);
+    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+    style.spacing.button_padding = egui::vec2(12.0, 8.0);
     style.spacing.interact_size.y = 38.0;
     style
         .text_styles

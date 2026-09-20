@@ -31,6 +31,22 @@ class NotesCorpusTests(unittest.TestCase):
             self.assertTrue(any("not " in text or "cannot " in text for text in split["key_fact"]))
             self.assertTrue(any("commit" in text for text in split["background"]))
 
+    def test_training_covers_short_turns_and_variable_context_without_test_leakage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "data"
+            generate(path)
+            train = json.loads((path / "train.json").read_text(encoding="utf-8"))
+            transcripts = [item["transcript"] for item in train]
+            self.assertGreater(len({len(t["segments"]) for t in transcripts}), 3)
+            self.assertGreater(len({t["goal"] for t in transcripts}), 1)
+            self.assertTrue(any(s["speaker"] is None for t in transcripts for s in t["segments"]))
+            short_categories = {
+                label["kind"] for item in train for label in item["labels"]
+                for segment in item["transcript"]["segments"]
+                if segment["id"] == label["segment_id"] and len(segment["text"].split()) <= 6
+            }
+            self.assertEqual(short_categories, {"background", "key_fact", "decision", "action"})
+
 
 if __name__ == "__main__":
     unittest.main()

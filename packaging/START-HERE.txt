@@ -9,19 +9,24 @@ Keep all DLLs beside the app.
 FIRST START
 1. Open Settings and choose Download recommended model (about 2.19 GB).
 2. Choose your microphone. Use headphones for call transcripts.
-3. Start dictation or press Ctrl+Alt+Space. Press again to finish.
-4. To dictate into another app, enable Type live, focus its text field,
-   and use the shortcut. Test in a disposable text field first.
-5. For calls, open Calls > Setup and download speaker identification
-   (about 237 MB). Choose the output device your call uses.
+3. Hold Ctrl+Alt+Space to dictate. Release to finish. Double-press for
+   hands-free recording, then press once to finish. Settings offers toggle
+   mode, custom keys, and optional start/stop sounds.
+4. Enable Insert into your app and focus its text field before dictating.
+   Hold mode inserts after finishing. Toggle mode can type live in supported
+   fields. Test in a disposable text field first.
+5. For calls, open Calls > Setup. The Vencord companion needs its separate
+   audio connection. For other apps, choose mixed output capture and download
+   speaker identification (about 237 MB) when activity names are unavailable.
 
-No model weights are bundled. Initial downloads require internet.
+Large speech models download separately. Small Assort notes and vocabulary
+models are included. Initial speech-model downloads require internet.
 Recognition works locally after download. A recent PC with 16 GB RAM is
 recommended; CPU-only operation is supported. If GPU loading fails, choose
 CPU only in Settings. First GPU loading can take longer while it warms up.
 
 UPDATES
-Settings > Updates checks GitHub only when you request it. Available updates
+Settings > Updates & about checks GitHub only when you request it. Available updates
 download separately and are checked against the release's SHA-256 digest.
 Finish any recording before installing. Models and saved sessions are kept.
 This initial release is not code-signed. Windows may show an unknown-publisher
@@ -34,11 +39,12 @@ There is no cloud transcription, telemetry, account or automatic sync.
 
 CALLS AND DISCORD
 Output capture includes everything playing through the chosen device.
-Discord speaker names use voice activity; they do not separate overlapping
-audio. The custom build includes the participant-isolated audio adapter. It
-has not yet been validated in a real call. See docs/vencord.md in the repository.
-Notes are highlights
-and possible actions quoted from the transcript, not a generative summary.
+The Vencord companion includes an adapter for separate participant audio.
+Capture waits for that connection rather than silently using mixed audio.
+Live callback behavior still needs validation on supported Discord builds.
+The debugger connection provides activity names only and cannot separate
+overlapping mixed audio. See docs/vencord.md in the repository.
+Notes are reviewable highlights and possible actions quoted from the transcript.
 
 FEEDBACK
 Use github.com/Obiente/articulate/issues. Include app version, Windows version,

@@ -247,7 +247,7 @@ impl App {
             return;
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Your history").size(36.0));
+            theme::page_title(ui, "History");
             ui.label(
                 RichText::new(format!("{} saved", self.history.items.len()))
                     .small()
@@ -304,53 +304,47 @@ impl App {
                     let day = date(item.created_ms);
                     if previous_date != day {
                         ui.add_space(12.0);
-                        ui.label(RichText::new(&day).size(18.0));
+                        ui.label(RichText::new(&day).size(13.0).color(MUTED));
                         ui.add_space(6.0);
                         previous_date = day;
                     }
                     egui::Frame::new()
-                        .fill(Color32::TRANSPARENT)
-                        .corner_radius(16)
+                        .fill(theme::SURFACE)
+                        .corner_radius(10)
                         .inner_margin(14.0)
                         .show(ui, |ui| {
-                            ui.set_min_width((ui.available_width() - 1.0).max(0.0));
-                            ui.horizontal(|ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.horizontal_top(|ui| {
                                 ui.add(if matches!(item.kind, Kind::Call) {
-                                    theme::Icon::Phone.image(28.0, INK)
+                                    theme::Icon::Phone.image(22.0, MUTED)
                                 } else {
-                                    theme::Icon::Mic.image(28.0, INK)
+                                    theme::Icon::Mic.image(22.0, MUTED)
                                 });
-                                let width = ui.available_width();
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(width * 0.4, 66.0),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        ui.set_min_width(width * 0.4);
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    RichText::new(&item.title)
-                                                        .size(18.0)
-                                                        .color(INK),
-                                                )
-                                                .frame(false),
-                                            )
-                                            .clicked()
-                                        {
-                                            open = Some(item.id.clone());
-                                        }
-                                        ui.label(
-                                            RichText::new(kind_name(&item.kind))
-                                                .small()
-                                                .color(MUTED),
-                                        );
-                                    },
-                                );
                                 ui.vertical(|ui| {
-                                    ui.set_max_width((width * 0.53).max(180.0));
+                                    ui.set_min_width(ui.available_width());
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(&item.title).size(17.0).color(INK),
+                                            )
+                                            .frame(false)
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&item.title)
+                                        .clicked()
+                                    {
+                                        open = Some(item.id.clone());
+                                    }
                                     ui.add(
-                                        egui::Label::new(RichText::new(&item.preview).color(MUTED))
-                                            .wrap(),
+                                        egui::Label::new(
+                                            RichText::new(&item.preview).size(14.0).color(MUTED),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.label(
+                                        RichText::new(kind_name(&item.kind))
+                                            .size(12.0)
+                                            .color(MUTED),
                                     );
                                 });
                             });
@@ -415,7 +409,7 @@ impl App {
             keep_selected = false;
         }
         ui.add_space(8.0);
-        ui.label(RichText::new(&session.title).size(34.0));
+        theme::page_title(ui, &session.title);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add(
@@ -540,7 +534,7 @@ impl App {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.history.detail_search)
                         .hint_text("Find words or a speaker")
-                        .desired_width(260.0)
+                        .desired_width((ui.available_width() - 160.0).clamp(160.0, 260.0))
                         .margin(egui::vec2(10.0, 8.0)),
                 );
             });

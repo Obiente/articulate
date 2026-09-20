@@ -8,7 +8,7 @@ Built with Rust, a native egui interface, and a local C/C++ inference runtime. W
 
 ## Make room for your voice
 
-- **Dictate into your apps.** A customizable shortcut starts recording. Supported text fields update as you speak, with a final revision when you finish.
+- **Dictate into your apps.** Hold a customizable shortcut to speak, or double-press for hands-free dictation. Toggle mode also supports live insertion in compatible text fields.
 - **Teach it your vocabulary.** Correct a short word or phrase, review the learning notice, and undo it if needed. Vocabulary can be scoped to an app or nearby words.
 - **Say your shortcuts.** Say “bang signature” to expand a snippet, or use a template with a spoken `{text}` argument.
 - **Keep the conversation.** Capture your microphone and call output, review speaker-labelled transcripts, and create quoted highlights and possible actions.
@@ -25,7 +25,7 @@ Assort's included models use authored synthetic English training examples. They 
 
 A recent Windows 10/11 PC with **16 GB RAM** is recommended as a starting point. CPU-only operation is supported; compatible Vulkan GPUs can accelerate inference. Performance depends on hardware and speech. A broader hardware compatibility matrix is still in progress.
 
-Press **Ctrl+Alt+Space** to start and finish dictation. Change the shortcut in Settings. [Full setup instructions →](docs/getting-started.md)
+Hold **Ctrl+Alt+Space** to dictate, then release to finish. Double-press for hands-free recording. Change the shortcut, activation mode, and recording sounds in Settings. [Full setup instructions →](docs/getting-started.md)
 
 ## Discord
 
@@ -35,7 +35,7 @@ The custom companion includes a [native receive adapter](plugins/discord-native/
 
 ## Updates and privacy
 
-Use **Settings → App updates** to check for a release. Updates are downloaded only on request, verified against the GitHub asset's SHA-256 digest, and installed after recording has finished and pending history saves have completed. Models and saved sessions survive updates.
+Use **Settings → Updates & about** to check for a release. Updates are downloaded only on request, verified against the GitHub asset's SHA-256 digest, and installed after recording has finished and pending history saves have completed. Models and saved sessions survive updates.
 
 Speech runs locally after models are downloaded. Model downloads contact Hugging Face; explicit update checks and downloads contact GitHub. The Discord companion uses loopback. Participant pictures are fetched from Discord's CDN and cached locally. Text is never sent for transcription or correction. Saved text, notes, preferences and models live under `%LOCALAPPDATA%\TranscribeLocal`; audio is not saved. Uninstalling keeps this local data.
 

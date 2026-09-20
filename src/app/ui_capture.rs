@@ -36,10 +36,13 @@ fn page_app(page: &str) -> App {
         _ => populated_app(),
     };
     match page {
-        "notes" => {
+        "notes" | "notes-review" => {
             app.call_tab = 1;
             app.call_rows.truncate(3);
             app.call_committed = app.call_rows.clone();
+            if page == "notes-review" {
+                app.prepare_assort_review_capture(true);
+            }
         }
         "discord-setup" => {
             app.call_tab = 2;
@@ -62,17 +65,23 @@ fn page_app(page: &str) -> App {
                 app.call_rows[index].microphone=index>=2;
                 app.call_rows[index].speakers=vec![if index==0 {1}else{2}];
             }
-            app.call_committed = app.call_rows[..3].to_vec();
+            let rows = std::mem::take(&mut app.call_rows);
+            calls::append_rows(&mut app.call_committed, rows[..3].to_vec());
+            app.call_rows = app.call_committed.clone();
+            calls::append_rows(&mut app.call_rows, rows[3..].to_vec());
             let mut session = crate::history::Session::new(crate::history::Kind::Call);
             session.title = "Weekly check-in".into();
             app.history.call = Some(session);
         }
 
-        "dictate" => {
+        "dictate" | "correction-review" => {
             app.page = 0;
             app.text = "Hi Casey, could you review the updated plan before tomorrow? I moved the launch check-in to Thursday at three.".into();
             app.raw = app.text.clone();
             app.status = "Your transcript is ready".into();
+            if page == "correction-review" {
+                app.prepare_assort_review_capture(false);
+            }
         }
         "vocabulary" => {
             app.page = 1;
@@ -151,9 +160,50 @@ fn calls_reserve_readable_transcript_height() {
             "Transcript clip too short at {width}x{height}: {transcript_clip:?}"
         );
         assert!(
-            transcript_clip.bottom() <= height - 44.0,
-            "Transcript overlaps footer"
+            transcript_clip.bottom() <= height - 32.0,
+            "Transcript extends beyond the content canvas"
         );
+    }
+}
+
+#[test]
+fn review_actions_and_first_note_are_visible_without_scrolling() {
+    for (width, height) in [(850.0, 620.0), (1200.0, 840.0)] {
+        for page in ["notes-review", "dictate"] {
+            let mut app = page_app(page);
+            let first_quote = app.call_rows[0].text.clone();
+            let ctx = egui::Context::default();
+            theme::configure(&ctx);
+            let mut output = None;
+            for _ in 0..3 {
+                output = Some(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, height),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| app.surface(ctx),
+                ));
+            }
+            let labels = if page == "notes-review" {
+                vec!["Save 2 selected passages", first_quote.as_str()]
+            } else {
+                vec!["Review vocabulary"]
+            };
+            for label in labels {
+                let visible = output.as_ref().unwrap().shapes.iter().any(|shape| {
+                    if let egui::epaint::Shape::Text(text) = &shape.shape {
+                        let bounds = text.galley.rect.translate(text.pos.to_vec2());
+                        text.galley.job.text == label && shape.clip_rect.contains_rect(bounds)
+                    } else {
+                        false
+                    }
+                });
+                assert!(visible, "{label} is clipped at {width}x{height} on {page}");
+            }
+        }
     }
 }
 
@@ -208,7 +258,8 @@ fn capture_calls_ui() {
                 self.app.surface(ctx);
             }
             self.frames += 1;
-            if self.frames == 3 {
+            // Let window and disclosure animations settle before visual QA.
+            if self.frames == 12 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
             }
             let saved = ctx.input(|input| {
@@ -260,6 +311,8 @@ fn capture_calls_ui() {
         options,
         Box::new(move |cc| {
             theme::configure(&cc.egui_ctx);
+            // Capture final visual states, not a timing-dependent window fade.
+            cc.egui_ctx.style_mut(|style| style.animation_time = 0.0);
             Ok(Box::new(Capture {
                 app: if let Ok(page) = std::env::var("ARTICULATE_UI_PAGE") {
                     page_app(&page)
@@ -373,8 +426,50 @@ fn live_calls_keep_reading_space_with_follow_controls() {
             "Live transcript too short at {width}x{height}: {clip:?}"
         );
         assert!(
-            clip.bottom() <= height - 44.0,
-            "Live transcript overlaps footer"
+            clip.bottom() <= height - 32.0,
+            "Live transcript extends beyond the content canvas"
         );
+    }
+}
+
+#[test]
+fn sidebar_navigation_supports_keyboard_activation() {
+    let mut app = page_app("dictate");
+    let ctx = egui::Context::default();
+    theme::configure(&ctx);
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(850.0, 620.0),
+        )),
+        ..Default::default()
+    };
+    let _ = ctx.run(input(), |ctx| app.surface(ctx));
+    for page in [3usize, 1, 4, 5, 2, 0] {
+        let id = ctx
+            .data_mut(|data| {
+                data.get_temp::<egui::Id>(egui::Id::new(("navigation_response", page)))
+            })
+            .unwrap();
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let mut raw = input();
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        });
+        let _ = ctx.run(raw, |ctx| app.surface(ctx));
+        assert_eq!(app.page, page);
+        let mut raw = input();
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: Default::default(),
+        });
+        let _ = ctx.run(raw, |ctx| app.surface(ctx));
     }
 }

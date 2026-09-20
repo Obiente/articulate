@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Context {
+    pub cues: Vec<String>,
+    pub ignore_case: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(from = "StoredEntry")]
 pub struct Entry {
@@ -11,6 +17,8 @@ pub struct Entry {
     pub cues: Vec<String>,
     #[serde(default)]
     pub ignore_case: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<Context>,
     #[serde(default = "enabled")]
     pub enabled: bool,
 }
@@ -25,6 +33,8 @@ struct StoredEntry {
     cues: Vec<String>,
     #[serde(default)]
     ignore_case: Option<bool>,
+    #[serde(default)]
+    contexts: Vec<Context>,
     #[serde(default = "enabled")]
     enabled: bool,
 }
@@ -41,6 +51,7 @@ impl From<StoredEntry> for Entry {
             app: value.app,
             cues: value.cues,
             ignore_case,
+            contexts: value.contexts,
             enabled: value.enabled,
         }
     }
@@ -59,11 +70,137 @@ fn enabled() -> bool {
 }
 impl Entry {
     pub fn same_scope(&self, other: &Self) -> bool {
-        self.app == other.app && self.cues == other.cues
+        self.same_app(other) && self.cues == other.cues && self.contexts == other.contexts
     }
     pub fn same_key(&self, other: &Self) -> bool {
         self.heard == other.heard && self.same_scope(other)
     }
+    pub fn same_app(&self, other: &Self) -> bool {
+        match (&self.app, &other.app) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    pub fn same_correction(&self, other: &Self) -> bool {
+        self.heard == other.heard && self.wanted == other.wanted && self.same_app(other)
+    }
+    pub fn policies(&self) -> impl Iterator<Item = (&[String], bool)> {
+        std::iter::once((self.cues.as_slice(), self.ignore_case)).chain(
+            self.contexts
+                .iter()
+                .map(|c| (c.cues.as_slice(), c.ignore_case)),
+        )
+    }
+    pub fn all_cues(&self) -> Vec<String> {
+        let mut cues: Vec<_> = self
+            .policies()
+            .flat_map(|(cues, _)| cues.iter().cloned())
+            .collect();
+        cues.sort();
+        cues.dedup();
+        cues
+    }
+    pub fn has_alternative_contexts(&self) -> bool {
+        !self.contexts.is_empty()
+    }
+    /// Concrete policies are useful when a review must retain the precise rule
+    /// that matched, rather than accidentally widening its capitalization.
+    pub fn variants(&self) -> impl Iterator<Item = Self> + '_ {
+        self.policies().map(|(cues, ignore_case)| {
+            let mut entry = self.clone();
+            entry.cues = cues.to_vec();
+            entry.ignore_case = ignore_case;
+            entry.contexts.clear();
+            entry
+        })
+    }
+}
+
+fn merge_contexts(existing: &mut Entry, incoming: &Entry) {
+    let mut policies: Vec<Context> = Vec::new();
+    for (cues, ignore_case) in existing.policies().chain(incoming.policies()) {
+        let mut cues = cues.to_vec();
+        cues.sort();
+        cues.dedup();
+        if let Some(policy) = policies.iter_mut().find(|p| {
+            p.ignore_case == ignore_case
+                && ((p.cues.is_empty() && cues.is_empty())
+                    || (!p.cues.is_empty() && !cues.is_empty() && {
+                        let mut joined = p.cues.clone();
+                        joined.extend(cues.iter().cloned());
+                        joined.sort();
+                        joined.dedup();
+                        joined.len() <= 8
+                    }))
+        }) {
+            if policy.cues.is_empty() || cues.is_empty() {
+                policy.cues.clear();
+            } else {
+                policy.cues.extend(cues);
+                policy.cues.sort();
+                policy.cues.dedup();
+            }
+        } else {
+            policies.push(Context { cues, ignore_case });
+        }
+    }
+    let first = policies.remove(0);
+    existing.cues = first.cues;
+    existing.ignore_case = first.ignore_case;
+    existing.contexts = policies;
+}
+
+/// Merge existing duplicate rows without changing the union of their matching
+/// policies. Disabled rows remain separate from enabled rows.
+pub fn deduplicate(entries: &mut Vec<Entry>) -> bool {
+    let before = entries.clone();
+    let mut result: Vec<Entry> = Vec::with_capacity(entries.len());
+    for entry in entries.drain(..) {
+        if result.contains(&entry) {
+            continue;
+        }
+        // Ambiguous replacement families retain their original row order.
+        // Moving one of their clauses could change which spelling wins ties.
+        let ambiguous = before.iter().any(|other| {
+            (other.heard == entry.heard
+                || ((other.policies().any(|(_, insensitive)| insensitive)
+                    || entry.policies().any(|(_, insensitive)| insensitive))
+                    && other.heard.to_lowercase() == entry.heard.to_lowercase()))
+                && other.same_app(&entry)
+                && other.wanted != entry.wanted
+                && other.enabled
+                && entry.enabled
+        });
+        if let Some(existing) = result
+            .iter_mut()
+            .find(|e| !ambiguous && e.same_correction(&entry) && e.enabled == entry.enabled)
+        {
+            merge_contexts(existing, &entry);
+        } else {
+            result.push(entry);
+        }
+    }
+    *entries = result;
+    *entries != before
+}
+
+/// Explicit edits replace only the exact row the editor opened. Adding an
+/// existing correction adds its context policies instead of another row.
+pub fn save(entries: &mut Vec<Entry>, entry: Entry, original: Option<&Entry>) -> Entry {
+    if let Some(index) = original.and_then(|original| entries.iter().position(|e| e == original)) {
+        // Equal-length, equally scoped rules resolve in saved order. Editing a
+        // spelling must not move it behind a case-folded competing rule.
+        entries[index] = entry.clone();
+    } else {
+        entries.push(entry.clone());
+    }
+    deduplicate(entries);
+    entries
+        .iter()
+        .find(|e| e.same_correction(&entry) && e.enabled == entry.enabled)
+        .unwrap()
+        .clone()
 }
 pub fn app_scope(value: &str) -> anyhow::Result<Option<String>> {
     let value = value.trim().to_lowercase();
@@ -118,6 +255,7 @@ pub fn validate(heard: &str, wanted: &str) -> anyhow::Result<Entry> {
         app: None,
         cues: Vec::new(),
         ignore_case: spoken_mention(heard, wanted),
+        contexts: Vec::new(),
         enabled: true,
     })
 }
@@ -182,7 +320,9 @@ pub(crate) fn output_in_context(entry: &Entry, text: &str) -> bool {
             let end = at + entry.wanted.len();
             (at == 0 || !text[..at].chars().next_back().is_some_and(word))
                 && !text[end..].chars().next().is_some_and(word)
-                && nearby(text, at, end, &entry.cues)
+                && entry
+                    .policies()
+                    .any(|(cues, _)| nearby(text, at, end, cues))
         })
 }
 
@@ -196,18 +336,24 @@ pub fn apply_in(text: &str, entries: &[Entry], app: Option<&str>) -> (String, us
                     .as_deref()
                     .is_none_or(|scope| app.is_some_and(|app| app.eq_ignore_ascii_case(scope)))
         })
+        .flat_map(|entry| {
+            entry
+                .policies()
+                .map(move |(cues, ignore_case)| (entry, cues, ignore_case))
+        })
         .collect();
-    entries.sort_by_key(|e| {
-        std::cmp::Reverse((e.heard.chars().count(), e.app.is_some(), !e.cues.is_empty()))
+    entries.sort_by_key(|(e, cues, _)| {
+        std::cmp::Reverse((e.heard.chars().count(), e.app.is_some(), !cues.is_empty()))
     });
     // Prepare case folding once per rule, not once for every input character.
     let entries: Vec<_> = entries
         .into_iter()
-        .map(|e| {
+        .map(|(e, cues, ignore_case)| {
             (
                 e,
                 e.heard.chars().count(),
-                e.ignore_case.then(|| e.heard.to_lowercase()),
+                ignore_case.then(|| e.heard.to_lowercase()),
+                cues,
             )
         })
         .collect();
@@ -215,8 +361,8 @@ pub fn apply_in(text: &str, entries: &[Entry], app: Option<&str>) -> (String, us
     let mut at = 0;
     let mut changed = 0;
     while at < text.len() {
-        let found = entries.iter().find_map(|(e, chars, folded)| {
-            let len = if e.ignore_case {
+        let found = entries.iter().find_map(|(e, chars, folded, cues)| {
+            let len = if folded.is_some() {
                 text[at..].chars().take(*chars).map(char::len_utf8).sum()
             } else {
                 e.heard.len()
@@ -230,7 +376,7 @@ pub fn apply_in(text: &str, entries: &[Entry], app: Option<&str>) -> (String, us
             (matches
                 && (at == 0 || !text[..at].chars().next_back().is_some_and(word))
                 && !text[at + len..].chars().next().is_some_and(word)
-                && nearby(text, at, at + len, &e.cues))
+                && nearby(text, at, at + len, cues))
             .then_some((*e, len))
         });
         if let Some((entry, len)) = found {
@@ -251,6 +397,95 @@ mod tests {
     use super::*;
     fn e(a: &str, b: &str) -> Entry {
         validate(a, b).unwrap()
+    }
+    #[test]
+    fn duplicates_merge_exact_matching_union_without_crossing_case_contexts() {
+        let mut a = e("mercury", "Mercury");
+        a.cues = vec!["planet".into()];
+        let mut b = a.clone();
+        b.cues = vec!["function".into()];
+        b.ignore_case = true;
+        let before = vec![a, b];
+        let mut merged = before.clone();
+        assert!(deduplicate(&mut merged));
+        assert_eq!(merged.len(), 1);
+        assert!(!deduplicate(&mut merged));
+        for text in [
+            "mercury planet",
+            "MERCURY planet",
+            "mercury function",
+            "MERCURY function",
+            "mercury",
+            "function. MERCURY planet",
+        ] {
+            assert_eq!(apply(text, &before), apply(text, &merged), "{text}");
+        }
+        let restored: Vec<Entry> =
+            serde_json::from_slice(&serde_json::to_vec(&merged).unwrap()).unwrap();
+        assert!(restored == merged);
+    }
+    #[test]
+    fn merge_preserves_apps_replacements_disabled_choices_and_explicit_edits() {
+        let a = e("Jon", "John");
+        let mut other_app = a.clone();
+        other_app.app = Some("editor.exe".into());
+        let mut disabled = a.clone();
+        disabled.enabled = false;
+        let other_spelling = e("Jon", "Jonathan");
+        let mut entries = vec![a.clone(), other_app, disabled, other_spelling];
+        assert!(!deduplicate(&mut entries));
+        let mut edited = a.clone();
+        edited.cues = vec!["team".into()];
+        save(&mut entries, edited, Some(&a));
+        assert_eq!(entries.len(), 4);
+        assert!(entries.iter().any(|e| !e.enabled && e.cues.is_empty()));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.enabled && e.wanted == "John" && e.app.is_none() && e.cues == ["team"])
+        );
+    }
+    #[test]
+    fn context_union_keeps_each_clause_editable_under_cue_limit() {
+        let mut a = e("Jon", "John");
+        a.cues = (0..8).map(|i| format!("team{i}")).collect();
+        let mut b = a.clone();
+        b.cues = (8..16).map(|i| format!("team{i}")).collect();
+        let mut entries = vec![a, b];
+        deduplicate(&mut entries);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].policies().all(|(cues, _)| cues.len() <= 8));
+        assert_eq!(entries[0].all_cues().len(), 16);
+    }
+    #[test]
+    fn competing_replacement_priority_survives_migration() {
+        let mut a = e("Jon", "John");
+        a.cues = vec!["planet".into()];
+        let mut other = e("Jon", "Jonathan");
+        other.cues = vec!["team".into()];
+        let mut b = a.clone();
+        b.cues = vec!["team".into()];
+        let before = vec![a, other, b];
+        let mut entries = before.clone();
+        deduplicate(&mut entries);
+        assert_eq!(apply("Jon team", &entries), apply("Jon team", &before));
+        assert!(entries == before);
+    }
+    #[test]
+    fn folded_competing_replacement_priority_survives_migration() {
+        let mut first = e("Jon", "John");
+        first.cues = vec!["planet".into()];
+        first.ignore_case = true;
+        let mut competitor = e("jon", "Jonathan");
+        competitor.cues = vec!["team".into()];
+        competitor.ignore_case = true;
+        let mut last = first.clone();
+        last.cues = vec!["team".into()];
+        let original = vec![first, competitor, last];
+        let mut entries = original.clone();
+        assert!(!deduplicate(&mut entries));
+        assert!(entries == original);
+        assert_eq!(apply("Jon team", &entries).0, "Jonathan team");
     }
     #[test]
     fn legacy_mentions_handle_sentence_case_and_explicit_choices_survive() {

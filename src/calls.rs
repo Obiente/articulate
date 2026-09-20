@@ -10,7 +10,17 @@ use std::{
     time::Duration,
 };
 
+mod activity;
 mod native;
+
+/// A requested companion capture never silently becomes mixed output capture.
+pub fn select_native_source(companion_selected: bool, native_ready: bool) -> Result<bool> {
+    anyhow::ensure!(
+        !companion_selected || native_ready,
+        "Separate Discord audio is not connected yet. Connect the companion audio adapter before capturing this call."
+    );
+    Ok(companion_selected)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Row {
@@ -132,15 +142,19 @@ fn process_activity_window(
             text,
         });
     }
-    for segment in segments {
+    for segment in activity::plan(segments, remote.len()) {
         let text = engine.transcribe(&remote[segment.audio_start..segment.audio_end])?;
         if !text.is_empty() {
             rows.push(Row {
                 start_ms: offset_ms + segment.start as u64 / 16,
                 end_ms: offset_ms + segment.end as u64 / 16,
                 microphone: false,
-                speakers: Vec::new(),
-                discord: Some(segment.attribution.clone()),
+                speakers: if segment.attribution.is_some() {
+                    Vec::new()
+                } else {
+                    vec![0]
+                },
+                discord: segment.attribution,
                 text,
             });
         }

@@ -300,6 +300,116 @@ TEST = {
         "We are brainstorming changes to {topic}, with nothing assigned or settled.",
     ],
 }
+# Short conversational passages are not all final decisions. These authored
+# training families deliberately vary length and separate actual commitments
+# from questions, imagined statements, and quoted examples.
+TRAIN["background"].extend([
+    "Hello, everybody.", "Good morning, team.", "Thanks for coming along.",
+    "Thank you for joining today.", "Welcome back.", "How are you doing?",
+    "How was your weekend?", "I hope you had a good holiday.",
+    "Sorry I am late.", "Can you hear me clearly?", "My microphone was muted.",
+    "Let me get my headphones.", "One second, please.", "I am still opening my notes.",
+    "Could you repeat that last sentence?", "I missed that, sorry.",
+    "That is funny.", "Anyway, where were we?", "Thanks, that makes sense.",
+    "See you next time.", "Have a nice evening.", "Okay, thank you.",
+    "What is the status of {topic}?", "Did anyone approve {topic}?",
+    "Have we decided to keep {topic}?", "Do we know the cost of {topic}?",
+    "Is {topic} working now?", "Who will own {topic}?",
+    "Would someone volunteer to test {topic}?", "Could you prepare {topic}?",
+    "Should we release {topic} on Thursday?", "Why did {topic} fail?",
+    "How long does {topic} take?", "When will {topic} be ready?",
+    "Is there enough money for {topic}?", "Would {topic} fit within the budget?",
+    "Did you say that {topic} has been approved?", "Can we agree on {topic} today?",
+    "If we had funding, we would approve {topic}.",
+    "If my schedule allowed it, I would review {topic}.",
+    "Imagine that we decided to replace {topic}.",
+    "Suppose {topic} stopped working; how would we respond?",
+    "Maybe we should cancel {topic}.", "Perhaps {topic} will cost less next year.",
+    "There might be a problem with {topic}; I have not checked.",
+    "We could use {topic}, but that is only an idea.",
+    "I could help with {topic}, but I have not agreed to anything.",
+    "I would send {topic} if I had spare time, but I make no promise.",
+    "I did not accept the task of reviewing {topic}.",
+    "We did not decide to approve {topic}.",
+    "I never committed to delivering {topic}.",
+    "There is no agreement on {topic}.",
+    "Nobody accepted responsibility for {topic}.",
+    "The vote on {topic} has not happened yet.",
+    "Please do not treat my suggestion about {topic} as a decision.",
+    "In the role-play, the character said they would test {topic}.",
+    "The training example says we decided to cancel {topic}; that is not our plan.",
+    "The phrase 'we approved {topic}' is a sample, not an actual agreement.",
+    "That claim about {topic} is an unverified rumor.",
+    "Someone joked about shutting down {topic}.",
+    "I was quoting an imaginary assignment to review {topic}.",
+    "We have not verified the alleged failure of {topic}.",
+    "What did the report say about {topic}?",
+])
+TRAIN["key_fact"].extend([
+    "The {topic} installer is 120 megabytes.",
+    "The {topic} package occupies 75 gigabytes.",
+    "The {topic} archive is 18 megabytes.",
+    "The {topic} file is 900 kilobytes.",
+    "The {topic} license expires in December.",
+    "The current {topic} contract ends on July 22.",
+    "The {topic} service was offline for eight minutes.",
+    "The {topic} test failed on seven computers.",
+    "The {topic} error affects every device.",
+    "We have 350 dollars remaining for {topic}.",
+    "The {topic} account balance is 950 pounds.",
+    "There are no replacement parts for {topic}.",
+    "Only an authorized operator can restart {topic}.",
+    "The manufacturer requires a deposit for {topic}.",
+    "The {topic} supplier no longer manufactures the required component.",
+    "The {topic} server does not support encryption.",
+    "The {topic} report contains no missing entries.",
+    "The {topic} backup has passed verification.",
+    "The {topic} trial is finished.",
+    "The {topic} download is incomplete.",
+    "The deadline is Friday.", "The budget is 300 dollars.",
+    "The build passed all tests.", "The server is unavailable.",
+    "The files are missing.", "The office is closed today.",
+    "Our machines have no network access.", "No errors were found.",
+    "The supplier's report confirms that {topic} is unavailable.",
+    "The audit established that {topic} has three outstanding defects.",
+    "According to the verified measurement, {topic} is 450 megabytes.",
+    "The inspection confirmed that {topic} cannot run on old hardware.",
+])
+TRAIN["decision"].extend([
+    "Agreed, {topic} is our final choice.",
+    "We unanimously chose to retain {topic}.",
+    "The board approved replacing {topic}.",
+    "The vote settled the question: we are stopping {topic}.",
+    "Our final choice is to renew {topic}.",
+    "We decided to cancel {topic}.",
+    "We agreed to retain {topic}.",
+    "We have accepted the revised {topic} contract as our agreement.",
+    "That is settled: {topic} launches on Wednesday.",
+    "The board agreed that we will not fund {topic}.",
+    "We decided not to renew {topic}.",
+    "The signed minutes confirm our decision to replace {topic}.",
+    "The formal record shows that we voted to approve {topic}.",
+    "The team has confirmed its final choice to keep {topic}.",
+])
+TRAIN["action"].extend([
+    "Casey will collect the paperwork for {topic} tonight.",
+    "I will phone the supplier about {topic} after this call.",
+    "Jordan will deliver the {topic} checklist by Thursday.",
+    "Casey has committed to testing {topic} this evening.",
+    "We assigned the {topic} review to Jordan for Wednesday.",
+    "I am taking ownership of {topic} and will report tomorrow.",
+    "Casey will review the {topic} invoices this week.",
+    "I will prepare {topic} and send it before our next session.",
+    "Jordan confirmed in writing that they will deliver {topic} on Tuesday.",
+    "Casey accepted the assignment to check {topic} after lunch.",
+    "I will not publish {topic} before checking it; I will finish that check tonight.",
+    "I will send the report today.", "I will do the test tomorrow.",
+    "Casey will call the supplier.", "Jordan is assigned to the review.",
+])
+GOALS = [GOAL, "Summarize decisions and follow-up actions.",
+         "Keep confirmed decisions, assigned tasks, and relevant facts.",
+         "Find useful meeting highlights while excluding small talk and guesses."]
+
 TOPICS = {
     "train": ["microphone setup", "call notes", "vocabulary editor", "keyboard shortcut",
               "project schedule", "customer portal", "office network", "warehouse system"],
@@ -316,28 +426,41 @@ def generate(output, seed=42):
                 "split_unit": "disjoint sentence template families and topic names", "splits": {}}
     for split, templates in (("train", TRAIN), ("validation", VALIDATION), ("test", TEST)):
         records = [(kind, text.format(topic=topic)) for kind, texts in templates.items()
-                   for text in texts for topic in TOPICS[split]]
+                   for text in texts for topic in (TOPICS[split] if "{topic}" in text else [""])]
         normalized = {text.lower().strip() for _, text in records}
         assert len(normalized) == len(records) and not normalized & seen
         seen.update(normalized)
         rng.shuffle(records)
         corpus = []
-        # Avoid the former invariant that every conversation has exactly one
-        # passage of each category. Real windows may be all small talk or actions.
-        for offset in range(0, len(records), 4):
-            segments, labels = [], []
-            for index, (kind, text) in enumerate(records[offset:offset + 4]):
-                identity = f"s{index}"
-                segments.append({"id": identity, "start_ms": index * 7000,
-                                 "end_ms": index * 7000 + 6000,
-                                 "speaker": ["Speaker A", "Speaker B"][index % 2], "text": text})
-                labels.append({"segment_id": identity, "kind": kind})
-            corpus.append({"transcript": {"id": f"{split}-{offset // 4}", "title": "Synthetic meeting",
-                                          "goal": GOAL, "segments": segments}, "labels": labels})
+        # Training uses two independent views of each passage, including solo
+        # turns and variable windows. Evaluation passages remain untouched.
+        views = 2 if split == "train" else 1
+        for view in range(views):
+            arranged = records.copy()
+            if view:
+                rng.shuffle(arranged)
+            offset = 0
+            while offset < len(arranged):
+                width = rng.choice([1, 2, 3, 4, 6, 8]) if split == "train" else 4
+                segments, labels = [], []
+                for index, (kind, text) in enumerate(arranged[offset:offset + width]):
+                    identity = f"s{index}"
+                    speaker = rng.choice(["Speaker A", "Speaker B", "You", None,
+                                          "Casey", "Jordan", "Participant"]) if split == "train" else ["Speaker A", "Speaker B"][index % 2]
+                    segments.append({"id": identity, "start_ms": index * 7000,
+                                     "end_ms": index * 7000 + 6000,
+                                     "speaker": speaker, "text": text})
+                    labels.append({"segment_id": identity, "kind": kind})
+                corpus.append({"transcript": {"id": f"{split}-{view}-{offset}", "title": "Synthetic meeting",
+                                              "goal": rng.choice(GOALS) if split == "train" else GOAL,
+                                              "segments": segments}, "labels": labels})
+                offset += width
         data = (json.dumps(corpus, ensure_ascii=False, indent=2) + "\n").encode()
         (output / f"{split}.json").write_bytes(data)
-        manifest["splits"][split] = {"transcripts": len(corpus), "segments": len(records),
-                                    "families_per_category": len(templates["decision"]),
+        manifest["splits"][split] = {"transcripts": len(corpus),
+                                    "segments": sum(len(item["transcript"]["segments"]) for item in corpus),
+                                    "unique_passages": len(records), "training_views": views,
+                                    "families_per_category": {kind: len(texts) for kind, texts in templates.items()},
                                     "sha256": hashlib.sha256(data).hexdigest()}
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest

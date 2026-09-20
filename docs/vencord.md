@@ -89,9 +89,11 @@ The custom build includes the [native audio adapter](../plugins/discord-native/R
 by default. On its supported Windows Discord build it hooks the native receive
 callback for individual participant PCM, preserving each participant's identity
 through overlapping speech. Synthetic tests pass; real Discord call behavior
-still needs controlled validation. If the adapter is unavailable, manual call
-capture can use mixed output and activity-based attribution. The app labels this
-source explicitly, since mixed output cannot reliably separate overlap.
+still needs controlled validation. While the companion is selected, capture
+requires its audio connection and never silently switches to mixed output.
+To record other apps, explicitly switch to mixed output capture in Setup.
+Mixed output uses activity-based attribution or acoustic speaker recognition
+and cannot reliably separate overlap.
 It accepts one verified native-module build. Compatibility with other Discord
 voice-module versions is not yet verified.
 

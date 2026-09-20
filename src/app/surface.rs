@@ -4,62 +4,33 @@ use theme::{INK, Icon, LINE, MUTED, SURFACE};
 impl App {
     pub(super) fn surface(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::from_rgb(15, 21, 23)))
+            .frame(egui::Frame::new().fill(theme::BASE))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 theme::background(ui.painter(), rect);
-                let padding = if rect.width() > 1000.0 { 30.0 } else { 20.0 };
-                let header = egui::Rect::from_min_max(
-                    rect.min + egui::vec2(padding, 16.0),
-                    egui::pos2(rect.right() - padding, rect.top() + 88.0),
+                let sidebar_width = if rect.width() < 1050.0 { 180.0 } else { 212.0 };
+                let sidebar = egui::Rect::from_min_max(
+                    rect.min + egui::vec2(12.0, 24.0),
+                    egui::pos2(rect.left() + sidebar_width - 12.0, rect.bottom() - 24.0),
                 );
-                ui.scope_builder(egui::UiBuilder::new().max_rect(header), |ui| {
-                    self.header(ui)
+                ui.scope_builder(egui::UiBuilder::new().max_rect(sidebar), |ui| {
+                    self.sidebar(ui)
                 });
-                let footer = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + padding, rect.bottom() - 44.0),
-                    egui::pos2(rect.right() - padding, rect.bottom() - 8.0),
+                let canvas = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + sidebar_width, rect.top() + 16.0),
+                    rect.max - egui::vec2(16.0, 16.0),
                 );
-                ui.scope_builder(egui::UiBuilder::new().max_rect(footer), |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(Icon::Lock.image(18.0, MUTED));
-                        ui.label(RichText::new("On this device").size(13.0).color(MUTED));
-                        if self.history.error.is_some()
-                            && ui.small_button("History needs attention").clicked()
-                        {
-                            self.page = 5;
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(
-                                    egui::Button::image_and_text(
-                                        Icon::Bulb.image(19.0, MUTED),
-                                        RichText::new("Say bang, then your shortcut")
-                                            .size(13.0)
-                                            .color(MUTED),
-                                    )
-                                    .frame(false),
-                                )
-                                .clicked()
-                            {
-                                self.page = 4;
-                            }
-                        });
-                    });
-                });
-                let max_width = if self.page == 0 {
-                    980.0
-                } else if self.page == 3 {
-                    1380.0
-                } else {
-                    1120.0
-                };
-                let inset = padding.max((rect.width() - max_width) * 0.5);
-                let content = egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + inset, rect.top() + 108.0),
-                    egui::pos2(rect.right() - inset, footer.top() - 12.0),
+                ui.painter().rect_filled(canvas, 24, theme::CANVAS);
+                ui.painter().rect_stroke(
+                    canvas,
+                    24,
+                    egui::Stroke::new(1.0_f32, LINE.gamma_multiply(0.55)),
+                    egui::StrokeKind::Inside,
                 );
+                let padding = if rect.width() < 1050.0 { 22.0 } else { 32.0 };
+                let content = canvas.shrink(padding);
                 ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+                    ui.set_clip_rect(content);
                     match self.page {
                         0 => self.dictation_surface(ui),
                         3 => self.calls_ui(ui, ctx),
@@ -81,124 +52,121 @@ impl App {
             });
     }
 
-    fn header(&mut self, ui: &mut egui::Ui) {
-        let wide = ui.available_width() > 1050.0;
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let bounds = ui.max_rect();
+        ui.spacing_mut().item_spacing.y = 6.0;
         ui.horizontal(|ui| {
-            if !wide {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.spacing_mut().button_padding.x = 10.0;
-            }
+            ui.spacing_mut().item_spacing.x = 6.0;
             ui.add(
                 egui::Image::new(egui::include_image!(
                     "../../assets/brand/articulate-mark.svg"
                 ))
-                .fit_to_exact_size(egui::vec2(46.0, 32.0)),
+                .fit_to_exact_size(egui::vec2(34.0, 28.0)),
             );
-            ui.label(
-                RichText::new("Articulate")
-                    .size(if wide { 27.0 } else { 24.0 })
-                    .color(INK),
-            );
-            ui.add_space(if wide {
-                (ui.available_width() - 690.0).max(22.0) * 0.4
-            } else {
-                10.0
+            ui.label(RichText::new("Articulate").size(21.0).color(INK));
+        });
+        ui.add_space(36.0);
+        for (page, label, icon) in [
+            (0, "Dictate", Icon::Mic),
+            (3, "Calls", Icon::Phone),
+            (1, "Vocabulary", Icon::Book),
+            (4, "Shortcuts", Icon::Bolt),
+            (5, "History", Icon::History),
+        ] {
+            self.navigation_row(ui, page, label, icon);
+        }
+        if self.history.error.is_some() && ui.small_button("History needs attention").clicked() {
+            self.page = 5;
+        }
+        let bottom = egui::Rect::from_min_max(
+            egui::pos2(bounds.left(), bounds.bottom() - 98.0),
+            bounds.max,
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bottom), |ui| {
+            self.navigation_row(ui, 2, "Settings", Icon::Gear);
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add(Icon::Lock.image(16.0, MUTED));
+                ui.label(RichText::new("On this device").size(12.0).color(MUTED));
             });
-            for (page, label, icon) in [
-                (0, "Dictate", Icon::Mic),
-                (3, "Calls", Icon::Phone),
-                (1, "Vocabulary", Icon::Book),
-                (4, "Shortcuts", Icon::Bolt),
-                (5, "History", Icon::History),
-            ] {
-                let active = self.page == page;
-                let tint = if active { ACCENT } else { MUTED };
-                let button = egui::Button::image_and_text(
-                    icon.image(if wide { 21.0 } else { 18.0 }, tint),
-                    RichText::new(label)
-                        .size(if wide { 17.0 } else { 14.0 })
-                        .color(if active { INK } else { MUTED }),
-                )
-                .corner_radius(28)
+            ui.label(
+                RichText::new(format!("Articulate {}", env!("CARGO_PKG_VERSION")))
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        });
+    }
+
+    fn navigation_row(&mut self, ui: &mut egui::Ui, page: usize, label: &str, icon: Icon) {
+        let active = self.page == page;
+        let tint = if active { ACCENT } else { MUTED };
+        let response = ui.add_sized(
+            [ui.available_width(), 44.0],
+            egui::Button::new("")
                 .fill(if active {
-                    SURFACE
+                    theme::SELECTED
                 } else {
                     Color32::TRANSPARENT
                 })
-                .stroke(if active {
-                    egui::Stroke::new(1.0_f32, LINE)
-                } else {
-                    egui::Stroke::NONE
-                })
-                .min_size(egui::vec2(if wide { 112.0 } else { 75.0 }, 48.0));
-                let response = ui.add(button);
-                let selected =
-                    ui.ctx()
-                        .animate_bool_with_time(response.id.with("selected"), active, 0.18);
-                if selected > 0.0 {
-                    let y = response.rect.bottom() - 2.0;
-                    ui.painter().line_segment(
-                        [
-                            egui::pos2(response.rect.left() + 22.0, y),
-                            egui::pos2(response.rect.right() - 22.0, y),
-                        ],
-                        egui::Stroke::new(2.0_f32, ACCENT.gamma_multiply(selected)),
-                    );
-                }
-                if response.clicked() {
-                    self.page = page;
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(
-                        egui::Button::image(
-                            Icon::Gear.image(23.0, if self.page == 2 { ACCENT } else { MUTED }),
-                        )
-                        .frame(false),
-                    )
-                    .on_hover_text("Settings")
-                    .clicked()
-                {
-                    self.page = 2;
-                }
-            });
+                .stroke(egui::Stroke::NONE)
+                .corner_radius(9),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), active, label)
         });
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new(("navigation_response", page)), response.id)
+        });
+        icon.image(20.0, tint).paint_at(
+            ui,
+            egui::Rect::from_center_size(
+                egui::pos2(response.rect.left() + 24.0, response.rect.center().y),
+                egui::vec2(20.0, 20.0),
+            ),
+        );
+        ui.painter().text(
+            egui::pos2(response.rect.left() + 44.0, response.rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(15.0),
+            if active { INK } else { MUTED },
+        );
+        if active {
+            ui.painter().rect_filled(
+                egui::Rect::from_center_size(
+                    egui::pos2(response.rect.left() + 2.0, response.rect.center().y),
+                    egui::vec2(3.0, 20.0),
+                ),
+                2,
+                ACCENT,
+            );
+        }
+        if response.clicked() {
+            self.page = page;
+        }
     }
 
     fn dictation_surface(&mut self, ui: &mut egui::Ui) {
         let idle = self.recording.is_none() && !self.busy && !self.loading && self.call.is_none();
-        let compact = ui.available_height() < 580.0;
+        let compact = ui.available_width() < 780.0;
         let bounds = ui.available_rect_before_wrap();
         egui::ScrollArea::vertical()
             .id_salt("dictation_page")
             .max_height((bounds.height() - 64.0).max(200.0))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.spacing_mut().item_spacing.y = if compact { 4.0 } else { 7.0 };
-                    ui.label(RichText::new("Speak naturally.").size(if compact {
-                        28.0
-                    } else {
-                        38.0
-                    }));
-                    ui.label(
-                        RichText::new("Articulate takes care of the rest.")
-                            .size(18.0)
-                            .color(MUTED),
-                    );
-                    ui.add_space(if compact { 8.0 } else { 10.0 });
-                    if compact {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(430.0, 84.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| self.recording_hero(ui, true),
-                        );
-                    } else {
-                        self.recording_hero(ui, false);
-                    }
+                theme::page_title(ui, "Dictate");
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    self.recording_hero(ui, true);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Open history").clicked() {
+                            self.page = 5;
+                        }
+                    });
                 });
-                ui.add_space(if compact { 12.0 } else { 24.0 });
+                ui.add_space(18.0);
                 egui::Frame::new()
                     .fill(Color32::from_rgba_unmultiplied(20, 29, 31, 170))
                     .stroke(egui::Stroke::new(1.0_f32, LINE))
@@ -246,18 +214,23 @@ impl App {
                             if self.busy || self.loading {
                                 ui.spinner();
                             }
+                            if idle && !self.preview_inflight && !self.text.is_empty() {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        self.assort_correction_button(ui);
+                                    },
+                                );
+                            }
                         });
                         if self.text.is_empty() && !recording && !self.busy && !self.loading {
                             ui.label(
                                 RichText::new(if self.settings.insert {
-                                    format!(
-                                        "Click a text field in another app, then press {}.",
-                                        self.settings.hotkey.label()
-                                    )
+                                    format!("Focus a text field. {}.", self.shortcut_instruction())
                                 } else {
                                     format!(
-                                        "Speak, review, then copy. Press {} to start.",
-                                        self.settings.hotkey.label()
+                                        "Speak, review, then copy. {}.",
+                                        self.shortcut_instruction()
                                     )
                                 })
                                 .size(14.0)
@@ -301,14 +274,15 @@ impl App {
                             };
                         egui::ScrollArea::vertical()
                             .id_salt("transcript_body")
-                            .max_height(if compact { 165.0 } else { 250.0 })
+                            .min_scrolled_height(180.0)
+                            .max_height((bounds.height() - 278.0).max(180.0))
                             .auto_shrink([false, true])
                             .stick_to_bottom(recording)
                             .show(ui, |ui| {
                                 let edit = ui.add(
                                     egui::TextEdit::multiline(&mut self.text)
                                         .desired_width(f32::INFINITY)
-                                        .desired_rows(2)
+                                        .desired_rows(5)
                                         .font(egui::FontId::proportional(size))
                                         .frame(false)
                                         .interactive(idle)
@@ -430,6 +404,7 @@ impl App {
             bounds.max,
         );
         ui.scope_builder(egui::UiBuilder::new().max_rect(footer), |ui| {
+            let hold = self.settings.hotkey_mode == platform::HotkeyMode::Hold;
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.separator();
             ui.horizontal(|ui| {
@@ -437,18 +412,33 @@ impl App {
                     egui::vec2(ui.available_width() * 0.70, 40.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        ui.label("Ready to type into your current app");
+                        ui.label(if !self.settings.insert {
+                            "Review and copy your words"
+                        } else if hold {
+                            "Insert into your app when you finish"
+                        } else {
+                            "Ready to type into your current app"
+                        });
                         ui.label(
-                            RichText::new(format!(
-                                "Focus a text field, then press {}.",
-                                self.settings.hotkey.label()
-                            ))
-                            .small()
-                            .color(MUTED),
+                            RichText::new(format!("{}.", self.shortcut_instruction()))
+                                .small()
+                                .color(MUTED),
                         );
                     },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if hold {
+                        if ui
+                            .add_enabled(
+                                idle,
+                                egui::Checkbox::new(&mut self.settings.insert, "Insert into app"),
+                            )
+                            .changed()
+                        {
+                            self.save();
+                        }
+                        return;
+                    }
                     let mut live = self.settings.insert && self.settings.live_insert;
                     if ui
                         .add_enabled(idle, egui::Checkbox::new(&mut live, "Live insertion"))
@@ -480,7 +470,7 @@ impl App {
                 .clamp(0.0, 1.0);
             self.meter_at = Instant::now();
         }
-        let diameter = if compact { 64.0 } else { 110.0 };
+        let diameter = if compact { 36.0 } else { 110.0 };
         let (orb, response) = ui.allocate_exact_size(
             egui::vec2(diameter + 20.0, diameter + 20.0),
             egui::Sense::click(),
@@ -506,10 +496,16 @@ impl App {
         // Layered native geometry keeps the microphone glow sharp at every DPI.
         ui.painter().circle_filled(center, radius - 2.0, SURFACE);
         Icon::Mic
-            .image(if compact { 28.0 } else { 38.0 }, INK)
+            .image(if compact { 22.0 } else { 38.0 }, INK)
             .paint_at(
                 ui,
-                egui::Rect::from_center_size(center, egui::vec2(42.0, 42.0)),
+                egui::Rect::from_center_size(
+                    center,
+                    egui::vec2(
+                        if compact { 26.0 } else { 42.0 },
+                        if compact { 26.0 } else { 42.0 },
+                    ),
+                ),
             );
         if response.clicked() && enabled {
             self.toggle(None);
@@ -541,11 +537,14 @@ impl App {
             self.cancel.cancel();
         }
         if compact {
-            ui.label(
+            let binding = ui.label(
                 RichText::new(self.settings.hotkey.label())
                     .small()
                     .color(MUTED),
             );
+            if self.settings.hotkey_mode == platform::HotkeyMode::Hold {
+                binding.on_hover_text("Hold to speak. Double-press for hands-free dictation, then press once to finish.");
+            }
         } else {
             ui.allocate_ui_with_layout(
                 egui::vec2(190.0, 32.0),

@@ -1,18 +1,18 @@
 # Get started
 
 1. Download the Windows x86_64 installer from [Releases](https://github.com/Obiente/articulate/releases/latest), or extract the entire portable ZIP.
-2. Open Settings and download the recommended speech model. Initial model downloads require internet. No weights are bundled.
+2. Open Settings and download the recommended speech model. Initial speech-model downloads require internet. The small Assort notes and vocabulary models are already included.
 3. Choose your microphone. If GPU loading fails, select CPU only and load again.
-4. Start dictation, speak, then finish. Ctrl+Alt+Space does the same from another app.
-5. To type into another app, enable Type live and focus its editable field before using the shortcut. Moving the caret or changing fields pauses live typing while transcription continues in Articulate.
+4. Hold Ctrl+Alt+Space while speaking and release to finish. Double-press for hands-free dictation, then press once to finish. Settings lets you change the keys, choose press-to-toggle mode, or turn recording sounds off.
+5. To type into another app, enable app insertion and focus its editable field before using the shortcut. Hold mode inserts after finishing, so held modifiers cannot interfere with typing. Toggle mode can update supported fields live. Moving the caret or changing fields pauses insertion while your transcript remains in Articulate.
 
 ## Calls
 
-Use headphones. In Calls > Setup, select your microphone and the output device used by your call. Download the speaker model and start capture. The output track includes every app playing on that device. It is not one track per participant.
+Use headphones. In Calls > Setup, select your microphone. With the Vencord companion selected, wait for its separate-audio connection before starting. Each received participant stream carries its own identity, including when people speak at the same time. The native adapter remains experimental; live behavior still needs validation on supported Discord builds. If the audio connection is unavailable, Articulate asks you to connect it instead of silently switching to mixed capture.
 
 The trailing transcript revises as more context arrives. Finish capture to process remaining audio. Notes contains quoted highlights and possible actions. History lets you revisit saved sessions.
 
-For Discord names, use the [Vencord companion](vencord.md) or the optional [debugger connection](discord-integration.md). These provide activity-based names; they do not separate audio. Relaunching Discord disconnects an active voice call, so rejoin afterward.
+For other calls, use mixed output capture and choose the output device used by your call. Download the speaker model when activity-based names are unavailable. This output includes every app playing on that device and cannot reliably separate simultaneous voices. The optional [debugger connection](discord-integration.md) provides activity-based names only. See the [Vencord companion setup](vencord.md) for separate Discord audio. Relaunching Discord disconnects an active voice call, so rejoin afterward.
 
 ## Corrections and shortcuts
 
@@ -22,6 +22,6 @@ In Shortcuts, save a trigger such as `signature` and a text expansion. Say “ba
 
 ## Updates and removal
 
-Settings > App updates checks GitHub only when requested. Finish recording before installing. Pending history saves must complete before the installer opens. Retry failed saves before updating.
+Settings > Updates & about checks GitHub only when requested. Finish recording before installing. Pending history saves must complete before the installer opens. Retry failed saves before updating.
 
 Updates preserve models, vocabulary, settings and History. Uninstall removes the application but keeps `%LOCALAPPDATA%\TranscribeLocal`. Remove that folder separately only if you intend to delete all local Articulate data.

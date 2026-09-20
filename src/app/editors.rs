@@ -6,6 +6,7 @@ pub(super) struct CorrectionEditor {
     app: String,
     cues: String,
     ignore_case: bool,
+    contexts: Vec<(String, bool)>,
     original: Option<Entry>,
     search: String,
     sample: String,
@@ -30,16 +31,32 @@ fn hint(ui: &mut egui::Ui, text: &str) {
     );
 }
 
+fn context_description(cues: &[String], ignore_case: bool) -> String {
+    let context = if cues.is_empty() {
+        "Any context".to_owned()
+    } else {
+        format!("Near {}", cues.join(", "))
+    };
+    format!(
+        "{context} · {}",
+        if ignore_case {
+            "Any capitalization"
+        } else {
+            "Exact capitalization"
+        }
+    )
+}
+
 fn editor_spacing(ui: &mut egui::Ui) {
-    ui.spacing_mut().item_spacing = egui::vec2(18.0, 8.0);
-    ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
+    ui.spacing_mut().item_spacing = egui::vec2(12.0, 8.0);
+    ui.spacing_mut().button_padding = egui::vec2(12.0, 8.0);
 }
 
 fn editor_surface() -> egui::Frame {
     egui::Frame::new()
         .fill(Color32::from_rgb(22, 30, 32))
-        .corner_radius(20.0)
-        .inner_margin(24.0)
+        .corner_radius(12.0)
+        .inner_margin(18.0)
 }
 
 fn field(value: &mut String) -> egui::TextEdit<'_> {
@@ -62,7 +79,7 @@ fn table_cell(ui: &mut egui::Ui, width: f32, text: RichText) {
 fn primary(label: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(label).color(Color32::from_rgb(13, 34, 30)))
         .fill(ACCENT)
-        .corner_radius(18.0)
+        .corner_radius(9.0)
         .min_size(egui::vec2(150.0, 40.0))
 }
 
@@ -101,7 +118,7 @@ impl App {
                 };
             }
             ui.add(egui::TextEdit::multiline(&mut self.library_input).desired_width(f32::INFINITY).desired_rows(3).margin(egui::vec2(12.0, 10.0)).hint_text("Paste your saved library here").char_limit(1_000_000));
-            hint(ui, "Import keeps your other entries and updates entries with the same trigger and scope.");
+            hint(ui, "Import keeps other spellings and combines matching vocabulary contexts. Shortcuts with the same trigger and app are updated.");
             if ui.add_enabled(!self.library_input.trim().is_empty(), primary("Import library")).clicked() {
                 match crate::library::parse(&self.library_input) {
                     Ok(library) => {
@@ -149,11 +166,7 @@ impl App {
                 match self.correction_draft() {
                     Ok(entry) => {
                         let original = self.correction_editor.original.take();
-                        self.settings.entries.retain(|e| {
-                            !e.same_key(&entry)
-                                && !original.as_ref().is_some_and(|old| old.same_key(e))
-                        });
-                        self.settings.entries.push(entry);
+                        dictionary::save(&mut self.settings.entries, entry, original.as_ref());
                         self.heard.clear();
                         self.wanted.clear();
                         self.correction_editor = CorrectionEditor::default();
@@ -176,21 +189,21 @@ impl App {
         editor_spacing(ui);
         let mut reveal_editor = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Your vocabulary").size(36.0));
+            theme::page_title(ui, "Vocabulary");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(primary("Add word")).clicked() {
                     reveal_editor = true;
                     self.correction_editor.open = true;
                     self.correction_editor.original = None;
+                    self.correction_editor.contexts.clear();
+                    self.correction_editor.cues.clear();
+                    self.correction_editor.ignore_case = false;
                     self.heard.clear();
                     self.wanted.clear();
                 }
             });
         });
-        hint(
-            ui,
-            "Names, phrases, and the words you use every day. Corrections learned in an app stay with that app.",
-        );
+        hint(ui, "Saved spellings for names and everyday words.");
         ui.add_space(12.0);
         ui.add(field(&mut self.correction_editor.search).hint_text("Find a word or correction"));
         ui.label(
@@ -198,23 +211,9 @@ impl App {
         );
         ui.spacing_mut().item_spacing.y = 6.0;
         self.learning_notice(ui);
-        ui.horizontal(|ui| {
-            let width = ui.available_width() - 8.0;
-            ui.add_space(32.0);
-            table_cell(
-                ui,
-                width * 0.25,
-                RichText::new("When you say").small().color(theme::MUTED),
-            );
-            table_cell(
-                ui,
-                width * 0.25,
-                RichText::new("Write instead").small().color(theme::MUTED),
-            );
-            ui.label(RichText::new("Where").small().color(theme::MUTED));
-        });
         let query = self.correction_editor.search.to_lowercase();
         let mut visible_entries = 0;
+        let mut list_shown = false;
         let mut edit = None;
         let mut remove = None;
         let mut changed = false;
@@ -225,71 +224,117 @@ impl App {
         } else {
             f32::INFINITY
         };
-        egui::ScrollArea::vertical()
-            .id_salt("vocabulary_entries")
-            .max_height(list_height)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for (i, entry) in self.settings.entries.iter_mut().enumerate() {
-                    if !format!(
-                        "{} {} {} {}",
-                        entry.heard,
-                        entry.wanted,
-                        entry.app.as_deref().unwrap_or("all apps"),
-                        entry.cues.join(" ")
-                    )
-                    .to_lowercase()
-                    .contains(&query)
-                    {
-                        continue;
-                    }
-                    visible_entries += 1;
-                    ui.push_id(i, |ui| {
-                        ui.separator();
-                        egui::Frame::new()
-                            .inner_margin(egui::Margin::symmetric(4, 6))
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                let width = ui.available_width();
-                                ui.horizontal(|ui| {
-                                    changed |= ui
-                                        .checkbox(&mut entry.enabled, "")
-                                        .on_hover_text("Use this spelling")
-                                        .changed();
-                                    table_cell(ui, width * 0.25, RichText::new(&entry.heard));
-                                    table_cell(
-                                        ui,
-                                        width * 0.25,
-                                        RichText::new(&entry.wanted).color(ACCENT),
-                                    );
-                                    ui.add_sized(
-                                        [(width * 0.18).max(80.0), 30.0],
-                                        egui::Label::new(
-                                            RichText::new(
-                                                entry.app.as_deref().unwrap_or("All apps"),
+        let mut entries = |ui: &mut egui::Ui| {
+            list_shown = true;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let width = ui.available_width() - 8.0;
+                ui.add_space(32.0);
+                table_cell(
+                    ui,
+                    ((width - 280.0) * 0.5).max(80.0),
+                    RichText::new("When you say").small().color(theme::MUTED),
+                );
+                table_cell(
+                    ui,
+                    ((width - 280.0) * 0.5).max(80.0),
+                    RichText::new("Write instead").small().color(theme::MUTED),
+                );
+                ui.label(RichText::new("Where").small().color(theme::MUTED));
+            });
+            egui::ScrollArea::vertical()
+                .id_salt("vocabulary_entries")
+                .max_height(list_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, entry) in self.settings.entries.iter_mut().enumerate() {
+                        if !format!(
+                            "{} {} {} {}",
+                            entry.heard,
+                            entry.wanted,
+                            entry.app.as_deref().unwrap_or("all apps"),
+                            entry.all_cues().join(" ")
+                        )
+                        .to_lowercase()
+                        .contains(&query)
+                        {
+                            continue;
+                        }
+                        visible_entries += 1;
+                        ui.push_id(i, |ui| {
+                            ui.separator();
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::symmetric(4, 6))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    let width = ui.available_width();
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        changed |= ui
+                                            .checkbox(&mut entry.enabled, "")
+                                            .on_hover_text("Use this spelling")
+                                            .changed();
+                                        table_cell(
+                                            ui,
+                                            ((width - 280.0) * 0.5).max(80.0),
+                                            RichText::new(&entry.heard),
+                                        );
+                                        table_cell(
+                                            ui,
+                                            ((width - 280.0) * 0.5).max(80.0),
+                                            RichText::new(&entry.wanted).color(ACCENT),
+                                        );
+                                        ui.add_sized(
+                                            [90.0, 30.0],
+                                            egui::Label::new(
+                                                RichText::new(
+                                                    entry.app.as_deref().unwrap_or("All apps"),
+                                                )
+                                                .small()
+                                                .color(theme::MUTED),
                                             )
-                                            .small()
-                                            .color(theme::MUTED),
-                                        )
-                                        .truncate(),
-                                    );
-                                    if ui.small_button("Edit").clicked() {
-                                        edit = Some(entry.clone());
-                                    }
-                                    ui.menu_button("More", |ui| {
-                                        if ui.button("Remove correction").clicked() {
-                                            remove = Some(i);
-                                            ui.close();
+                                            .truncate(),
+                                        );
+                                        if ui.small_button("Edit").clicked() {
+                                            edit = Some(entry.clone());
                                         }
-                                        if !entry.cues.is_empty() {
-                                            hint(ui, &format!("Near {}", entry.cues.join(", ")));
-                                        }
+                                        ui.menu_button("…", |ui| {
+                                            if ui.button("Remove correction").clicked() {
+                                                remove = Some(i);
+                                                ui.close();
+                                            }
+                                            hint(
+                                                ui,
+                                                &context_description(
+                                                    &entry.cues,
+                                                    entry.ignore_case,
+                                                ),
+                                            );
+                                            if entry.has_alternative_contexts() { hint(ui, "Use this spelling in any matching context below."); }
+                                            for context in &entry.contexts {
+                                                hint(
+                                                    ui,
+                                                    &format!(
+                                                        "Or {}",
+                                                        context_description(
+                                                            &context.cues,
+                                                            context.ignore_case
+                                                        )
+                                                    ),
+                                                );
+                                            }
+                                        });
                                     });
                                 });
-                            });
-                    });
-                }
-            });
+                        });
+                    }
+                });
+        };
+        if editing && ui.available_width() < 700.0 {
+            ui.collapsing("Your vocabulary", entries);
+        } else {
+            entries(ui);
+        }
         if let Some(entry) = edit {
             reveal_editor = true;
             self.heard = entry.heard.clone();
@@ -297,6 +342,11 @@ impl App {
             self.correction_editor.app = entry.app.clone().unwrap_or_default();
             self.correction_editor.cues = entry.cues.join(", ");
             self.correction_editor.ignore_case = entry.ignore_case;
+            self.correction_editor.contexts = entry
+                .contexts
+                .iter()
+                .map(|context| (context.cues.join(", "), context.ignore_case))
+                .collect();
             self.correction_editor.original = Some(entry);
             self.correction_editor.message.clear();
             self.correction_editor.open = true;
@@ -313,7 +363,7 @@ impl App {
                 ui,
                 "Your vocabulary starts with a correction. Edit a name after dictating, or add a spelling above.",
             );
-        } else if visible_entries == 0 {
+        } else if list_shown && visible_entries == 0 {
             ui.add_space(18.0);
             hint(ui, "No matches. Try another word, phrase, or app.");
         }
@@ -324,17 +374,45 @@ impl App {
             ui.strong(if self.correction_editor.original.is_some() { "Edit vocabulary" } else { "Add to your vocabulary" });
             ui.columns(2, |cols| {
                 cols[0].label("When you say");
-                cols[0].add(field(&mut self.heard).hint_text("at ExampleHandle"));
+                let width = (cols[0].available_width()-24.0).max(80.0);
+                cols[0].add(field(&mut self.heard).desired_width(width).hint_text("at ExampleHandle"));
                 cols[1].label("Write it as");
-                cols[1].add(field(&mut self.wanted).hint_text("@ExampleHandle"));
+                let width = (cols[1].available_width()-24.0).max(80.0);
+                cols[1].add(field(&mut self.wanted).desired_width(width).hint_text("@ExampleHandle"));
             });
             scope_field(ui, &mut self.correction_editor.app, self.dictation_app.as_deref());
-            ui.collapsing("Context and matching", |ui| {
+            let context_header = egui::CollapsingHeader::new("Context and matching");
+            #[cfg(test)]
+            let context_header = context_header.default_open(std::env::var_os("ARTICULATE_UI_CONTEXTS").is_some());
+            let context_response = context_header.show(ui, |ui| {
             ui.label("Context words · optional");
             ui.add(field(&mut self.correction_editor.cues).hint_text("crate, function, compiler"));
             hint(ui, "Use this spelling near any of these words in the same sentence. Leave empty for every context.");
             ui.checkbox(&mut self.correction_editor.ignore_case, "Match any capitalization");
+            let mut remove_context = None;
+            for (index, (cues, ignore_case)) in self.correction_editor.contexts.iter_mut().enumerate() {
+                ui.push_id(index, |ui| {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Or in this context");
+                        if ui.small_button("Remove").clicked() { remove_context = Some(index); }
+                    });
+                    ui.add(field(cues).hint_text("Context words, separated by commas"));
+                    hint(ui, "Leave empty to match in any context.");
+                    ui.checkbox(ignore_case, "Match any capitalization");
+                });
+            }
+            if let Some(index) = remove_context { self.correction_editor.contexts.remove(index); }
+            if ui.add_enabled(self.correction_editor.contexts.len() < 32, egui::Button::new("Add another context").small()).clicked() {
+                self.correction_editor.contexts.push((String::new(), false));
+            }
             });
+            #[cfg(test)]
+            if std::env::var_os("ARTICULATE_UI_CONTEXTS").is_some() {
+                ui.scroll_to_rect(context_response.header_response.rect, Some(egui::Align::Min));
+            }
+            #[cfg(not(test))]
+            let _ = context_response;
             ui.collapsing("Try this correction", |ui| {
                 ui.add(egui::TextEdit::multiline(&mut self.correction_editor.sample).margin(egui::vec2(12.0, 10.0)).desired_rows(2).desired_width(f32::INFINITY).hint_text("Type an example sentence"));
                 if !self.correction_editor.sample.is_empty() {
@@ -361,6 +439,17 @@ impl App {
         entry.app = dictionary::app_scope(&self.correction_editor.app)?;
         entry.cues = dictionary::cue_words(&self.correction_editor.cues)?;
         entry.ignore_case = self.correction_editor.ignore_case;
+        entry.contexts = self
+            .correction_editor
+            .contexts
+            .iter()
+            .map(|(cues, ignore_case)| {
+                Ok(dictionary::Context {
+                    cues: dictionary::cue_words(cues)?,
+                    ignore_case: *ignore_case,
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
         entry.enabled = self
             .correction_editor
             .original
@@ -372,7 +461,7 @@ impl App {
     pub(super) fn macros_ui(&mut self, ui: &mut egui::Ui) {
         editor_spacing(ui);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Voice shortcuts").size(36.0));
+            theme::page_title(ui, "Shortcuts");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add(primary("New shortcut")).clicked() {
                     self.macro_editor = MacroEditor::default();
@@ -710,6 +799,42 @@ impl App {
             self.wanted = "check-in".into();
             self.correction_editor.open = true;
             self.correction_editor.original = Some(self.settings.entries[2].clone());
+            if std::env::var_os("ARTICULATE_UI_CONTEXTS").is_some() {
+                self.correction_editor.cues = "meeting, project".into();
+                self.correction_editor.contexts = vec![("calendar, tomorrow".into(), true)];
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn editing_preserves_and_can_remove_alternative_contexts() {
+        let (mut app, _) = super::super::tests::app();
+        let mut original = dictionary::validate("rust", "Rust").unwrap();
+        original.cues = vec!["compiler".into()];
+        original.contexts.push(dictionary::Context {
+            cues: vec!["crate".into()],
+            ignore_case: true,
+        });
+        app.heard = original.heard.clone();
+        app.wanted = original.wanted.clone();
+        app.correction_editor.cues = "compiler".into();
+        app.correction_editor.contexts = vec![("crate".into(), true)];
+        app.correction_editor.original = Some(original.clone());
+        assert!(app.correction_draft().unwrap() == original);
+        app.correction_editor.contexts.clear();
+        let mut entries = vec![original.clone()];
+        dictionary::save(
+            &mut entries,
+            app.correction_draft().unwrap(),
+            Some(&original),
+        );
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].contexts.is_empty());
+        assert_eq!(entries[0].cues, ["compiler"]);
     }
 }

@@ -15,7 +15,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.label("Keyboard shortcut");
                 ui.label(
-                    RichText::new("Start or finish dictation from any app.")
+                    RichText::new(self.shortcut_instruction())
                         .small()
                         .color(theme::MUTED),
                 );
@@ -24,6 +24,28 @@ impl App {
                 theme::keycap(ui, &self.settings.hotkey.label());
             });
         });
+        let previous_mode = self.settings.hotkey_mode;
+        ui.add_enabled_ui(idle && !self.hotkey_pending, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.settings.hotkey_mode, platform::HotkeyMode::Hold, "Hold to talk");
+                ui.selectable_value(&mut self.settings.hotkey_mode, platform::HotkeyMode::Toggle, "Press to toggle");
+            });
+            if self.settings.hotkey_mode == platform::HotkeyMode::Hold {
+                ui.small("Hold to speak and release to finish. Double-press for hands-free dictation, then press once to finish. Text is inserted after finishing when app insertion is enabled.");
+            }
+        });
+        if previous_mode != self.settings.hotkey_mode {
+            self.save();
+        }
+        if ui
+            .checkbox(
+                &mut self.settings.audio_feedback,
+                "Play sounds when recording starts and stops",
+            )
+            .changed()
+        {
+            self.save();
+        }
         ui.collapsing("Change keyboard shortcut", |ui| {
             ui.add_enabled_ui(idle && !self.hotkey_pending, |ui| {
                 ui.horizontal_wrapped(|ui| {

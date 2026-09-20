@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs::File,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -18,6 +18,7 @@ use std::{
 };
 
 pub mod builtin;
+pub(crate) mod passages;
 
 pub fn verify_builtin_models() -> Result<()> {
     builtin::verify_embedded()
@@ -637,11 +638,12 @@ fn classify_in_process(package: &InstalledPackage, transcript: &Transcript) -> R
         65536,
         &AtomicBool::new(false),
     )?)?;
+    let passages = passages::prepare(transcript, &tokenizer, &limits)?;
     let engine = assort_inference::Engine::new(model, tokenizer, limits)?;
     let input: assort_transcript::Transcript =
-        serde_json::from_slice(&serde_json::to_vec(transcript)?)?;
+        serde_json::from_slice(&serde_json::to_vec(&passages)?)?;
     let scores = assort_transcript::score_transcript(&engine, &input)?;
-    let summary = assort_transcript::select_summary(
+    let mut summary = assort_transcript::select_summary(
         &input,
         &scores,
         &assort_transcript::SummaryOptions {
@@ -651,6 +653,7 @@ fn classify_in_process(package: &InstalledPackage, transcript: &Transcript) -> R
             ..Default::default()
         },
     )?;
+    summary.source_segments = transcript.segments.len();
     let output = serde_json::to_vec(&summary)?;
     validate_output(transcript, &output)?;
     Ok(output)
@@ -799,21 +802,16 @@ fn validate_output(input: &Transcript, bytes: &[u8]) -> Result<Summary> {
         summary.highlights.len() <= MAX_HIGHLIGHTS,
         "The summary exceeded its highlight budget."
     );
-    let lookup: HashMap<_, _> = input
-        .segments
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (&s.id, (i, s)))
-        .collect();
     let mut selected = HashSet::new();
-    let mut previous = 0;
+    let mut previous = None;
     let mut words = 0;
     for highlight in &summary.highlights {
-        let (index, source) = lookup
-            .get(&highlight.source.id)
-            .context("The summary references an unknown passage.")?;
+        let source = &highlight.source;
+        let (index, range) = passages::locate(input, source)?;
         ensure!(
-            *source == &highlight.source && selected.insert(&source.id) && *index >= previous,
+            selected.insert(&source.id)
+                && previous
+                    .is_none_or(|(row, end)| index > row || (index == row && range.start >= end)),
             "The summary changed, duplicated or reordered a source passage."
         );
         ensure!(
@@ -822,7 +820,7 @@ fn validate_output(input: &Transcript, bytes: &[u8]) -> Result<Summary> {
                 && (MIN_IMPORTANCE..=1.0).contains(&highlight.importance),
             "The summary contains an unsupported classification."
         );
-        previous = *index;
+        previous = Some((index, range.end));
         words += source.text.split_whitespace().count();
     }
     ensure!(
@@ -964,6 +962,33 @@ mod tests {
         }
     }
     #[test]
+    fn excerpt_results_preserve_parent_ranges_and_reject_overlap() {
+        let mut input = transcript();
+        input.segments[0].text = "We agreed. I will send the notes.".into();
+        let prepared = passages::prepare(
+            &input,
+            &assort_tokenizer::ByteTokenizer,
+            &assort_transcript::transcript_limits(1),
+        )
+        .unwrap();
+        let highlights: Vec<_> = prepared
+            .segments
+            .iter()
+            .map(|source| serde_json::json!({"kind":"action", "importance":0.9, "source":source}))
+            .collect();
+        let mut summary = serde_json::json!({
+            "transcript_id":input.id,"title":input.title,"goal":input.goal,
+            "source_segments":1,"word_count":7,"highlights":highlights
+        });
+        assert!(validate_output(&input, &serde_json::to_vec(&summary).unwrap()).is_ok());
+        summary["highlights"][1]["source"] = serde_json::to_value(&input.segments[0]).unwrap();
+        summary["word_count"] = serde_json::json!(10);
+        assert!(validate_output(&input, &serde_json::to_vec(&summary).unwrap()).is_err());
+        summary["highlights"][1]["source"]["text"] =
+            serde_json::json!("I will not send the notes.");
+        assert!(validate_output(&input, &serde_json::to_vec(&summary).unwrap()).is_err());
+    }
+    #[test]
     fn rejects_wrong_session_duplicate_and_invalid_labels() {
         let input = transcript();
         for field in ["transcript_id", "goal", "title"] {
@@ -1083,6 +1108,18 @@ mod tests {
         let input = transcript();
         let bytes = classify_in_process(&package, &input).unwrap();
         validate_output(&input, &bytes).unwrap();
+        // A grouped speaker turn can be much longer than the question window.
+        // Exercise real tokenization and inference without truncating the turn.
+        let mut long = input;
+        long.segments[0].text =
+            "The installer is ready. I will send the report tomorrow. ".repeat(40);
+        let bytes = classify_in_process(&package, &long).unwrap();
+        let result = validate_output(&long, &bytes).unwrap();
+        assert_eq!(result.source_segments, 1);
+        for highlight in result.highlights {
+            passages::locate(&long, &highlight.source).unwrap();
+            assert!(highlight.source.text.len() < long.segments[0].text.len());
+        }
     }
 
     #[test]

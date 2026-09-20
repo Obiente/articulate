@@ -400,6 +400,28 @@ mod tests {
         assert_eq!(rows[0].discord.as_ref().unwrap().speakers[0].id, "Casey");
         assert_eq!(rows[1].discord.as_ref().unwrap().speakers[0].id, "Jordan");
         assert_eq!((rows[0].start_ms, rows[1].start_ms), (0, 0));
+        let mut transcript = Vec::new();
+        super::super::append_rows(&mut transcript, rows);
+        assert_eq!(transcript.len(), 2);
+        let names = Default::default();
+        assert_eq!(super::super::label(&transcript[0], &names), "Casey");
+        assert_eq!(super::super::label(&transcript[1], &names), "Jordan");
+    }
+
+    #[test]
+    fn native_frames_never_accept_an_overlap_or_missing_participant_identity() {
+        let origin = Instant::now();
+        let mut window = Window::default();
+        let mut input = frame(origin, "Casey", 1.0, 16000, 8192);
+        input
+            .attribution
+            .speakers
+            .push(input.attribution.speakers[0].clone());
+        assert!(window.ingest(input, origin).is_err());
+        let mut input = frame(origin, "Casey", 1.0, 16000, 8192);
+        input.attribution.speakers.clear();
+        assert!(window.ingest(input, origin).is_err());
+        assert!(window.voices.is_empty());
     }
     #[test]
     fn packet_boundary_preserves_every_sample_without_duplication() {
