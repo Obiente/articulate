@@ -13,6 +13,30 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $stage = Join-Path $articulateRoot ".local/package-stage/$stamp/Articulate-$version-windows-x86_64"
 New-Item -ItemType Directory -Force $dist,$stage | Out-Null
 
+# Acquire build tooling before the lengthy Rust build. SourceForge can return
+# an HTML mirror page to PowerShell's web client; curl follows its download flow.
+if (!$Makensis) {
+    $tools = Join-Path $articulateRoot '.local/tools'
+    $nsisArchive = Join-Path $tools 'nsis-3.11.zip'
+    $nsisHash = 'c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1'
+    New-Item -ItemType Directory -Force $tools | Out-Null
+    $validArchive = (Test-Path -LiteralPath $nsisArchive) -and ((Get-FileHash -LiteralPath $nsisArchive -Algorithm SHA256).Hash.ToLowerInvariant() -eq $nsisHash)
+    if (!$validArchive) {
+        $nsisPart = Join-Path $tools ('nsis-' + [guid]::NewGuid().ToString('N') + '.part')
+        try {
+            & curl.exe --fail --location --silent --show-error --retry 3 --max-time 180 --output $nsisPart 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip'
+            if ($LASTEXITCODE -ne 0) { throw 'NSIS archive download failed.' }
+            if ((Get-FileHash -LiteralPath $nsisPart -Algorithm SHA256).Hash.ToLowerInvariant() -ne $nsisHash) { throw 'NSIS archive SHA-256 mismatch.' }
+            Move-Item -LiteralPath $nsisPart -Destination $nsisArchive -Force
+        } finally {
+            if (Test-Path -LiteralPath $nsisPart) { Remove-Item -LiteralPath $nsisPart }
+        }
+    }
+    Expand-Archive -LiteralPath $nsisArchive -DestinationPath $tools -Force
+    $Makensis = Join-Path $tools 'nsis-3.11/makensis.exe'
+}
+if (!(Test-Path -LiteralPath $Makensis)) { throw 'Install NSIS 3.11 or pass -Makensis.' }
+
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (!$vs) { throw 'Visual Studio C++ Build Tools are required to package.' }
@@ -79,18 +103,6 @@ try {
     }
     $manifest = @(Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object { [ordered]@{ path=$_.FullName.Substring($stage.Length+1).Replace('\','/'); sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); bytes=$_.Length } })
     [ordered]@{ product='Articulate'; version=$version; platform='windows-x86_64'; files=$manifest } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stage 'manifest.json') -Encoding utf8
-    if (!$Makensis) {
-        $tools = Join-Path $articulateRoot '.local/tools'
-        $nsisArchive = Join-Path $tools 'nsis-3.11.zip'
-        New-Item -ItemType Directory -Force $tools | Out-Null
-        if (!(Test-Path -LiteralPath $nsisArchive)) {
-            Invoke-WebRequest -Uri 'https://downloads.sourceforge.net/project/nsis/NSIS%203/3.11/nsis-3.11.zip' -OutFile $nsisArchive -TimeoutSec 180
-        }
-        if ((Get-FileHash -LiteralPath $nsisArchive -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1') { throw 'NSIS archive SHA-256 mismatch.' }
-        Expand-Archive -LiteralPath $nsisArchive -DestinationPath $tools -Force
-        $Makensis = Join-Path $tools 'nsis-3.11/makensis.exe'
-    }
-    if (!(Test-Path -LiteralPath $Makensis)) { throw 'Install NSIS 3.11 or pass -Makensis.' }
     $remove = Join-Path $articulateRoot ".local/package-stage/$stamp/remove-files.nsh"
     $lines = @(Get-ChildItem -LiteralPath $stage -Recurse -File | ForEach-Object { 'Delete "$INSTDIR\' + $_.FullName.Substring($stage.Length+1).Replace('$','$$') + '"' })
     $lines += @(Get-ChildItem -LiteralPath $stage -Recurse -Directory | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object { 'RMDir "$INSTDIR\' + $_.FullName.Substring($stage.Length+1).Replace('$','$$') + '"' })
