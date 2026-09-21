@@ -17,10 +17,6 @@ try {
     }
     & npm.cmd --prefix ui ci --no-audit --no-fund
     if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency installation failed. Close the Vite preview server if Windows reports a file in use, then retry.' }
-    if ($Test) {
-        & npm.cmd --prefix ui test
-        if ($LASTEXITCODE -ne 0) { throw 'Frontend tests failed' }
-    }
     if ($Check) {
         & npm.cmd --prefix ui run format:check
         if ($LASTEXITCODE -ne 0) { throw 'Frontend formatting failed' }
@@ -28,6 +24,10 @@ try {
     & npm.cmd --prefix ui run build
     if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
     if (!(Test-Path -LiteralPath (Join-Path $root 'ui/dist/client/index.html'))) { throw 'Frontend output is missing' }
+    if ($Test) {
+        & npm.cmd --prefix ui test
+        if ($LASTEXITCODE -ne 0) { throw 'Frontend tests failed' }
+    }
 
     # This pinned upstream bundle includes portable CPU dispatch and Vulkan.
     # Rust still uses the matching published 0.2.3 bindings and checks the ABI.
