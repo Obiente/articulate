@@ -220,6 +220,38 @@ pub struct App {
     last_seconds: u64,
 }
 
+fn save_settings(directory: &std::path::Path, settings: &Settings) -> anyhow::Result<()> {
+    use std::io::Write;
+    static SAVES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // Serialize replacement within this process. Separate processes never share
+    // a temporary file, so a failed save cannot remove another writer's data.
+    let _guard = SAVES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::fs::create_dir_all(directory)?;
+    let temp = directory.join(format!(
+        "settings-{}-{}.tmp",
+        std::process::id(),
+        SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let result = (|| -> anyhow::Result<()> {
+        file.write_all(&serde_json::to_vec_pretty(settings)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, directory.join("settings.json"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 impl App {
     fn new() -> Self {
         let settings_path = model::data_dir().join("settings.json");
@@ -397,11 +429,7 @@ impl App {
     }
 
     fn save_preferences(&self) -> anyhow::Result<()> {
-        std::fs::create_dir_all(model::data_dir())?;
-        let temp = model::data_dir().join("settings.tmp");
-        std::fs::write(&temp, serde_json::to_vec_pretty(&self.settings)?)?;
-        std::fs::rename(temp, model::data_dir().join("settings.json"))?;
-        Ok(())
+        save_settings(&model::data_dir(), &self.settings)
     }
 
     fn load(&mut self) {
@@ -1409,6 +1437,43 @@ impl Drop for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_preferences_saves_leave_complete_json_without_shared_temp_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "articulate-save-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for index in 0..16 {
+                let directory = &directory;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let settings = Settings {
+                        transcription_language: format!("synthetic-{index}"),
+                        ..Default::default()
+                    };
+                    barrier.wait();
+                    for _ in 0..4 {
+                        save_settings(directory, &settings).unwrap();
+                    }
+                });
+            }
+        });
+        let settings: Settings =
+            serde_json::from_slice(&std::fs::read(directory.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(settings.transcription_language.starts_with("synthetic-"));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_file(directory.join("settings.json")).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     fn call_row(speaker: i32, start_ms: u64, text: &str) -> calls::Row {
         calls::Row {
