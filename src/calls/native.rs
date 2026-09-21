@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
@@ -16,6 +16,8 @@ const MAX_SECONDS: f64 = 24.0;
 const CLOCK_JITTER: f64 = 0.030;
 
 struct Voice {
+    native_generation: u64,
+    loss_epoch: u64,
     attribution: Attribution,
     rate: u32,
     start: f64,
@@ -23,12 +25,31 @@ struct Voice {
     pcm: Vec<f32>,
 }
 
+struct Boundary {
+    attribution: Attribution,
+    native_generation: u64,
+    end: f64,
+}
+
+fn same_person(a: &Attribution, b: &Attribution) -> bool {
+    a.generation == b.generation
+        && a.channel_id == b.channel_id
+        && a.speakers[0].id == b.speakers[0].id
+}
+
 #[derive(Default)]
 struct Window {
     start: f64,
     mic: Vec<f32>,
     voices: Vec<Voice>,
+    previous: Vec<Boundary>,
     rows: Vec<Row>,
+    // Only completed speech spans are reusable as new audio extends this window.
+    turn_cache: HashMap<(usize, usize, usize), String>,
+    // Audio delivered after its section was finalized cannot be transcribed
+    // retroactively. Retain a session-wide count for the incomplete-audio notice.
+    late_packets: u64,
+    context_submitted: BTreeSet<(usize, usize, usize)>,
 }
 
 fn frame_start(frame: &Frame) -> Instant {
@@ -65,7 +86,7 @@ impl Window {
             "Invalid participant audio format"
         );
         let raw_start = frame_start(&frame);
-        let skip = if raw_start < origin {
+        let mut skip = if raw_start < origin {
             (origin.duration_since(raw_start).as_secs_f64() * f64::from(frame.rate)).ceil() as usize
         } else {
             0
@@ -74,25 +95,94 @@ impl Window {
         if skip >= frames {
             return Ok(());
         }
-        let start = raw_start.saturating_duration_since(origin).as_secs_f64();
+        let raw_seconds = if raw_start >= origin {
+            raw_start.duration_since(origin).as_secs_f64()
+        } else {
+            -origin.duration_since(raw_start).as_secs_f64()
+        };
+        let mut start = raw_seconds + skip as f64 / f64::from(frame.rate);
         let end = frame.at.saturating_duration_since(origin).as_secs_f64();
-        ensure!(
-            start + 0.001 >= self.start,
-            "Participant audio arrived after its transcript section was committed. Capture stopped to preserve the existing transcript."
-        );
-        let slot = self.voices.iter().position(|voice| {
-            voice.attribution.generation == frame.attribution.generation
-                && voice.attribution.channel_id == frame.attribution.channel_id
-                && voice.attribution.speakers[0].id == frame.attribution.speakers[0].id
-        });
+        let existing = self
+            .voices
+            .iter()
+            .rposition(|voice| same_person(&voice.attribution, &frame.attribution));
+        let previous = existing
+            .map(|slot| {
+                let voice = &self.voices[slot];
+                (
+                    voice.native_generation,
+                    voice
+                        .end
+                        .max(voice.start + voice.pcm.len() as f64 / f64::from(voice.rate)),
+                )
+            })
+            .or_else(|| {
+                self.previous
+                    .iter()
+                    .find(|voice| same_person(&voice.attribution, &frame.attribution))
+                    .map(|voice| (voice.native_generation, voice.end))
+            });
+        if previous.is_some_and(|(generation, _)| frame.native_generation < generation) {
+            return Ok(());
+        }
+        let replacement =
+            previous.is_some_and(|(generation, _)| frame.native_generation > generation);
+        let original_skip = skip;
+        // A callback can be delayed past commit without belonging to a replaced
+        // connection. Drop only its finalized prefix, retaining any new tail.
+        let cutoff = previous
+            .and_then(|(_, end)| replacement.then_some(end.max(self.start)))
+            .or_else(|| (start < self.start).then_some(self.start));
+        if let Some(cutoff) = cutoff {
+            skip = skip.max(
+                (((cutoff - raw_seconds) * f64::from(frame.rate) - 1e-6)
+                    .ceil()
+                    .max(0.0)) as usize,
+            );
+            start = raw_seconds + skip as f64 / f64::from(frame.rate);
+        }
+        // A finalized boundary can trim ordinary clock jitter or digital silence.
+        // Neither is evidence of missing conversation. Inspect only the discarded
+        // prefix, never the retained tail, and keep replacement overlap excluded.
+        let discarded = skip.min(frames).saturating_sub(original_skip);
+        if !replacement
+            && discarded > 1
+            && (end <= self.start || discarded as f64 / f64::from(frame.rate) > CLOCK_JITTER)
+            && frame.samples[original_skip * usize::from(frame.channels)
+                ..skip.min(frames) * usize::from(frame.channels)]
+                .iter()
+                .any(|&sample| sample != 0)
+        {
+            self.late_packets = self.late_packets.saturating_add(1);
+        }
+        if skip >= frames {
+            // Keep the old generation until replacement audio reaches its end.
+            // The transport already discards late packets from that old stream.
+            return Ok(());
+        }
+        let slot = existing.filter(|&slot| !replacement || self.voices[slot].rate == frame.rate);
         let slot = match slot {
             Some(slot) => slot,
             None => {
                 ensure!(
-                    self.voices.len() < MAX_PARTICIPANTS,
-                    "This capture reached its limit of 16 simultaneous participant streams"
+                    self.voices.len() < MAX_PARTICIPANTS * 2
+                        && (existing.is_some()
+                            || self
+                                .voices
+                                .iter()
+                                .map(|voice| (
+                                    voice.attribution.generation,
+                                    &voice.attribution.channel_id,
+                                    &voice.attribution.speakers[0].id
+                                ))
+                                .collect::<BTreeSet<_>>()
+                                .len()
+                                < MAX_PARTICIPANTS),
+                    "This capture reached its bounded participant stream limit"
                 );
                 self.voices.push(Voice {
+                    native_generation: frame.native_generation,
+                    loss_epoch: frame.loss_epoch,
                     attribution: frame.attribution.clone(),
                     rate: frame.rate,
                     start: start.max(self.start),
@@ -114,8 +204,16 @@ impl Window {
             start + CLOCK_JITTER >= voice.end,
             "Participant audio timestamps moved backwards"
         );
-        let gap = if start - voice.end > CLOCK_JITTER {
-            ((start - voice.end) * f64::from(voice.rate)).round() as usize
+        let timeline_end = if cutoff.is_some() {
+            voice.start + voice.pcm.len() as f64 / f64::from(voice.rate)
+        } else {
+            voice.end
+        };
+        let gap = if start - timeline_end > CLOCK_JITTER
+            || frame.loss_epoch != voice.loss_epoch
+            || cutoff.is_some()
+        {
+            ((start - timeline_end).max(0.0) * f64::from(voice.rate)).round() as usize
         } else {
             0
         };
@@ -140,42 +238,102 @@ impl Window {
                 }),
         );
         voice.end = end;
+        voice.loss_epoch = frame.loss_epoch;
+        voice.native_generation = frame.native_generation;
         Ok(())
     }
 
+    #[cfg(test)]
     fn decode(
-        &self,
+        &mut self,
+        end: f64,
+        transcribe: impl FnMut(&[f32]) -> Result<String>,
+    ) -> Result<Vec<Row>> {
+        self.decode_context(end, transcribe, &mut None, false)
+    }
+
+    fn decode_context(
+        &mut self,
         end: f64,
         mut transcribe: impl FnMut(&[f32]) -> Result<String>,
+        context: &mut Option<crate::sensevoice::Worker>,
+        finalizing: bool,
     ) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
-        let text = transcribe(&self.mic)?;
-        if !text.is_empty() {
-            rows.push(Row {
-                start_ms: (self.start * 1000.0) as u64,
-                end_ms: (end * 1000.0) as u64,
-                microphone: true,
-                speakers: Vec::new(),
-                discord: None,
-                text,
-            });
-        }
-        for voice in &self.voices {
-            // Resample contiguous accumulated speech, never individual 20 ms packets.
-            let pcm = crate::audio::resample(&voice.pcm, voice.rate)?;
-            let text = transcribe(&pcm)?;
-            if !text.is_empty() {
-                rows.push(Row {
+        // Locate utterances on the aligned separate tracks before recognition.
+        // Whole-track ASR loses the timing of A/B/A exchanges because this model
+        // returns text without word timestamps.
+        let remote = self
+            .voices
+            .iter()
+            .map(|voice| {
+                let mut pcm = crate::audio::resample(&voice.pcm, voice.rate)?;
+                // consume() has already admitted all audio through this boundary.
+                // A callback that stopped sending is silence through that time,
+                // not an indefinitely unfinished turn.
+                let through = ((end - voice.start).max(0.0) * 16000.0).round() as usize;
+                pcm.resize(pcm.len().max(through), 0.0);
+                Ok(pcm)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut tracks = vec![super::turns::Track {
+            pcm: &self.mic,
+            start_ms: (self.start * 1000.0) as u64,
+        }];
+        tracks.extend(
+            remote
+                .iter()
+                .zip(&self.voices)
+                .map(|(pcm, voice)| super::turns::Track {
+                    pcm,
                     start_ms: (voice.start * 1000.0) as u64,
-                    end_ms: (voice.end * 1000.0) as u64,
-                    microphone: false,
-                    speakers: Vec::new(),
-                    discord: Some(voice.attribution.clone()),
-                    text,
-                });
+                }),
+        );
+        let mut rows = Vec::new();
+        let mut next_cache = HashMap::new();
+        for turn in super::turns::plan(&tracks) {
+            let key = (turn.track, turn.audio_start, turn.audio_end);
+            let text = if let Some(text) = self.turn_cache.get(&key) {
+                text.clone()
+            } else {
+                transcribe(&tracks[turn.track].pcm[turn.audio_start..turn.audio_end])?
+            };
+            if turn.complete && next_cache.len() < 256 {
+                next_cache.insert(key, text.clone());
+            }
+            let row = Row {
+                cues: Vec::new(),
+                start_ms: tracks[turn.track].start_ms + turn.start as u64 / 16,
+                end_ms: (tracks[turn.track].start_ms + turn.end as u64 / 16)
+                    .min((end * 1000.0) as u64),
+                microphone: turn.track == 0,
+                speakers: Vec::new(),
+                discord: turn
+                    .track
+                    .checked_sub(1)
+                    .map(|index| self.voices[index].attribution.clone()),
+                text,
+            };
+            if (turn.complete || finalizing || end - self.start >= MAX_SECONDS - 0.001)
+                && self.context_submitted.len() < 256
+                && !self.context_submitted.contains(&key)
+                && let Some(context) = context
+            {
+                // Cue times cover the analyzed clip, not invented event/word timestamps.
+                let mut target = row.clone();
+                target.start_ms = tracks[turn.track].start_ms + turn.audio_start as u64 / 16;
+                target.end_ms = tracks[turn.track].start_ms + turn.audio_end as u64 / 16;
+                context.submit(
+                    &target,
+                    &tracks[turn.track].pcm[turn.audio_start..turn.audio_end],
+                );
+                self.context_submitted.insert(key);
+            }
+            if !row.text.is_empty() {
+                rows.push(row);
             }
         }
         rows.sort_by_key(|row| row.start_ms);
+        self.turn_cache = next_cache;
         Ok(rows)
     }
 
@@ -196,6 +354,24 @@ impl Window {
     fn commit(&mut self, end: f64, update: &mut impl FnMut(Update)) {
         update(Update::Rows(std::mem::take(&mut self.rows)));
         self.mic.clear();
+        self.turn_cache.clear();
+        self.context_submitted.clear();
+        self.previous.clear();
+        for voice in self.voices.iter().rev() {
+            if !self
+                .previous
+                .iter()
+                .any(|previous| same_person(&previous.attribution, &voice.attribution))
+            {
+                self.previous.push(Boundary {
+                    attribution: voice.attribution.clone(),
+                    native_generation: voice.native_generation,
+                    end: end
+                        .max(voice.end)
+                        .max(voice.start + voice.pcm.len() as f64 / f64::from(voice.rate)),
+                });
+            }
+        }
         self.voices.clear();
         self.start = end;
     }
@@ -229,6 +405,8 @@ fn consume(
         let remaining = frame.samples.split_off(cut);
         let boundary = start + Duration::from_secs_f64(count as f64 / f64::from(frame.rate));
         let head = Frame {
+            native_generation: frame.native_generation,
+            loss_epoch: frame.loss_epoch,
             at: boundary,
             rate: frame.rate,
             channels: frame.channels,
@@ -270,16 +448,27 @@ pub(super) fn run(
         .expect("microphone establishes capture clock");
     update(Update::Started);
     update(Update::NativeAudio(false));
+    let mut context = crate::sensevoice::Worker::start(request.audio_context);
     let mut received = false;
+    let mut lost_packets = 0;
     let mut pending = VecDeque::new();
     let mut window = Window::default();
     let mut cursor = 0.0;
     let result = (|| -> Result<()> {
         loop {
+            if let Some(context) = &mut context {
+                context.poll(&mut update);
+            }
             if request.control.abort.load(Ordering::Relaxed) {
                 break;
             }
-            let frames = capture.drain()?;
+            let frames = capture.drain();
+            let lost = capture.lost_packets().saturating_add(window.late_packets);
+            if lost != lost_packets {
+                lost_packets = lost;
+                update(Update::AudioGap(lost));
+            }
+            let frames = frames?;
             if !received && !frames.is_empty() {
                 received = true;
                 update(Update::NativeAudio(true));
@@ -318,8 +507,18 @@ pub(super) fn run(
                     origin,
                     &mut window,
                 )?;
+                let lost = capture.lost_packets().saturating_add(window.late_packets);
+                if lost != lost_packets {
+                    lost_packets = lost;
+                    update(Update::AudioGap(lost));
+                }
                 window.mic.extend(mic.take_until(end)?);
-                let rows = window.decode(end, |pcm| engine.transcribe(pcm))?;
+                let rows = window.decode_context(
+                    end,
+                    |pcm| engine.transcribe(pcm),
+                    &mut context,
+                    stopping,
+                )?;
                 window.rows = rows;
                 cursor = end;
                 if window.endpoint(end) || (stopping && cursor >= now) {
@@ -349,6 +548,11 @@ pub(super) fn run(
     if !window.rows.is_empty() {
         window.commit(cursor, &mut update);
     }
+    drop(capture);
+    drop(mic);
+    if let Some(context) = &mut context {
+        context.finish(&mut update, &request.control.abort);
+    }
     result
 }
 
@@ -357,6 +561,8 @@ mod tests {
     use super::*;
     fn frame(origin: Instant, id: &str, end: f64, samples: usize, value: i16) -> Frame {
         Frame {
+            native_generation: 1,
+            loss_epoch: 0,
             at: origin + Duration::from_secs_f64(end),
             rate: 16000,
             channels: 1,
@@ -371,6 +577,117 @@ mod tests {
                 }],
             },
         }
+    }
+    #[test]
+    fn a_loss_disables_jitter_compensation_for_each_affected_voice() {
+        let origin = Instant::now();
+        let mut window = Window::default();
+        for id in ["Casey", "Jordan"] {
+            window
+                .ingest(frame(origin, id, 0.020, 320, 8192), origin)
+                .unwrap();
+        }
+        // One lost 20ms callback belongs to an unknown participant. Preserve
+        // the next real timestamp gap on both tracks, never guess its owner.
+        for id in ["Casey", "Jordan"] {
+            let mut next = frame(origin, id, 0.060, 320, 8192);
+            next.loss_epoch = 1;
+            window.ingest(next, origin).unwrap();
+        }
+        for voice in &window.voices {
+            assert_eq!(voice.pcm.len(), 960);
+            assert!(voice.pcm[320..640].iter().all(|sample| *sample == 0.0));
+            assert!(voice.pcm[640..].iter().all(|sample| *sample == 0.25));
+        }
+    }
+    #[test]
+    fn replacement_trims_already_accumulated_samples_including_clock_jitter() {
+        let origin = Instant::now();
+        let mut window = Window::default();
+        window
+            .ingest(frame(origin, "Casey", 0.1, 1600, 8192), origin)
+            .unwrap();
+        window
+            .ingest(frame(origin, "Casey", 0.18, 1600, 8192), origin)
+            .unwrap();
+        let mut replacement = frame(origin, "Casey", 0.25, 1600, -8192);
+        replacement.native_generation = 2;
+        window.ingest(replacement, origin).unwrap();
+        assert_eq!(window.voices.len(), 1);
+        assert_eq!(window.voices[0].pcm.len(), 4000);
+        assert!(
+            window.voices[0].pcm[..3200]
+                .iter()
+                .all(|sample| *sample == 0.25)
+        );
+        assert!(
+            window.voices[0].pcm[3200..]
+                .iter()
+                .all(|sample| *sample == -0.25)
+        );
+    }
+
+    #[test]
+    fn replacement_preserves_short_wallclock_gaps_and_other_people_generations() {
+        let origin = Instant::now();
+        let mut window = Window::default();
+        let mut first = frame(origin, "Casey", 0.1, 1600, 8192);
+        first.native_generation = 40;
+        window.ingest(first, origin).unwrap();
+        let mut other = frame(origin, "Jordan", 0.1, 1600, -8192);
+        other.native_generation = 2;
+        window.ingest(other, origin).unwrap();
+        let mut next = frame(origin, "Casey", 0.14, 320, 8192);
+        next.native_generation = 41;
+        window.ingest(next, origin).unwrap();
+        assert_eq!(window.voices[0].pcm.len(), 2240);
+        assert!(
+            window.voices[0].pcm[1600..1920]
+                .iter()
+                .all(|sample| *sample == 0.0)
+        );
+        assert_eq!(window.voices[1].pcm.len(), 1600);
+        assert_eq!(window.voices[1].native_generation, 2);
+    }
+
+    #[test]
+    fn replacement_straddling_a_committed_section_keeps_only_new_audio() {
+        let origin = Instant::now();
+        let mut window = Window::default();
+        window
+            .ingest(frame(origin, "Casey", 0.1, 1600, 8192), origin)
+            .unwrap();
+        window.commit(0.1, &mut |_| {});
+        let mut next = frame(origin, "Casey", 0.15, 1600, -8192);
+        next.native_generation = 2;
+        window.ingest(next, origin).unwrap();
+        assert_eq!(window.voices[0].pcm.len(), 800);
+        assert!((window.voices[0].start - 0.1).abs() < 1e-8);
+    }
+
+    #[test]
+    fn replacement_format_change_splits_segments_but_same_stream_remains_strict() {
+        let origin = Instant::now();
+        let mut window = Window::default();
+        window
+            .ingest(frame(origin, "Casey", 0.1, 1600, 8192), origin)
+            .unwrap();
+        assert!(
+            window
+                .ingest(frame(origin, "Casey", 0.15, 1600, 8192), origin)
+                .is_err()
+        );
+        let mut changed = frame(origin, "Casey", 0.2, 4800, -8192);
+        changed.rate = 48000;
+        assert!(window.ingest(changed, origin).is_err());
+        let mut changed = frame(origin, "Casey", 0.2, 4800, -8192);
+        changed.rate = 48000;
+        changed.native_generation = 2;
+        window.ingest(changed, origin).unwrap();
+        assert_eq!(window.voices.len(), 2);
+        assert_eq!(window.voices[0].pcm.len(), 1600);
+        assert_eq!(window.voices[1].pcm.len(), 4800);
+        assert_eq!(window.voices[1].attribution.speakers[0].id, "Casey");
     }
     #[test]
     fn overlapping_people_are_decoded_separately_with_exact_identity() {
@@ -477,7 +794,7 @@ mod tests {
         assert!(window.voices.is_empty());
     }
     #[test]
-    fn silence_keeps_context_and_late_audio_or_excess_participants_fail() {
+    fn silence_keeps_context_participants_stay_bounded_and_late_audio_is_counted() {
         let origin = Instant::now();
         let mut window = Window::default();
         window
@@ -502,13 +819,134 @@ mod tests {
                 .is_err()
         );
         window.start = 3.0;
-        assert!(
-            window
-                .ingest(frame(origin, "late", 2.0, 16000, 8192), origin)
-                .is_err()
-        );
+        window
+            .ingest(frame(origin, "late", 2.0, 16000, 8192), origin)
+            .unwrap();
+        assert_eq!(window.late_packets, 1);
+        assert_eq!(window.voices.len(), 16);
     }
 
+    #[test]
+    fn silent_late_audio_and_small_boundary_overlap_do_not_report_loss() {
+        let origin = Instant::now();
+        let mut window = Window {
+            start: 1.0,
+            ..Window::default()
+        };
+        window
+            .ingest(frame(origin, "Casey", 0.95, 1600, 0), origin)
+            .unwrap();
+        assert_eq!(window.late_packets, 0);
+        // A silent discarded prefix must not inherit sound from the retained tail.
+        let mut crossing = frame(origin, "Casey", 1.05, 1600, 0);
+        crossing.samples[800..].fill(8192);
+        window.ingest(crossing, origin).unwrap();
+        assert_eq!(window.late_packets, 0);
+        assert_eq!(window.voices[0].pcm.len(), 800);
+        let mut jitter = Window {
+            start: 1.0,
+            ..Window::default()
+        };
+        jitter
+            .ingest(frame(origin, "Casey", 1.01, 320, 8192), origin)
+            .unwrap();
+        assert_eq!(jitter.late_packets, 0);
+        // A fully discarded audible packet remains a genuine loss signal.
+        jitter
+            .ingest(frame(origin, "Casey", 0.95, 320, 8192), origin)
+            .unwrap();
+        assert_eq!(jitter.late_packets, 1);
+    }
+
+    #[test]
+    fn delayed_packets_skip_finalized_audio_and_keep_a_straddling_tail() {
+        let origin = Instant::now();
+        let mut window = Window::default();
+        window
+            .ingest(frame(origin, "Casey", 1.0, 16000, 8192), origin)
+            .unwrap();
+        window.rows = window
+            .decode(1.0, |_| Ok("Finalized words.".into()))
+            .unwrap();
+        let mut saved = Vec::new();
+        window.commit(1.0, &mut |update| {
+            if let Update::Rows(rows) = update {
+                saved.extend(rows)
+            }
+        });
+        window
+            .ingest(frame(origin, "Casey", 0.95, 320, 16384), origin)
+            .unwrap();
+        assert!(window.voices.is_empty());
+        window
+            .ingest(frame(origin, "Casey", 1.05, 1600, -8192), origin)
+            .unwrap();
+        assert_eq!(window.voices.len(), 1);
+        assert_eq!(window.voices[0].pcm.len(), 800);
+        assert!((window.voices[0].start - 1.0).abs() < 1e-8);
+        assert!(window.voices[0].pcm.iter().all(|sample| *sample == -0.25));
+        assert_eq!(window.late_packets, 2);
+        window
+            .ingest(frame(origin, "Casey", 1.07, 320, -8192), origin)
+            .unwrap();
+        assert_eq!(window.voices[0].pcm.len(), 1120);
+        window.commit(1.07, &mut |_| {});
+        assert_eq!(window.late_packets, 2, "The warning survives commit");
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].text, "Finalized words.");
+    }
+
+    #[test]
+    fn alternating_tracks_emit_a_b_a_and_cache_completed_turns() {
+        let origin = Instant::now();
+        let mut window = Window::default();
+        let mut a = frame(origin, "Casey", 4.0, 64000, 0);
+        a.samples[..9600].fill(8192);
+        a.samples[32000..41600].fill(16384);
+        window.ingest(a, origin).unwrap();
+        let mut b = frame(origin, "Jordan", 4.0, 64000, 0);
+        b.samples[12800..22400].fill(-8192);
+        window.ingest(b, origin).unwrap();
+        let mut decoded = 0;
+        let rows = window
+            .decode(4.0, |pcm| {
+                decoded += 1;
+                let sample = pcm
+                    .iter()
+                    .copied()
+                    .find(|sample| sample.abs() > 0.01)
+                    .unwrap();
+                Ok(if sample < 0.0 {
+                    "Reply."
+                } else if sample > 0.3 {
+                    "Follow-up."
+                } else {
+                    "Question."
+                }
+                .into())
+            })
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["Question.", "Reply.", "Follow-up."]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.discord.as_ref().unwrap().speakers[0].id.as_str())
+                .collect::<Vec<_>>(),
+            ["Casey", "Jordan", "Casey"]
+        );
+        assert_eq!(decoded, 3);
+        assert!(rows[0].end_ms <= rows[1].start_ms && rows[1].end_ms <= rows[2].start_ms);
+        window
+            .decode(4.2, |_| anyhow::bail!("Completed turns must be reused"))
+            .unwrap();
+        let mut committed = Vec::new();
+        super::super::append_rows(&mut committed, rows);
+        assert_eq!(committed.len(), 3);
+        window.commit(4.2, &mut |_| {});
+        assert!(window.turn_cache.is_empty());
+    }
     #[test]
     fn small_packets_resample_as_one_draft_and_duration_is_bounded() {
         let origin = Instant::now();
@@ -526,7 +964,7 @@ mod tests {
                 Ok(String::new())
             })
             .unwrap();
-        assert_eq!(lengths, [0, 16000]);
+        assert_eq!(lengths, [16000]);
         assert!(window.endpoint(24.0));
         let mut huge = frame(origin, "Casey", 27.0, 26 * 48000, 8192);
         huge.rate = 48000;

@@ -92,6 +92,10 @@ impl Entry {
                 .map(|c| (c.cues.as_slice(), c.ignore_case)),
         )
     }
+    #[allow(
+        dead_code,
+        reason = "Preserve merged vocabulary context inspection for React vocabulary controls"
+    )]
     pub fn all_cues(&self) -> Vec<String> {
         let mut cues: Vec<_> = self
             .policies()
@@ -101,11 +105,19 @@ impl Entry {
         cues.dedup();
         cues
     }
+    #[allow(
+        dead_code,
+        reason = "Preserve merged vocabulary context inspection for React vocabulary controls"
+    )]
     pub fn has_alternative_contexts(&self) -> bool {
         !self.contexts.is_empty()
     }
     /// Concrete policies are useful when a review must retain the precise rule
     /// that matched, rather than accidentally widening its capitalization.
+    #[allow(
+        dead_code,
+        reason = "Preserve merged vocabulary context inspection for React vocabulary controls"
+    )]
     pub fn variants(&self) -> impl Iterator<Item = Self> + '_ {
         self.policies().map(|(cues, ignore_case)| {
             let mut entry = self.clone();

@@ -11,6 +11,7 @@ use std::{
 pub const MAX_PACKET: usize = 64 + 5760 * 2 * 2;
 const MAX_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const LEASE: Duration = Duration::from_secs(2);
+const MAX_RETIRED_PARTICIPANTS: usize = 512;
 
 pub struct Frame {
     /// Capture callback time, mapped to the same monotonic clock as microphone capture.
@@ -19,23 +20,51 @@ pub struct Frame {
     pub channels: u16,
     pub samples: Vec<i16>,
     pub attribution: Attribution,
+    /// Identity of the native Connect callback that supplied this person's PCM.
+    pub native_generation: u64,
+    /// Global loss count when this frame arrived. A change invalidates jitter
+    /// compensation for every participant until their next frame.
+    pub loss_epoch: u64,
+}
+
+struct RetiredParticipant {
+    speaker: NamedSpeaker,
+    removed: Instant,
 }
 
 struct Active {
+    diagnostics: Option<Arc<Mutex<super::diagnostics::Recorder>>>,
     id: u64,
     channel: String,
     observation_generation: u64,
-    native_generation: Option<u64>,
+    native_generations: HashMap<u64, u64>,
     sequence: u64,
+    lost_packets: u64,
     participants: HashMap<u64, NamedSpeaker>,
+    retired: HashMap<u64, RetiredParticipant>,
     queue: VecDeque<Frame>,
     bytes: usize,
     error: Option<&'static str>,
 }
 #[derive(Default)]
 struct State {
+    diagnostics: Option<Arc<Mutex<super::diagnostics::Recorder>>>,
     polled: Option<Instant>,
     active: Option<Active>,
+}
+impl Active {
+    fn diagnose(&self, reason: &'static str, incoming: u64) {
+        if let Some(recorder) = &self.diagnostics {
+            recorder.lock().unwrap_or_else(|e| e.into_inner()).failure(
+                reason,
+                self.sequence,
+                incoming,
+                self.lost_packets,
+                self.queue.len(),
+                self.bytes,
+            );
+        }
+    }
 }
 #[derive(Clone, Default)]
 pub struct Hub(Arc<Mutex<State>>);
@@ -75,6 +104,30 @@ fn usable(observation: &Observation) -> bool {
 }
 
 impl Hub {
+    pub(super) fn with_diagnostics(path: std::path::PathBuf) -> Self {
+        Self(Arc::new(Mutex::new(State {
+            diagnostics: Some(Arc::new(Mutex::new(super::diagnostics::Recorder::new(
+                path,
+            )))),
+            ..State::default()
+        })))
+    }
+    pub(super) fn report_diagnostics(&self, bytes: &[u8]) -> Result<()> {
+        let report = super::diagnostics::validate(bytes)?;
+        let recorder = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .diagnostics
+            .clone();
+        if let Some(recorder) = recorder {
+            recorder
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .companion(report);
+        }
+        Ok(())
+    }
     pub fn ready(&self) -> bool {
         self.0
             .lock()
@@ -98,12 +151,15 @@ impl Hub {
             "Discord audio is already being captured"
         );
         state.active = Some(Active {
+            diagnostics: state.diagnostics.clone(),
             id,
             channel: observation.channel_id.clone().unwrap(),
             observation_generation: observation.generation,
-            native_generation: None,
+            native_generations: HashMap::new(),
             sequence: 0,
+            lost_packets: 0,
             participants: participants(observation)?,
+            retired: HashMap::new(),
             queue: VecDeque::new(),
             bytes: 0,
             error: None,
@@ -117,7 +173,7 @@ impl Hub {
     pub fn control(&self, observation: Option<&Observation>) -> serde_json::Value {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         state.polled = Some(Instant::now());
-        let inactive = serde_json::json!({"version":1,"active":false,"capture_id":"0","channel_id":null,"participants":[]});
+        let inactive = serde_json::json!({"version":1,"pcm_batch":true,"active":false,"capture_id":"0","channel_id":null,"participants":[]});
         let Some(active) = state.active.as_mut() else {
             return inactive;
         };
@@ -139,10 +195,36 @@ impl Hub {
                 Some("Discord supplied an invalid participant identity. Capture stopped.");
             return inactive;
         };
+        // Metadata can observe a departure before previously captured audio has
+        // crossed the transport. Keep only a short, bounded identity history so
+        // those packets retain their speaker and do not break the global sequence.
+        let now = Instant::now();
+        active.retired.retain(|id, entry| {
+            now.saturating_duration_since(entry.removed) <= LEASE && !names.contains_key(id)
+        });
+        for (id, speaker) in &active.participants {
+            if !names.contains_key(id) {
+                if active.retired.len() >= MAX_RETIRED_PARTICIPANTS {
+                    active.error =
+                        Some("Discord membership changed too quickly. Start a new capture.");
+                    return inactive;
+                }
+                active.retired.insert(
+                    *id,
+                    RetiredParticipant {
+                        speaker: speaker.clone(),
+                        removed: now,
+                    },
+                );
+            }
+        }
+        active
+            .native_generations
+            .retain(|id, _| names.contains_key(id) || active.retired.contains_key(id));
         active.participants = names;
         let mut ids: Vec<_> = active.participants.keys().map(u64::to_string).collect();
         ids.sort();
-        serde_json::json!({"version":1,"active":true,"capture_id":active.id.to_string(),
+        serde_json::json!({"version":1,"pcm_batch":true,"active":true,"capture_id":active.id.to_string(),
             "channel_id":active.channel,"participants":ids})
     }
     pub fn receive(&self, bytes: &[u8], now_us: u64, received: Instant) -> Result<()> {
@@ -166,41 +248,72 @@ impl Hub {
             "Packet belongs to a different capture"
         );
         ensure!(active.error.is_none(), "Native capture has stopped");
+        let captured_at = received
+            .checked_sub(Duration::from_micros(
+                now_us.saturating_sub(packet.observed),
+            ))
+            .unwrap_or(received);
+        let retired = active
+            .retired
+            .get(&packet.user)
+            .filter(|entry| received.saturating_duration_since(entry.removed) <= LEASE);
         let speaker = active
             .participants
             .get(&packet.user)
+            .or_else(|| retired.map(|entry| &entry.speaker))
             .ok_or_else(|| anyhow::anyhow!("Participant is not in this capture"))?
             .clone();
-        if packet.sequence != active.sequence.saturating_add(1) {
+        if packet.sequence <= active.sequence {
+            active.diagnose("sequence_order", packet.sequence);
             active.error = Some(
-                "Discord audio packets were lost or reordered. Capture stopped to avoid an incomplete transcript.",
+                "Discord audio arrived out of order. Capture stopped; completed text is retained.",
             );
             anyhow::bail!(active.error.unwrap());
         }
+        let missing = packet.sequence - active.sequence - 1;
+        if missing > 0 {
+            active.lost_packets = active.lost_packets.saturating_add(missing);
+            // Fresh, ordered audio from the same authorized capture means the
+            // stream has resumed. Preserve the loss count and wall-clock gap;
+            // stopping here would discard the rest of an otherwise usable call.
+            // Replay, channel changes, expired leases and queue bounds remain
+            // separate errors and cannot be bypassed by claiming a sequence gap.
+            active.diagnose("sequence_loss", packet.sequence);
+        }
+        // The native allowlist update can race one last callback after removal.
+        // Acknowledge its sequence without recording audio outside membership.
+        if retired.is_some_and(|entry| captured_at > entry.removed) {
+            active.sequence = packet.sequence;
+            return Ok(());
+        }
+        // The native serial identifies one Connect callback, not a whole call.
+        // Different participants can use different callbacks concurrently. Once
+        // this person moves to a newer callback, acknowledge queued old packets
+        // without duplicating their audio or rolling their stream back.
         if active
-            .native_generation
-            .is_some_and(|generation| generation != packet.generation)
+            .native_generations
+            .get(&packet.user)
+            .is_some_and(|generation| packet.generation < *generation)
         {
-            active.error = Some(
-                "Discord reconnected its audio stream. Finish this capture and start a new one.",
-            );
-            anyhow::bail!(active.error.unwrap());
+            active.sequence = packet.sequence;
+            return Ok(());
         }
         if active.bytes + packet.pcm.len() > MAX_QUEUE_BYTES || active.queue.len() >= 4096 {
+            active.diagnose("receiver_queue_full", packet.sequence);
             active.error = Some(
                 "Discord audio processing fell behind. Capture stopped; completed text is retained.",
             );
             anyhow::bail!(active.error.unwrap());
         }
-        active.native_generation = Some(packet.generation);
+        active
+            .native_generations
+            .insert(packet.user, packet.generation);
         active.sequence = packet.sequence;
         active.bytes += packet.pcm.len();
         active.queue.push_back(Frame {
-            at: received
-                .checked_sub(Duration::from_micros(
-                    now_us.saturating_sub(packet.observed),
-                ))
-                .unwrap_or(received),
+            native_generation: packet.generation,
+            loss_epoch: active.lost_packets,
+            at: captured_at,
             rate: packet.rate,
             channels: packet.channels,
             samples: packet
@@ -220,6 +333,16 @@ impl Hub {
     }
 }
 impl Capture {
+    pub fn lost_packets(&self) -> u64 {
+        self.hub
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .as_ref()
+            .filter(|active| active.id == self.id)
+            .map_or(0, |active| active.lost_packets)
+    }
     pub fn drain(&self) -> Result<Vec<Frame>> {
         let mut state = self.hub.0.lock().unwrap_or_else(|e| e.into_inner());
         ensure!(
@@ -275,7 +398,8 @@ impl<'a> Packet<'a> {
                 && u16_at(4) == 1
                 && u16_at(6) == 64
                 && u16_at(46) == 0
-                && bytes[60..64] == [0; 4],
+                && bytes[60..64] == [0; 4]
+                && u64_at(8) != 0,
             "Unsupported native audio format"
         );
         let channels = u16_at(44);
@@ -360,21 +484,180 @@ mod tests {
         );
     }
     #[test]
-    fn loss_and_connection_changes_stop_instead_of_silently_mixing() {
+    fn departing_participant_does_not_interrupt_other_streams() {
+        let hub = Hub::default();
+        let mut observation = observation();
+        let mut other = observation.participants[0].clone();
+        other.id = "789".into();
+        other.name = "Another speaker".into();
+        observation.participants.push(other);
+        hub.control(Some(&observation));
+        let capture = hub.begin(&observation).unwrap();
+        let before_departure = Instant::now();
+        observation.participants.remove(0);
+        hub.control(Some(&observation));
+        // This packet was captured while the participant was still in the call.
+        hub.receive(&packet(capture.id, 456, 1), 1000, before_departure)
+            .unwrap();
+        let frames = capture.drain().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].attribution.speakers[0].id, "456");
+        // A callback racing the native allowlist update is ignored, but its
+        // sequence must still be consumed so the remaining speaker can continue.
+        hub.receive(&packet(capture.id, 456, 2), 1000, Instant::now())
+            .unwrap();
+        hub.receive(&packet(capture.id, 789, 3), 1000, Instant::now())
+            .unwrap();
+        let frames = capture.drain().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].attribution.speakers[0].id, "789");
+        // Removed identities expire and cannot be reused as indefinite membership.
+        hub.0
+            .lock()
+            .unwrap()
+            .active
+            .as_mut()
+            .unwrap()
+            .retired
+            .get_mut(&456)
+            .unwrap()
+            .removed = Instant::now() - LEASE - Duration::from_millis(1);
+        assert!(
+            hub.receive(&packet(capture.id, 456, 4), 1000, Instant::now())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn large_gap_recovers_but_channel_changes_still_stop() {
         let hub = Hub::default();
         let mut observation = observation();
         hub.control(Some(&observation));
         let capture = hub.begin(&observation).unwrap();
-        assert!(
-            hub.receive(&packet(capture.id, 456, 2), 1000, Instant::now())
-                .is_err()
+        let now = Instant::now();
+        hub.receive(&packet(capture.id, 456, 1), 1000, now).unwrap();
+        hub.receive(
+            &packet(capture.id, 456, 152),
+            1000,
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+        hub.receive(
+            &packet(capture.id, 456, 153),
+            1000,
+            now + Duration::from_millis(1020),
+        )
+        .unwrap();
+        let frames = capture.drain().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames.iter().map(|f| f.loss_epoch).collect::<Vec<_>>(),
+            [0, 150, 150]
         );
-        assert!(capture.drain().is_err());
+        assert_eq!(
+            frames[1].at.duration_since(frames[0].at),
+            Duration::from_secs(1)
+        );
+        assert_eq!(capture.lost_packets(), 150);
         drop(capture);
         let capture = hub.begin(&observation).unwrap();
         observation.channel_id = Some("789".into());
         assert_eq!(hub.control(Some(&observation))["active"], false);
         assert!(capture.drain().is_err());
+    }
+    #[test]
+    fn brief_loss_is_visible_and_preserves_each_participant_and_timestamp() {
+        let hub = Hub::default();
+        let mut observation = observation();
+        let mut other = observation.participants[0].clone();
+        other.id = "789".into();
+        observation.participants.push(other);
+        assert_eq!(hub.control(Some(&observation))["pcm_batch"], true);
+        let capture = hub.begin(&observation).unwrap();
+        assert_eq!(hub.control(Some(&observation))["pcm_batch"], true);
+        let now = Instant::now();
+        hub.receive(&packet(capture.id, 456, 1), 1000, now).unwrap();
+        hub.receive(
+            &packet(capture.id, 789, 3),
+            1000,
+            now + Duration::from_millis(20),
+        )
+        .unwrap();
+        hub.receive(
+            &packet(capture.id, 456, 4),
+            1000,
+            now + Duration::from_millis(30),
+        )
+        .unwrap();
+        let frames = capture.drain().unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(
+            frames.iter().map(|f| f.loss_epoch).collect::<Vec<_>>(),
+            [0, 1, 1]
+        );
+        assert_eq!(frames[1].attribution.speakers[0].id, "789");
+        assert_eq!(frames[2].attribution.speakers[0].id, "456");
+        assert_eq!(
+            frames[2].at.duration_since(frames[0].at),
+            Duration::from_millis(30)
+        );
+        assert_eq!(capture.lost_packets(), 1);
+        // A real replay is not a recoverable loss and must never duplicate text.
+        assert!(hub.receive(&packet(capture.id, 456, 4), 1000, now).is_err());
+        assert!(capture.drain().is_err());
+        drop(capture);
+        assert_eq!(hub.begin(&observation).unwrap().lost_packets(), 0);
+    }
+
+    #[test]
+    fn repeated_gaps_remain_visible_without_discarding_subsequent_audio() {
+        let hub = Hub::default();
+        let observation = observation();
+        hub.control(Some(&observation));
+        let capture = hub.begin(&observation).unwrap();
+        let now = Instant::now();
+        for index in 1..=100 {
+            hub.receive(&packet(capture.id, 456, index * 2), 1000, now)
+                .unwrap();
+            let frames = capture.drain().unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].loss_epoch, index);
+        }
+        assert_eq!(capture.lost_packets(), 100);
+    }
+
+    #[test]
+    fn remote_network_silence_and_replaced_voice_callback_keep_the_same_capture() {
+        let hub = Hub::default();
+        let mut observation = observation();
+        hub.control(Some(&observation));
+        let capture = hub.begin(&observation).unwrap();
+        let start = Instant::now();
+        hub.receive(&packet(capture.id, 456, 1), 1000, start)
+            .unwrap();
+        let before = capture.drain().unwrap().remove(0);
+        // Discord remains in this channel and the local control connection is
+        // healthy, but remote network audio disappears for thirty seconds.
+        for _ in 0..120 {
+            observation.at = Instant::now();
+            let control = hub.control(Some(&observation));
+            assert_eq!(control["active"], true);
+            assert_eq!(control["capture_id"], capture.id.to_string());
+            assert!(capture.drain().unwrap().is_empty());
+        }
+        let mut resumed = packet(capture.id, 456, 2);
+        resumed[8..16].copy_from_slice(&2_u64.to_le_bytes());
+        hub.receive(&resumed, 1000, start + Duration::from_secs(30))
+            .unwrap();
+        let after = capture.drain().unwrap().remove(0);
+        assert_eq!(after.native_generation, 2);
+        assert_eq!(after.attribution.speakers, before.attribution.speakers);
+        assert_eq!(after.at.duration_since(before.at), Duration::from_secs(30));
+        assert_eq!(
+            capture.lost_packets(),
+            0,
+            "A network silence is not a missing local packet"
+        );
     }
     #[test]
     fn binary_parser_rejects_truncation_dimensions_reserved_and_stale_audio() {
@@ -425,19 +708,10 @@ mod tests {
     }
 
     #[test]
-    fn native_generation_and_lease_cannot_change_silently() {
+    fn native_lease_expiry_still_stops_capture() {
         let hub = Hub::default();
         let observation = observation();
         hub.control(Some(&observation));
-        let capture = hub.begin(&observation).unwrap();
-        hub.receive(&packet(capture.id, 456, 1), 1000, Instant::now())
-            .unwrap();
-        capture.drain().unwrap();
-        let mut changed = packet(capture.id, 456, 2);
-        changed[8..16].copy_from_slice(&2_u64.to_le_bytes());
-        assert!(hub.receive(&changed, 1000, Instant::now()).is_err());
-        assert!(capture.drain().is_err());
-        drop(capture);
         let capture = hub.begin(&observation).unwrap();
         hub.0.lock().unwrap().polled = Instant::now().checked_sub(LEASE + Duration::from_millis(1));
         assert!(!hub.ready());
@@ -446,6 +720,76 @@ mod tests {
                 .is_err()
         );
         assert!(capture.drain().is_err());
+    }
+
+    #[test]
+    fn callback_generations_are_per_participant_and_retired_streams_cannot_return() {
+        let hub = Hub::default();
+        let mut observation = observation();
+        let mut other = observation.participants[0].clone();
+        other.id = "789".into();
+        other.name = "Another speaker".into();
+        observation.participants.push(other);
+        hub.control(Some(&observation));
+        let capture = hub.begin(&observation).unwrap();
+        // The second person can still use an older native callback. A replacement
+        // for the first person must neither stop nor retire that other stream.
+        let deliveries = [
+            (456, 7_u64),
+            (789, 3),
+            (456, 9),
+            (456, 7),
+            (789, 3),
+            (456, 9),
+        ];
+        for (index, (user, generation)) in deliveries.into_iter().enumerate() {
+            let mut bytes = packet(capture.id, user, index as u64 + 1);
+            bytes[8..16].copy_from_slice(&generation.to_le_bytes());
+            bytes[64..66].copy_from_slice(&(index as i16 + 1).to_le_bytes());
+            hub.receive(&bytes, 1000, Instant::now()).unwrap();
+        }
+        let frames = capture.drain().unwrap();
+        assert_eq!(frames.len(), 5);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.samples[0])
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 5, 6]
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.native_generation)
+                .collect::<Vec<_>>(),
+            [7, 3, 9, 3, 9]
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.attribution.speakers[0].id.as_str())
+                .collect::<Vec<_>>(),
+            ["456", "789", "456", "789", "456"]
+        );
+        assert_eq!(capture.lost_packets(), 0);
+        // A real channel change still invalidates this capture and its identities.
+        observation.channel_id = Some("999".into());
+        assert_eq!(hub.control(Some(&observation))["active"], false);
+        assert!(capture.drain().is_err());
+    }
+
+    #[test]
+    fn zero_callback_generation_is_invalid_and_does_not_poison_capture() {
+        let hub = Hub::default();
+        let observation = observation();
+        hub.control(Some(&observation));
+        let capture = hub.begin(&observation).unwrap();
+        let mut invalid = packet(capture.id, 456, 1);
+        invalid[8..16].fill(0);
+        assert!(hub.receive(&invalid, 1000, Instant::now()).is_err());
+        hub.receive(&packet(capture.id, 456, 1), 1000, Instant::now())
+            .unwrap();
+        assert_eq!(capture.drain().unwrap().len(), 1);
     }
 
     #[test]

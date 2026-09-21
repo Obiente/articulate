@@ -1,10 +1,14 @@
 # Local dictation cleanup
 
-Articulate uses two separate stages. The existing lightweight Rust rules handle
-clear stutters and explicit date/number repairs without a model. Optional Polish
-edits a finished passage with a local language model and shows a comparison.
-Nothing is applied until the user chooses Apply. This changes the saved preview;
-it does not replace text in another app. Raw transcription remains available.
+Clean and Chat writing styles automatically remove common English fillers,
+short repeated phrases and supported explicit spoken corrections during dictation
+and before final insertion into another app. These shared Rust rules run without
+a language model or download. Verbatim keeps the original wording. Enabled
+vocabulary phrases and literal shortcut templates are preserved.
+
+Optional Polish adds a local language-model editing preview for punctuation and
+style. Its additional edits require Apply and update Articulate's saved text;
+they do not revise an external app after insertion. Raw transcription stays available.
 
 ## Model and runtime
 
@@ -65,18 +69,26 @@ The model sees only the selected passage, not other apps, document titles or
 conversation history. Expanded voice shortcuts keep their literal contents and
 are excluded from Polish.
 
-The comparison checks against the existing conservative-cleaned text, allowing
-earlier explicit repairs to remain intact. The current rejection gate preserves
+Polish builds a safe baseline by removing supported fillers such as an isolated
+"um", reducing short adjacent repetitions, and handling explicit bounded repairs
+such as "Tuesday, sorry, Thursday". It preserves ambiguous repetitions and
+phrases that could change negation, quantities or intent. The comparison checks
+the model output against this baseline, allowing those supported repairs to
+remain intact. The current rejection gate preserves
 ordered content words, numbers, symbols, saved phrases and unique clauses. It
 permits filler/article cleanup, limited subject/verb agreement, equivalent
 contractions, and reduction of exact adjacent repeated phrases. It rejects
 unfinished output, tool calls, reasoning output and unrequested substantive
-rewrites. A rejected result keeps the current wording and explains why.
+rewrites. If the model result is rejected, the After preview retains the safe baseline
+cleanup and explains that the additional model edit was rejected. When the rules
+find nothing safe to change, that preview can remain identical to the original.
+Nothing is applied without **Apply changes**.
 
 These checks do not prove semantic equivalence. Users review every accepted
 draft. Small-model trials showed useful punctuation, grammar and repeated-clause
 editing, but also incorrect handling of ambiguous self-corrections, spoken
-punctuation and quote markers. Those behaviors are not advertised as reliable.
+punctuation and quote markers. The bounded rules do not make arbitrary spoken mistakes or paragraph-level
+restarts reliable.
 The model is not used to guess what missing or misrecognized audio meant.
 
 ## Validation

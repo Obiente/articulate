@@ -104,11 +104,13 @@ pub struct Summary {
     pub highlights: Vec<Highlight>,
 }
 
+#[cfg(test)]
 pub struct Task {
     result: Receiver<Result<Summary, String>>,
     cancel: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 impl Task {
     pub fn poll(&self) -> Option<Result<Summary, String>> {
         match self.result.try_recv() {
@@ -121,6 +123,7 @@ impl Task {
     }
 }
 
+#[cfg(test)]
 impl Drop for Task {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -203,6 +206,7 @@ impl Drop for WorkerJob {
     }
 }
 
+#[cfg(test)]
 pub fn start(package: InstalledPackage, transcript: Transcript) -> Result<Task> {
     let profile = APPROVED_PROFILES
         .iter()
@@ -438,6 +442,7 @@ fn verify_task_package(
     Ok(())
 }
 
+#[cfg(test)]
 fn run(
     package: &InstalledPackage,
     profile: Option<&ApprovedProfile>,
@@ -934,6 +939,26 @@ mod tests {
     fn output(input: &Transcript) -> serde_json::Value {
         serde_json::json!({"transcript_id": input.id,"title": input.title,"goal": input.goal,"word_count":4,"source_segments":1,"highlights":[{"kind":"decision","importance":0.9,"source":input.segments[0]}]})
     }
+    #[test]
+    fn legacy_note_task_reports_worker_failure_and_cancels_on_drop() {
+        let (sender, result) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = Task {
+            result,
+            cancel: cancel.clone(),
+        };
+        assert!(task.poll().is_none());
+        sender.send(Err("Synthetic worker failure".into())).unwrap();
+        assert_eq!(
+            task.poll().unwrap().unwrap_err(),
+            "Synthetic worker failure"
+        );
+        drop(sender);
+        assert!(task.poll().unwrap().is_err());
+        drop(task);
+        assert!(cancel.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn unapproved_demo_cannot_launch() {
         assert!(APPROVED_PROFILES.is_empty());

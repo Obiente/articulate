@@ -5,6 +5,7 @@ use std::{net::TcpListener, time::SystemTime};
 const ENDPOINT: &str = "127.0.0.1:9223";
 const BODY_LIMIT: usize = 128 * 1024;
 const HEADER_LIMIT: usize = 4096;
+const BATCH_PACKETS: usize = 64;
 const STALE: Duration = Duration::from_millis(750);
 
 pub fn valid_token(token: &str) -> bool {
@@ -41,9 +42,17 @@ pub fn start(token: String) -> Result<Arc<Connection>> {
         TcpListener::bind(ENDPOINT).context("The Discord plugin port is already in use")?;
     listener.set_nonblocking(true)?;
     let shared = Arc::new(Shared {
-        pcm: super::pcm::Hub::default(),
+        pcm: if cfg!(test) {
+            super::pcm::Hub::default()
+        } else {
+            super::pcm::Hub::with_diagnostics(
+                crate::model::data_dir().join("logs/discord-audio.json"),
+            )
+        },
         state: Mutex::new(State {
             snapshot: Snapshot {
+                audio_status: None,
+                companion_revision: None,
                 status: Status::Connecting,
                 observation: None,
             },
@@ -86,9 +95,10 @@ fn serve(listener: TcpListener, token: &str, shared: &Shared) {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
                 let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
                 let result = receive(&mut stream, token);
+                let request_complete = result.is_ok();
                 let mut response = String::new();
                 let status = match result {
-                    Ok(Incoming::Voice(observation, timestamp))
+                    Ok(Incoming::Voice(observation, timestamp, revision, audio_status))
                         if timestamp > last_timestamp
                             && last_good
                                 .is_none_or(|at| at.elapsed() >= Duration::from_millis(40)) =>
@@ -96,10 +106,10 @@ fn serve(listener: TcpListener, token: &str, shared: &Shared) {
                         last_timestamp = timestamp;
                         last_good = Some(Instant::now());
                         stale = false;
-                        shared.publish(observation);
+                        shared.publish_companion(observation, revision, audio_status);
                         "204 No Content"
                     }
-                    Ok(Incoming::Voice(_, _)) => "429 Too Many Requests",
+                    Ok(Incoming::Voice(_, _, _, _)) => "429 Too Many Requests",
                     Ok(Incoming::Control) => {
                         let observation = shared
                             .state
@@ -110,6 +120,13 @@ fn serve(listener: TcpListener, token: &str, shared: &Shared) {
                             .clone();
                         response = shared.pcm.control(observation.as_ref()).to_string();
                         "200 OK"
+                    }
+                    Ok(Incoming::Diagnostics(bytes)) => {
+                        if shared.pcm.report_diagnostics(&bytes).is_ok() {
+                            "204 No Content"
+                        } else {
+                            "400 Bad Request"
+                        }
                     }
                     Ok(Incoming::Pcm(bytes)) => {
                         let now = SystemTime::now()
@@ -123,6 +140,22 @@ fn serve(listener: TcpListener, token: &str, shared: &Shared) {
                             "400 Bad Request"
                         }
                     }
+                    Ok(Incoming::PcmBatch(bytes)) => {
+                        let now = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .map(|d| d.as_micros() as u64);
+                        if now.is_ok_and(|now| {
+                            pcm_batch(&bytes).is_ok_and(|packets| {
+                                packets.into_iter().all(|packet| {
+                                    shared.pcm.receive(packet, now, Instant::now()).is_ok()
+                                })
+                            })
+                        }) {
+                            "204 No Content"
+                        } else {
+                            "400 Bad Request"
+                        }
+                    }
                     Err(_) => "400 Bad Request",
                 };
                 let response = format!(
@@ -130,7 +163,13 @@ fn serve(listener: TcpListener, token: &str, shared: &Shared) {
                     response.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
-                finish_response(&mut stream);
+                if request_complete {
+                    // All declared bytes were consumed. Waiting for the client's
+                    // close here serializes every audio request behind a timeout.
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                } else {
+                    finish_response(&mut stream);
+                }
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -198,13 +237,17 @@ fn token_matches(left: &str, right: &str) -> bool {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
+    Diagnostics,
     Voice,
     Pcm,
+    PcmBatch,
     Control,
 }
 enum Incoming {
-    Voice(Observation, u64),
+    Diagnostics(Vec<u8>),
+    Voice(Observation, u64, Option<String>, Option<String>),
     Pcm(Vec<u8>),
+    PcmBatch(Vec<u8>),
     Control,
 }
 fn request_headers(headers: &str, token: &str) -> Result<(Route, usize)> {
@@ -212,7 +255,9 @@ fn request_headers(headers: &str, token: &str) -> Result<(Route, usize)> {
     let route = match lines.next() {
         Some("POST /voice HTTP/1.1") => Route::Voice,
         Some("POST /pcm HTTP/1.1") => Route::Pcm,
+        Some("POST /pcm-batch HTTP/1.1") => Route::PcmBatch,
         Some("GET /capture HTTP/1.1") => Route::Control,
+        Some("POST /diagnostics HTTP/1.1") => Route::Diagnostics,
         _ => bail!("Unsupported request"),
     };
     let mut fields = std::collections::HashMap::new();
@@ -236,7 +281,7 @@ fn request_headers(headers: &str, token: &str) -> Result<(Route, usize)> {
     );
     ensure!(
         fields.get("content-type")
-            == Some(&if route == Route::Pcm {
+            == Some(&if matches!(route, Route::Pcm | Route::PcmBatch) {
                 "application/octet-stream"
             } else {
                 "application/json"
@@ -256,7 +301,9 @@ fn request_headers(headers: &str, token: &str) -> Result<(Route, usize)> {
         match route {
             Route::Voice => (1..=BODY_LIMIT).contains(&length),
             Route::Pcm => (64..=super::pcm::MAX_PACKET).contains(&length),
+            Route::PcmBatch => (68..=BODY_LIMIT).contains(&length),
             Route::Control => length == 0,
+            Route::Diagnostics => (1..=4096).contains(&length),
         },
         "Payload limit exceeded"
     );
@@ -299,18 +346,49 @@ fn receive(stream: &mut TcpStream, token: &str) -> Result<Incoming> {
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_millis() as u64;
     match route {
-        Route::Voice => {
-            decode(&bytes[split..], now, Instant::now()).map(|(o, t)| Incoming::Voice(o, t))
-        }
+        Route::Voice => decode(&bytes[split..], now, Instant::now())
+            .map(|(o, t, r, a)| Incoming::Voice(o, t, r, a)),
         Route::Pcm => Ok(Incoming::Pcm(bytes[split..].to_vec())),
+        Route::PcmBatch => {
+            pcm_batch(&bytes[split..])?;
+            Ok(Incoming::PcmBatch(bytes[split..].to_vec()))
+        }
         Route::Control => Ok(Incoming::Control),
+        Route::Diagnostics => Ok(Incoming::Diagnostics(bytes[split..].to_vec())),
     }
+}
+
+fn pcm_batch(mut bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= BODY_LIMIT,
+        "Invalid PCM batch size"
+    );
+    let mut packets = Vec::new();
+    while !bytes.is_empty() {
+        ensure!(
+            packets.len() < BATCH_PACKETS && bytes.len() >= 4,
+            "Invalid PCM batch framing"
+        );
+        let length = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        bytes = &bytes[4..];
+        ensure!(
+            (64..=super::pcm::MAX_PACKET).contains(&length) && length <= bytes.len(),
+            "Invalid PCM batch packet size"
+        );
+        packets.push(&bytes[..length]);
+        bytes = &bytes[length..];
+    }
+    Ok(packets)
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Payload {
     version: u8,
+    #[serde(default)]
+    companion_revision: Option<String>,
+    #[serde(default)]
+    audio_status: Option<String>,
     observed_ms: u64,
     channel_id: Option<String>,
     participants: Vec<PluginParticipant>,
@@ -328,8 +406,40 @@ struct PluginParticipant {
     avatar: Option<super::avatar::Avatar>,
 }
 
-fn decode(bytes: &[u8], now: u64, received: Instant) -> Result<(Observation, u64)> {
+type DecodedVoice = (Observation, u64, Option<String>, Option<String>);
+fn decode(bytes: &[u8], now: u64, received: Instant) -> Result<DecodedVoice> {
     let payload: Payload = serde_json::from_slice(bytes)?;
+    ensure!(
+        payload
+            .audio_status
+            .as_deref()
+            .is_none_or(|status| matches!(
+                status,
+                "disabled"
+                    | "addon-unavailable"
+                    | "preload-unavailable"
+                    | "waiting"
+                    | "waiting-for-voice-engine"
+                    | "unsupported-native-build"
+                    | "native-hook-unavailable"
+                    | "waiting-for-articulate"
+                    | "ready"
+                    | "capturing"
+                    | "control-unavailable"
+                    | "audio-transport-unavailable"
+            )),
+        "Invalid audio status"
+    );
+    ensure!(
+        payload
+            .companion_revision
+            .as_ref()
+            .is_none_or(|revision| revision.len() == 64
+                && revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
+        "Invalid companion revision"
+    );
     ensure!(
         payload.version == 1
             && payload.observed_ms <= now + 50
@@ -374,12 +484,111 @@ fn decode(bytes: &[u8], now: u64, received: Instant) -> Result<(Observation, u64
             valid: sample.valid,
         },
         payload.observed_ms,
+        payload.companion_revision,
+        payload.audio_status,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn batch_bytes(packets: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for packet in packets {
+            bytes.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(packet);
+        }
+        bytes
+    }
+
+    #[test]
+    fn batches_preserve_order_and_reject_truncated_oversized_or_excess_frames() {
+        let packets = vec![vec![1; 64], vec![2; 128], vec![3; 64]];
+        let bytes = batch_bytes(&packets);
+        assert_eq!(
+            pcm_batch(&bytes).unwrap(),
+            packets.iter().map(Vec::as_slice).collect::<Vec<_>>()
+        );
+        assert!(pcm_batch(&[]).is_err());
+        assert!(pcm_batch(&bytes[..bytes.len() - 1]).is_err());
+        assert!(pcm_batch(&batch_bytes(&[vec![0; 63]])).is_err());
+        assert!(pcm_batch(&batch_bytes(&[vec![0; super::super::pcm::MAX_PACKET + 1]])).is_err());
+        assert!(pcm_batch(&batch_bytes(&vec![vec![0; 64]; BATCH_PACKETS + 1])).is_err());
+        assert!(pcm_batch(&vec![0; BODY_LIMIT + 1]).is_err());
+        let token = "a".repeat(64);
+        let header = format!(
+            "POST /pcm-batch HTTP/1.1\r\nHost: {ENDPOINT}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}",
+            bytes.len()
+        );
+        assert!(matches!(
+            request_headers(&header, &token),
+            Ok((Route::PcmBatch, _))
+        ));
+        assert!(request_headers(&header, &"b".repeat(64)).is_err());
+        assert!(
+            request_headers(&format!("{header}\r\nOrigin: https://example.test"), &token).is_err()
+        );
+    }
+
+    #[test]
+    fn diagnostics_require_authentication_json_and_a_small_body() {
+        let token = "a".repeat(64);
+        let header = format!(
+            "POST /diagnostics HTTP/1.1\r\nHost: {ENDPOINT}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: 128"
+        );
+        assert!(matches!(
+            request_headers(&header, &token),
+            Ok((Route::Diagnostics, 128))
+        ));
+        assert!(request_headers(&header, &"b".repeat(64)).is_err());
+        assert!(
+            request_headers(
+                &format!("{header}\r\nOrigin: https://example.invalid"),
+                &token
+            )
+            .is_err()
+        );
+        assert!(request_headers(&header.replace("128", "4097"), &token).is_err());
+        assert!(
+            request_headers(&header.replace("application/json", "text/plain"), &token).is_err()
+        );
+    }
+
+    #[test]
+    fn running_revision_is_optional_for_old_companions_and_strict_when_present() {
+        let mut body = json!({"version":1,"observed_ms":1000,"channel_id":null,"participants":[],"valid":true});
+        assert!(
+            decode(body.to_string().as_bytes(), 1000, Instant::now())
+                .unwrap()
+                .2
+                .is_none()
+        );
+        let revision = "a".repeat(64);
+        body["companion_revision"] = json!(revision);
+        assert_eq!(
+            decode(body.to_string().as_bytes(), 1000, Instant::now())
+                .unwrap()
+                .2
+                .as_deref(),
+            Some(revision.as_str())
+        );
+        for invalid in ["short".into(), "A".repeat(64), "g".repeat(64)] {
+            body["companion_revision"] = json!(invalid);
+            assert!(decode(body.to_string().as_bytes(), 1000, Instant::now()).is_err());
+        }
+        body["companion_revision"] = json!(revision);
+        body["audio_status"] = json!("native-hook-unavailable");
+        assert_eq!(
+            decode(body.to_string().as_bytes(), 1000, Instant::now())
+                .unwrap()
+                .3
+                .as_deref(),
+            Some("native-hook-unavailable")
+        );
+        body["audio_status"] = json!("unbounded diagnostic text");
+        assert!(decode(body.to_string().as_bytes(), 1000, Instant::now()).is_err());
+    }
 
     #[test]
     fn pairing_keys_are_random_and_valid() {
@@ -429,7 +638,8 @@ mod tests {
         let mut body = json!({"version":1,"observed_ms":1000,"channel_id":"123","valid":true,
             "participants":[{"id":"456","name":"Example","speaking":true,"is_self":false,
                 "avatar":{"user_id":"456","hash":"0123456789abcdef0123456789abcdef"}}]});
-        let (observation, _) = decode(body.to_string().as_bytes(), 1100, Instant::now()).unwrap();
+        let (observation, _, _, _) =
+            decode(body.to_string().as_bytes(), 1100, Instant::now()).unwrap();
         assert_eq!(
             observation.participants[0].avatar.as_ref().unwrap().user_id,
             "456"
@@ -455,6 +665,8 @@ mod tests {
             pcm: super::super::pcm::Hub::default(),
             state: Mutex::new(State {
                 snapshot: Snapshot {
+                    audio_status: None,
+                    companion_revision: None,
                     status: Status::Connecting,
                     observation: None,
                 },
@@ -478,7 +690,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let body = json!({"version":1,"observed_ms":now,"channel_id":"123","valid":true,
+        let body = json!({"version":1,"observed_ms":now,"channel_id":"123","valid":true,"companion_revision":"a".repeat(64),
             "participants":[{"id":"456","name":"Example","speaking":true,"is_self":false}]})
         .to_string();
         let mut stream = TcpStream::connect(address).unwrap();
@@ -495,11 +707,16 @@ mod tests {
         stream.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 204"));
         assert!(matches!(connection.snapshot().status, Status::Ready));
+        assert_eq!(
+            connection.snapshot().companion_revision.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(connection.snapshot().status, Status::Ready) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(connection.snapshot().observation.is_none());
+        assert!(connection.snapshot().companion_revision.is_none());
         let shutdown = Instant::now();
         drop(connection);
         assert!(shutdown.elapsed() < Duration::from_secs(1));
@@ -515,6 +732,8 @@ mod tests {
             pcm: super::super::pcm::Hub::default(),
             state: Mutex::new(State {
                 snapshot: Snapshot {
+                    audio_status: None,
+                    companion_revision: None,
                     status: Status::Connecting,
                     observation: None,
                 },
@@ -548,7 +767,7 @@ mod tests {
             stream
                 .set_write_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let content_type = if route == "/pcm" {
+            let content_type = if matches!(route, "/pcm" | "/pcm-batch") {
                 "application/octet-stream"
             } else {
                 "application/json"
@@ -616,6 +835,7 @@ mod tests {
             .as_millis();
         let body = json!({"version":1,"observed_ms":now,"channel_id":"123","valid":true,
             "participants":[{"id":"456","name":"Remote example","speaking":true,"is_self":false},
+                {"id":"901","name":"Second remote example","speaking":true,"is_self":false},
                 {"id":"789","name":"Local example","speaking":true,"is_self":true}]})
         .to_string();
         assert!(exchange("POST", "/voice", &token, body.as_bytes()).starts_with("HTTP/1.1 204"));
@@ -630,7 +850,7 @@ mod tests {
         let armed = control();
         assert_eq!(armed["active"], true);
         assert_eq!(armed["channel_id"], "123");
-        assert_eq!(armed["participants"], json!(["456"]));
+        assert_eq!(armed["participants"], json!(["456", "901"]));
         let nonce = armed["capture_id"]
             .as_str()
             .unwrap()
@@ -668,8 +888,37 @@ mod tests {
         assert_eq!(&frames[0].samples[..2], &[1, -1]);
         assert_eq!(frames[0].attribution.speakers[0].name, "Remote example");
         assert_eq!(frames[0].attribution.speakers[0].id, "456");
+        let packets: Vec<_> = (201..=264)
+            .map(|sequence| packet(nonce, if sequence % 2 == 0 { 901 } else { 456 }, sequence))
+            .collect();
+        let mut malformed = batch_bytes(&packets[..1]);
+        malformed.extend_from_slice(&[1, 2, 3]);
+        assert!(exchange("POST", "/pcm-batch", &token, &malformed).starts_with("HTTP/1.1 400"));
         assert!(
-            exchange("POST", "/pcm", &token, &packet(nonce, 456, 200)).starts_with("HTTP/1.1 400")
+            capture.drain().unwrap().is_empty(),
+            "Malformed batch framing must not partially deliver audio"
+        );
+        let batch = batch_bytes(&packets);
+        assert!(exchange("POST", "/pcm-batch", &invalid_key, &batch).starts_with("HTTP/1.1 400"));
+        let batch_started = Instant::now();
+        assert!(
+            exchange_parts("POST", "/pcm-batch", &token, &batch, true).starts_with("HTTP/1.1 204")
+        );
+        assert!(
+            batch_started.elapsed() < Duration::from_millis(600),
+            "Two participants' 640 ms of PCM must arrive faster than real time"
+        );
+        let frames = capture.drain().unwrap();
+        assert_eq!(frames.len(), 64);
+        for (index, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                frame.attribution.speakers[0].id,
+                if index % 2 == 0 { "456" } else { "901" }
+            );
+            assert_eq!(frame.samples.len(), 960);
+        }
+        assert!(
+            exchange("POST", "/pcm", &token, &packet(nonce, 456, 264)).starts_with("HTTP/1.1 400")
         );
         assert!(
             capture.drain().is_err(),

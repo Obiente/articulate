@@ -5,9 +5,14 @@ Windows 10/11, 64-bit Intel or AMD. No account or subscription.
 The installer runs for your Windows user and needs no administrator access.
 For the portable ZIP, extract the whole folder before opening Articulate.exe.
 Keep all DLLs beside the app.
+The interface requires Microsoft Edge WebView2 Evergreen Runtime. Setup checks
+for it and opens Microsoft's download page if it is missing. For the portable
+ZIP, install the runtime before opening the app if Windows does not have it:
+https://developer.microsoft.com/microsoft-edge/webview2/#download-section
+Node.js and a development server are not needed to run Articulate.
 
 FIRST START
-1. Open Settings and choose Download recommended model (about 2.19 GB).
+1. Open Settings and choose Download model (about 2.19 GB).
 2. Choose your microphone. Use headphones for call transcripts.
 3. Hold Ctrl+Alt+Space to dictate. Release to finish. Double-press for
    hands-free recording, then press once to finish. Settings offers toggle
@@ -26,14 +31,11 @@ recommended; CPU-only operation is supported. If GPU loading fails, choose
 CPU only in Settings. First GPU loading can take longer while it warms up.
 
 LOCAL TEXT CLEANUP
-Choose Polish after dictation to preview punctuation and grammar changes.
-The optional local editor downloads once (about 852 MB). Compare the result
-before applying it. The original remains available. Copy the polished text
-to use it elsewhere; text already inserted into another app is not replaced.
+Finished dictation receives local cleanup before insertion. Original
+transcripts remain available in the library.
 
 UPDATES
-Settings > Updates & about checks GitHub only when you request it. Available updates
-download separately and are checked against the release's SHA-256 digest.
+Download updated installers from github.com/Obiente/articulate/releases.
 Finish any recording before installing. Models and saved sessions are kept.
 This initial release is not code-signed. Windows may show an unknown-publisher
 warning. Obtain builds only from github.com/Obiente/articulate/releases.
@@ -45,7 +47,8 @@ There is no cloud transcription, telemetry, account or automatic sync.
 
 NOTETAKER
 Choose New note to write without a microphone or model. Personal notes save
-automatically and remain separate from reviewed Highlights and Transcript.
+automatically. Open a conversation to switch between its notes document and
+its transcript. Notes can update during a call when the notes model is ready.
 The active conversation card returns to capture without restarting it.
 
 CALLS AND DISCORD
@@ -55,7 +58,7 @@ Capture waits for that connection rather than silently using mixed audio.
 Live callback behavior still needs validation on supported Discord builds.
 The debugger connection provides activity names only and cannot separate
 overlapping mixed audio. See docs/vencord.md in the repository.
-Notes are reviewable highlights and possible actions quoted from the transcript.
+Review generated notes against the transcript before relying on them.
 
 FEEDBACK
 Use github.com/Obiente/articulate/issues. Include app version, Windows version,
@@ -67,6 +70,6 @@ Licenses for the app, runtime, fonts and dependencies are in licenses/.
 
 SUMMARIES AND INSIGHTS
 Download the optional summary model in Settings (about 3.16 GB on first setup).
-Open a saved call or dictation, choose Summary, generate and review its sources,
-then save. My notes and the transcript stay separate. Search finds phrases in
-saved content. Insights shows your retained dictation usage on this device.
+Open a saved conversation and use Update notes to generate a notes document.
+Notes and the transcript stay separate. Search finds phrases in saved content.
+Insights shows your retained dictation usage on this device.

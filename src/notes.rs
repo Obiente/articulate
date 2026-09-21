@@ -16,8 +16,13 @@ pub struct Quote {
 }
 
 impl Quote {
+    #[allow(
+        dead_code,
+        reason = "Preserve source-attributed note export for React export controls"
+    )]
     pub fn attribution(&self, names: &[String; 4]) -> String {
         let row = Row {
+            cues: Vec::new(),
             start_ms: self.start_ms,
             end_ms: self.end_ms,
             microphone: self.microphone,
@@ -39,6 +44,10 @@ impl Quote {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "Used by the retained source-attributed note export API"
+)]
 fn timestamp(ms: u64) -> String {
     format!("{:02}:{:02}", ms / 60_000, ms / 1_000 % 60)
 }
@@ -260,12 +269,17 @@ impl Notes {
 
     /// Call rows are append-only; adjacent same-speaker sections can extend the
     /// final row without changing row count.
+    #[cfg(test)]
     pub fn is_current(&self, rows: &[Row]) -> bool {
         self.source_rows == rows.len()
             && self.source_end == rows.last().map_or(0, |row| row.end_ms)
             && self.source_last_bytes == rows.last().map_or(0, |row| row.text.len())
     }
 
+    #[allow(
+        dead_code,
+        reason = "Preserve plain-text note export for React export controls"
+    )]
     pub fn text(&self, names: &[String; 4]) -> String {
         let mut text = String::from(
             "Meeting notes\nSelected transcript quotes; timestamps refer to source sections.\n",
@@ -296,6 +310,7 @@ mod tests {
 
     fn row(start_ms: u64, text: &str) -> Row {
         Row {
+            cues: Vec::new(),
             start_ms,
             end_ms: start_ms + 8000,
             microphone: false,

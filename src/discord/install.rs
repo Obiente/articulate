@@ -8,6 +8,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::OnceLock,
     thread,
     time::{Duration, Instant},
 };
@@ -76,10 +77,31 @@ fn current_native_payload(source: &Path) -> Result<bool> {
         &source.join("dist/.articulate-build.json"),
         16384,
     )?)?;
-    Ok(native_payload_available()
-        && NATIVE_FILES
+    if !native_payload_available()
+        || manifest.schema != 1
+        || manifest.revision != bundled_manifest().revision
+        || !NATIVE_FILES
             .iter()
-            .all(|(name, bytes)| manifest.files.get(*name) == Some(&hash(bytes))))
+            .all(|(name, bytes)| manifest.files.get(*name) == Some(&hash(bytes)))
+    {
+        return Ok(false);
+    }
+    // The receipt alone is not proof that the running build is intact. An
+    // updater or a partial copy may replace/delete artifacts while leaving it.
+    for name in CORE_ARTIFACTS
+        .into_iter()
+        .chain(NATIVE_FILES.iter().map(|(name, _)| *name))
+    {
+        let artifact = source.join("dist").join(name);
+        if !artifact.is_file() {
+            return Ok(false);
+        }
+        ordinary(&artifact)?;
+        if manifest.files.get(name) != Some(&hash(&bounded_read(&artifact, 16 * 1024 * 1024)?)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 const FILES: [(&str, &[u8]); 3] = [
     (
@@ -97,6 +119,10 @@ const FILES: [(&str, &[u8]); 3] = [
 ];
 
 #[derive(Clone, Debug, Default)]
+#[allow(
+    dead_code,
+    reason = "Preserve complete detection state for React companion setup"
+)]
 pub struct Detection {
     pub installed: bool,
     pub source: Option<PathBuf>,
@@ -119,6 +145,10 @@ pub struct Plan {
 }
 
 #[derive(Debug)]
+#[allow(
+    dead_code,
+    reason = "Preserve installation result details for React companion setup"
+)]
 pub struct InstallReport {
     pub changed: bool,
     pub built: bool,
@@ -136,14 +166,53 @@ fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+const REVISION_PLACEHOLDER: &str = "__ARTICULATE_COMPANION_REVISION__";
+
+fn companion_revision(plugin: &[(&str, &[u8])], native: &[(&str, &[u8])]) -> String {
+    let mut inventory = BTreeMap::new();
+    for (prefix, files) in [("plugin", plugin), ("native", native)] {
+        for (name, bytes) in files {
+            inventory.insert(format!("{prefix}/{name}"), hash(bytes));
+        }
+    }
+    hash(&serde_json::to_vec(&inventory).unwrap())
+}
+
+pub fn bundled_revision() -> String {
+    static REVISION: OnceLock<String> = OnceLock::new();
+    REVISION
+        .get_or_init(|| companion_revision(&FILES, &NATIVE_FILES))
+        .clone()
+}
+
+fn rendered_files() -> &'static [(&'static str, Vec<u8>)] {
+    static RENDERED: OnceLock<Vec<(&'static str, Vec<u8>)>> = OnceLock::new();
+    RENDERED.get_or_init(|| {
+        let revision = bundled_revision();
+        FILES
+            .iter()
+            .map(|(name, bytes)| {
+                let bytes = if *name == "index.ts" {
+                    String::from_utf8_lossy(bytes)
+                        .replace(REVISION_PLACEHOLDER, &revision)
+                        .into_bytes()
+                } else {
+                    bytes.to_vec()
+                };
+                (*name, bytes)
+            })
+            .collect()
+    })
+}
+
 fn bundled_manifest() -> Manifest {
-    let files: BTreeMap<_, _> = FILES
+    let files: BTreeMap<_, _> = rendered_files()
         .iter()
         .map(|(name, bytes)| ((*name).into(), hash(bytes)))
         .collect();
     Manifest {
         schema: 1,
-        revision: hash(&serde_json::to_vec(&files).unwrap()),
+        revision: bundled_revision(),
         files,
     }
 }
@@ -408,7 +477,7 @@ pub fn install(request: &Plan, rebuild: bool, progress: impl Fn(&str)) -> Result
         let identity = super::plugin::new_token()?;
         let stage = scratch.join(format!("staging-{identity}"));
         fs::create_dir(&stage)?;
-        for (name, bytes) in FILES {
+        for (name, bytes) in rendered_files() {
             write_new(&stage.join(name), bytes)?;
         }
         write_new(
@@ -1011,6 +1080,71 @@ mod tests {
         }
     }
     #[test]
+    fn companion_revision_covers_templates_native_payload_and_preload() {
+        let plugin: &[(&str, &[u8])] = &[("index.ts", b"plugin")];
+        let native: &[(&str, &[u8])] = &[("adapter.node", b"adapter"), ("preload.cjs", b"preload")];
+        let original = companion_revision(plugin, native);
+        assert_eq!(original.len(), 64);
+        assert_eq!(original, companion_revision(plugin, native));
+        assert_ne!(
+            original,
+            companion_revision(&[("index.ts", b"changed")], native)
+        );
+        assert_ne!(
+            original,
+            companion_revision(
+                plugin,
+                &[("adapter.node", b"changed"), ("preload.cjs", b"preload")]
+            )
+        );
+        assert_ne!(
+            original,
+            companion_revision(
+                plugin,
+                &[("adapter.node", b"adapter"), ("preload.cjs", b"changed")]
+            )
+        );
+        assert_eq!(
+            bundled_revision(),
+            companion_revision(&FILES, &NATIVE_FILES)
+        );
+    }
+
+    #[test]
+    fn installed_revision_matches_receipt_and_stale_compiled_source_needs_update() {
+        let fixture = Fixture::new();
+        install(&plan(&fixture.0).unwrap(), false, |_| {}).unwrap();
+        let plugin = fixture.0.join("src/userplugins/articulate");
+        let index = fs::read_to_string(plugin.join("index.ts")).unwrap();
+        let mut manifest: Manifest =
+            serde_json::from_slice(&fs::read(plugin.join(MANIFEST)).unwrap()).unwrap();
+        assert_eq!(manifest.revision, bundled_revision());
+        assert!(index.contains(&format!(
+            "const compiledRevision = \"{}\"",
+            manifest.revision
+        )));
+        assert!(!index.contains(REVISION_PLACEHOLDER));
+        assert_eq!(manifest.files["index.ts"], hash(index.as_bytes()));
+        let stale = "0".repeat(64);
+        assert_ne!(manifest.revision, stale);
+        let index = index.replace(&manifest.revision, &stale);
+        manifest.revision = stale;
+        manifest
+            .files
+            .insert("index.ts".into(), hash(index.as_bytes()));
+        fs::write(plugin.join("index.ts"), index).unwrap();
+        fs::write(
+            plugin.join(MANIFEST),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan(&fixture.0).unwrap().status,
+            PluginStatus::UpdateAvailable
+        );
+    }
+
+    #[test]
     fn installs_idempotently_and_refuses_user_changes() {
         let fixture = Fixture::new();
         let request = plan(&fixture.0).unwrap();
@@ -1136,8 +1270,23 @@ mod tests {
         )
         .unwrap();
         verify_build(&fixture.0).unwrap();
-        fs::write(fixture.0.join("dist/renderer.js"), "changed").unwrap();
+        assert_eq!(plan(&fixture.0).unwrap().status, PluginStatus::Current);
+        let renderer = fixture.0.join("dist/renderer.js");
+        fs::write(&renderer, "changed").unwrap();
         assert!(verify_build(&fixture.0).is_err());
+        if native_payload_available() {
+            assert_eq!(
+                plan(&fixture.0).unwrap().status,
+                PluginStatus::UpdateAvailable
+            );
+            fs::write(&renderer, "synthetic build").unwrap();
+            assert_eq!(plan(&fixture.0).unwrap().status, PluginStatus::Current);
+            fs::remove_file(fixture.0.join("dist").join(NATIVE_FILES[0].0)).unwrap();
+            assert_eq!(
+                plan(&fixture.0).unwrap().status,
+                PluginStatus::UpdateAvailable
+            );
+        }
     }
 
     #[test]

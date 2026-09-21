@@ -1,15 +1,9 @@
 use super::*;
 use crate::discord::install::{self, Detection, InstallReport, Plan, PluginStatus};
 use crate::discord::{Snapshot, Status};
-use theme::{LINE, MUTED, SURFACE};
-
-const SETUP_COMMAND: &str = r#"$discordApp = Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA 'Discord') -Directory -Filter 'app-*' | Where-Object { $_.Name -match '^app-\d+(\.\d+)+$' -and (Test-Path -LiteralPath (Join-Path $_.FullName 'Discord.exe')) } | Sort-Object { [version]$_.Name.Substring(4) } -Descending | Select-Object -First 1
-if ($null -eq $discordApp) { throw 'Discord installation not found.' }
-& (Join-Path $discordApp.FullName 'Discord.exe') --remote-debugging-port=9222 --remote-debugging-address=127.0.0.1"#;
 
 #[derive(Default)]
 pub(super) struct LaunchState {
-    pub(super) confirm: bool,
     pending: Option<Receiver<Result<(), String>>>,
     error: Option<String>,
     companion: CompanionState,
@@ -49,6 +43,7 @@ enum AutoAction {
 pub(super) struct AutoCall {
     joined: Option<(String, Instant)>,
     left: Option<Instant>,
+    unavailable_since: Option<Instant>,
     owned: Option<String>,
     suppressed: Option<String>,
     retry_at: Option<Instant>,
@@ -101,7 +96,11 @@ impl AutoCall {
             self.manual_finish();
             self.joined = None;
             self.left = None;
+            self.unavailable_since = None;
             return None;
+        }
+        if presence != Presence::Unknown {
+            self.unavailable_since = None;
         }
         if !active && let Some(channel) = self.owned.take() {
             self.suppressed = Some(channel);
@@ -110,6 +109,17 @@ impl AutoCall {
             Presence::Unknown => {
                 self.joined = None;
                 self.left = None;
+                // Discord can exit without publishing a leave event. Brief
+                // reconnects are tolerated, but an automatic system-audio
+                // capture must not continue indefinitely without call presence.
+                let since = *self.unavailable_since.get_or_insert(now);
+                if active
+                    && !stopping
+                    && self.owned.is_some()
+                    && now.duration_since(since) >= Duration::from_secs(5)
+                {
+                    return Some(AutoAction::Stop);
+                }
             }
             Presence::Out => {
                 self.joined = None;
@@ -180,6 +190,10 @@ enum CompanionEvent {
     NativeState(bool),
 }
 
+#[allow(
+    dead_code,
+    reason = "Companion installation operations retained for Tauri setup"
+)]
 enum CompanionAction {
     Detect(Option<PathBuf>),
     Install(PathBuf),
@@ -188,19 +202,145 @@ enum CompanionAction {
 }
 
 impl App {
-    #[cfg(test)]
-    pub(super) fn prepare_companion_capture(&mut self) {
-        self.settings.discord_companion = true;
-        self.settings.discord_pairing_key.clear();
-        self.settings.vencord_source.clear();
-        self.settings.vencord_auto_update = false;
-        self.settings.discord_auto_connect = false;
-        self.settings.discord_auto_transcribe = false;
-        self.discord_launch.companion = CompanionState {
-            checked: true,
-            detection: Some(Detection::default()),
-            ..Default::default()
+    pub(super) fn desktop_discord_status(&self) -> serde_json::Value {
+        let snapshot = self
+            .discord
+            .as_ref()
+            .map(|connection| connection.snapshot());
+        let (status, connection_error) = match snapshot.as_ref().map(|s| &s.status) {
+            Some(Status::Ready) => ("ready", None),
+            Some(Status::Connecting) => ("connecting", None),
+            Some(Status::Unavailable(error)) => ("unavailable", Some(error.as_str())),
+            None => ("disconnected", None),
         };
+        let companion = &self.discord_launch.companion;
+        let plan = companion.plan.as_ref();
+        let observation = snapshot.as_ref().and_then(current_observation);
+        let connected = observation.is_some();
+        let in_voice = observation.is_some_and(|o| o.channel_id.is_some());
+        let audio_ready = self
+            .discord
+            .as_ref()
+            .is_some_and(|c| c.native_audio_ready());
+        let runtime_status = companion_runtime_status(
+            plan.map(|p| p.status),
+            companion.native_enabled,
+            connected,
+            snapshot
+                .as_ref()
+                .and_then(|s| s.companion_revision.as_deref()),
+            &install::bundled_revision(),
+        );
+        let audio_status = snapshot
+            .as_ref()
+            .filter(|_| connected)
+            .and_then(|s| s.audio_status.as_deref());
+        serde_json::json!({"connected":connected,"listener_started":self.discord.is_some(),"status":status,
+            "in_voice":in_voice,"audio_ready":audio_ready,
+            "audio_status":audio_status,"audio_message":if audio_ready {None} else {companion_audio_message(audio_status)},
+            "pairing_state":if connected {"paired"} else if self.discord.is_some() {"waiting"} else {"automatic"},
+            "automatic_can_retry":self.settings.discord_auto_transcribe && self.call.is_none() && (self.discord_launch.automation.suppressed.is_some() || self.discord_launch.automation.failed_attempts > 0 || self.discord_launch.error.is_some() || (!self.ready && !self.loading && self.discord_launch.automatic_model_attempt.is_some())),
+            "error":self.discord_launch.error.as_deref().or(connection_error),
+            "relaunching":self.discord_launch.pending.is_some(),"companion_selected":self.settings.discord_companion,
+            "automatic_status":self.discord_launch.automatic_status,
+            "companion":{"checked":companion.checked,"installed":companion.detection.as_ref().is_some_and(|d|d.installed),
+                "runtime_status":runtime_status,
+                "source_found":plan.is_some(),"active":companion.detection.as_ref().is_some_and(|d|d.selected_active),
+                "busy":companion.pending.is_some(),"status":companion.progress,"error":companion.error,
+                "plugin_status":plan.map(|p|match p.status {PluginStatus::Missing=>"missing",PluginStatus::Current=>"current",PluginStatus::UpdateAvailable=>"update_available"}).unwrap_or("unknown"),
+                "can_build":plan.is_some_and(|p|p.can_build),"native_audio":companion.native_enabled,
+                "installer_ready":plan.is_some_and(|p|p.status==PluginStatus::Current && p.source.join("dist/patcher.js").is_file())}
+        })
+    }
+
+    pub(super) fn desktop_discord_retry(&mut self) -> Result<(), String> {
+        if self.call.is_some() || self.discord_launch.pending.is_some() {
+            return Err("Finish the current recording or Discord restart before retrying.".into());
+        }
+        self.discord_launch.automation.retry();
+        self.discord_launch.automatic_model_attempt = None;
+        self.discord_launch.retry = Retry::default();
+        self.discord_launch.error = None;
+        if self.discord.as_ref().is_some_and(|c| !c.is_running())
+            && let Some(connection) = self.discord.take()
+        {
+            connection.disconnect();
+        }
+        self.connect_discord();
+        self.discord_launch.error.clone().map_or(Ok(()), Err)
+    }
+
+    pub(super) fn desktop_discord_connect(&mut self, companion: bool) -> Result<(), String> {
+        if self.call.is_some() || self.discord_launch.pending.is_some() {
+            return Err(
+                "Finish the recording or Discord restart before changing the connection.".into(),
+            );
+        }
+        if let Some(connection) = self.discord.take() {
+            connection.disconnect();
+        }
+        self.settings.discord_companion = companion;
+        self.settings.discord_auto_connect = true;
+        self.connect_discord();
+        self.discord_launch.error.clone().map_or(Ok(()), Err)
+    }
+
+    pub(super) fn desktop_discord_disconnect(&mut self) -> Result<(), String> {
+        if self.call.is_some() {
+            return Err("Finish the recording before disconnecting Discord.".into());
+        }
+        self.settings.discord_auto_connect = false;
+        if let Some(connection) = self.discord.take() {
+            connection.disconnect();
+        }
+        self.save_preferences().map_err(|e| e.to_string())
+    }
+
+    pub(super) fn desktop_discord_relaunch(&mut self) -> Result<(), String> {
+        if self.call.is_some() || self.recording.is_some() || self.busy {
+            return Err("Finish recording before restarting Discord.".into());
+        }
+        if self.settings.discord_companion {
+            return Err("The companion does not need debug mode. Restart Discord normally after installing it.".into());
+        }
+        self.relaunch_discord();
+        Ok(())
+    }
+
+    pub(super) fn desktop_companion_action(&mut self, action: &str) -> Result<(), String> {
+        if self.discord_launch.companion.pending.is_some() {
+            return Err("Companion setup is already running.".into());
+        }
+        if action != "detect" && (self.call.is_some() || self.recording.is_some() || self.busy) {
+            return Err("Finish recording before changing the Discord companion.".into());
+        }
+        let action = match action {
+            "detect" => CompanionAction::Detect(
+                (!self.settings.vencord_source.trim().is_empty())
+                    .then(|| PathBuf::from(&self.settings.vencord_source)),
+            ),
+            "install" => {
+                self.settings.discord_companion = true;
+                self.save_preferences().map_err(|e| e.to_string())?;
+                if let Some(plan) = &self.discord_launch.companion.plan {
+                    CompanionAction::Install(plan.source.clone())
+                } else {
+                    CompanionAction::Prepare
+                }
+            }
+            "open_installer" => CompanionAction::OpenInstaller(
+                self.discord_launch
+                    .companion
+                    .plan
+                    .as_ref()
+                    .ok_or("Build the companion before opening the installer.")?
+                    .source
+                    .clone(),
+            ),
+            _ => return Err("Unknown companion action.".into()),
+        };
+        self.companion_work(action);
+        Ok(())
     }
 
     fn connect_discord(&mut self) {
@@ -297,6 +437,9 @@ impl App {
     }
 
     fn poll_automatic_call(&mut self) {
+        if self.call.is_some() && self.is_note_capture() {
+            return;
+        }
         let snapshot = self
             .discord
             .as_ref()
@@ -349,7 +492,17 @@ impl App {
                 "This capture is controlled manually."
             }
             .into()
-        } else if !matches!(presence, Presence::In(_)) {
+        } else if matches!(presence, Presence::Unknown) {
+            if let Some(error) = &self.discord_launch.error {
+                format!("Automatic capture is waiting for Discord: {error}")
+            } else if self.discord.is_none() {
+                "Connect Discord to start calls automatically.".into()
+            } else if self.settings.discord_companion {
+                "Waiting for the companion to pair and report your voice channel. Update the companion and restart Discord if this continues.".into()
+            } else {
+                "Waiting for Discord to report your voice channel.".into()
+            }
+        } else if matches!(presence, Presence::Out) {
             "Waiting for you to join a Discord voice channel.".into()
         } else if self.loading {
             "Loading the speech model for automatic capture…".into()
@@ -360,7 +513,7 @@ impl App {
                 "Choose and download a speech model in Settings to start automatically.".into()
             }
         } else if self.settings.discord_companion && !native_ready {
-            "Speaker names are connected. Waiting for the participant audio adapter. Update the companion and restart Discord if this continues.".into()
+            companion_audio_message(snapshot.as_ref().and_then(|s| s.audio_status.as_deref())).unwrap_or("Speaker names are connected. Waiting for the participant audio adapter. Update the companion and restart Discord if this continues.").into()
         } else if self
             .discord_launch
             .automation
@@ -403,29 +556,14 @@ impl App {
         }
     }
 
-    pub(super) fn discord_connection_label(
-        &self,
-        snapshot: Option<&Snapshot>,
-    ) -> (&'static str, bool) {
-        let (label, ready) = connection_label(snapshot);
-        if ready
-            && self.settings.discord_companion
-            && !self
-                .discord
-                .as_ref()
-                .is_some_and(|connection| connection.native_audio_ready())
-        {
-            ("Names connected · audio unavailable", false)
-        } else {
-            (label, ready)
-        }
-    }
-
-    fn relaunch_discord(&mut self, ctx: &egui::Context) {
+    #[allow(
+        dead_code,
+        reason = "Discord setup and recovery operations retained for the Tauri integration"
+    )]
+    fn relaunch_discord(&mut self) {
         if self.discord_launch.pending.is_some() {
             return;
         }
-        self.discord_launch.confirm = false;
         self.discord_launch.error = None;
         self.settings.discord_companion = false;
         self.save();
@@ -436,14 +574,13 @@ impl App {
             connection.disconnect();
         }
         let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
+
         match std::thread::Builder::new()
             .name("discord-relaunch".into())
             .spawn(move || {
                 let result =
                     crate::discord::launch::relaunch().map_err(|error| format!("{error:#}"));
                 let _ = tx.send(result);
-                ctx.request_repaint();
             }) {
             Ok(_) => self.discord_launch.pending = Some(rx),
             Err(error) => {
@@ -453,200 +590,19 @@ impl App {
         }
     }
 
-    pub(super) fn discord_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let snapshot = self
-            .discord
-            .as_ref()
-            .map(|connection| connection.snapshot());
-        if snapshot.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
-        self.discord_card(ui, ctx, snapshot.as_ref());
-    }
-
-    pub(super) fn discord_card(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        snapshot: Option<&Snapshot>,
-    ) {
-        egui::Frame::new()
-            .fill(SURFACE)
-            .stroke(egui::Stroke::new(1.0_f32, LINE))
-            .corner_radius(18)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.set_min_width((ui.available_width() - 1.0).max(0.0));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Discord speakers").strong().size(18.0));
-                    ui.add_space(8.0);
-                    let (label, active) = self.discord_connection_label(snapshot);
-                    ui.label(RichText::new(label).small().color(if active { ACCENT } else { MUTED }));
-                    ui.add_space(8.0);
-                    let connected = snapshot.is_some();
-                    if ui.add_enabled(self.discord_launch.pending.is_none(),
-                        egui::Button::new(if connected { "Disconnect" } else { "Connect" })
-                            .corner_radius(14),
-                    ).clicked()
-                    {
-                        if let Some(connection) = self.discord.take() {
-                            self.settings.discord_auto_connect = false;
-                            if self.discord_launch.automation.owned.is_some() {
-                                if let Some(control) = &self.call { control.stop(); }
-                                self.discord_launch.automation.manual_finish();
-                                self.call_status = "Saving your automatic call transcript…".into();
-                            }
-                            self.save();
-                            if let Some(control) = &self.call {
-                                control.set_discord(None);
-                            }
-                            connection.disconnect();
-                        } else {
-                            self.settings.discord_auto_connect = true;
-                            self.discord_launch.retry = Retry::default();
-                            self.save();
-                            self.connect_discord();
-                            ctx.request_repaint();
-                        }
-                    }
-                });
-                if let Some(observation) = snapshot.and_then(current_observation)
-                    && observation.channel_id.is_some()
-                    && !observation.participants.is_empty()
-                {
-                        ui.add_space(10.0);
-                        ui.horizontal_wrapped(|ui| {
-                            for participant in &observation.participants {
-                                let speaking = participant.speaking;
-                                let color = if speaking { ACCENT } else { MUTED };
-                                let name = if participant.is_self { "You" } else { &participant.name };
-                                egui::Frame::new()
-                                    .fill(if speaking { Color32::from_rgb(35, 63, 56) } else { Color32::from_rgb(28, 38, 40) })
-                                    .corner_radius(12)
-                                    .inner_margin(egui::Margin::symmetric(10, 5))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let (rect, _) = ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                                            ui.painter().circle_filled(rect.center(), 3.0, color);
-                                            ui.add(egui::Label::new(RichText::new(name).small().color(color)).truncate())
-                                                .on_hover_text(if speaking { format!("{name} is speaking") } else { name.to_owned() });
-                                        });
-                                    });
-                            }
-                        });
-                }
-                ui.add_space(6.0);
-                ui.add_enabled_ui(snapshot.is_none() && self.discord_launch.pending.is_none(), |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        let standard = ui.selectable_value(&mut self.settings.discord_companion, false, "Standard Discord").changed();
-                        let companion = ui.selectable_value(&mut self.settings.discord_companion, true, "Vencord companion").changed();
-                        if standard || companion {
-                            self.discord_launch.confirm = false;
-                            self.discord_launch.error = None;
-                            self.save();
-                            if companion {
-                                self.settings.discord_auto_connect = true;
-                                self.connect_discord();
-                            }
-                        }
-                    });
-                });
-                ui.label(RichText::new("Use names from your voice channel. Choose the audio output Discord uses.").small().color(MUTED));
-                if ui.checkbox(&mut self.settings.discord_auto_connect, "Connect automatically").changed() {
-                    self.discord_launch.retry = Retry::default();
-                    self.save();
-                }
-                if ui.checkbox(&mut self.settings.discord_auto_transcribe, "Transcribe Discord calls automatically").changed() {
-                    self.save();
-                }
-                ui.small("Starts when you join a voice channel and saves when you leave. Calls you start yourself stay under your control.");
-                if self.settings.discord_auto_transcribe && !self.discord_launch.automatic_status.is_empty() {
-                    ui.label(RichText::new(&self.discord_launch.automatic_status).color(MUTED));
-                    if self.call.is_none() && ui.button("Retry automatic capture").clicked() {
-                        self.discord_launch.automation.retry();
-                        self.discord_launch.automatic_model_attempt = None;
-                    }
-                }
-                if self.settings.discord_companion {
-                    self.discord_companion_ui(ui, ctx);
-                    return;
-                }
-                let needs_setup = snapshot.is_none_or(|state| !matches!(state.status, Status::Ready));
-                if needs_setup {
-                    ui.add_space(4.0);
-                    self.discord_launch_ui(ui, ctx);
-                    ui.collapsing("Manual connection", |ui| {
-                        ui.label("1. Quit Discord completely, including its tray icon.");
-                        ui.label("2. Copy this command and run it in PowerShell to open Discord.");
-                        if ui.button("Copy launch command").clicked() {
-                            ctx.copy_text(SETUP_COMMAND.to_owned());
-                            self.call_status = "Discord launch command copied".into();
-                        }
-                        ui.label("3. Choose Connect here, then join a voice channel.");
-                        ui.add_space(6.0);
-                        ui.label(RichText::new("This allows programs on this computer to inspect Discord through its local debugger. Restart Discord normally to turn this access off.").small().color(MUTED));
-                        if let Some(Snapshot { status: Status::Unavailable(detail), .. }) = snapshot {
-                            ui.collapsing("Connection details", |ui| {
-                                ui.label(RichText::new(detail).small().color(MUTED));
-                            });
-                        }
-                    });
-                }
-            });
-    }
-
-    fn discord_companion_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        self.companion_install_ui(ui, ctx);
-        ui.add_space(6.0);
-        ui.label("Paste the pairing key into the Articulate plugin in Vencord once. Articulate reconnects automatically.");
-        ui.small("The companion shares speaker names and activity. The companion captures each participant separately when its audio adapter is connected.");
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(
-                    crate::discord::plugin::valid_token(&self.settings.discord_pairing_key),
-                    egui::Button::new("Copy pairing key"),
-                )
-                .clicked()
-            {
-                ctx.copy_text(self.settings.discord_pairing_key.clone());
-                self.call_status =
-                    "Pairing key copied. Paste it into the Vencord plugin settings.".into();
-            }
-            ui.hyperlink_to(
-                "Set up the companion",
-                "https://github.com/obiente/articulate/blob/main/docs/vencord.md",
-            );
-        });
-        ui.small("Keep the pairing key private. Disconnect to stop sharing speaker activity.");
-        if let Some(error) = &self.discord_launch.error {
-            ui.label(RichText::new(error).color(Color32::from_rgb(244, 180, 160)));
-        }
-        if let Some(snapshot) = self
-            .discord
-            .as_ref()
-            .map(|connection| connection.snapshot())
-            && let Status::Unavailable(detail) = snapshot.status
-        {
-            ui.small(detail);
-        }
-    }
-
-    fn companion_work(&mut self, ctx: Option<&egui::Context>, action: CompanionAction) {
+    fn companion_work(&mut self, action: CompanionAction) {
         if self.discord_launch.companion.pending.is_some() {
             return;
         }
         self.discord_launch.companion.error = None;
         self.discord_launch.companion.progress = "Checking Vencord…".into();
         let (tx, rx) = mpsc::channel();
-        let ctx = ctx.cloned();
+
         let result = std::thread::Builder::new()
             .name("vencord-companion-install".into())
             .spawn(move || {
                 let progress = |message: &str| {
                     let _ = tx.send(CompanionEvent::Progress(message.into()));
-                    if let Some(ctx) = &ctx {
-                        ctx.request_repaint();
-                    }
                 };
                 match action {
                     CompanionAction::Detect(hint) => {
@@ -704,9 +660,6 @@ impl App {
                         let _ = tx.send(CompanionEvent::InstallerOpened(result));
                     }
                 }
-                if let Some(ctx) = &ctx {
-                    ctx.request_repaint();
-                }
             });
         match result {
             Ok(_) => self.discord_launch.companion.pending = Some(rx),
@@ -753,6 +706,7 @@ impl App {
                     self.discord_launch.companion.pending = None;
                     self.discord_launch.companion.checked = true;
                     self.discord_launch.companion.detection = Some(detection);
+                    self.discord_launch.companion.progress.clear();
                     match plan {
                         Ok(plan) => self.discord_launch.companion.plan = plan,
                         Err(error) => {
@@ -798,231 +752,66 @@ impl App {
         }
         if !self.discord_launch.companion.checked {
             self.discord_launch.companion.checked = true;
-            self.companion_work(
-                None,
-                CompanionAction::Detect(Some(PathBuf::from(self.settings.vencord_source.trim()))),
-            );
+            self.companion_work(CompanionAction::Detect(Some(PathBuf::from(
+                self.settings.vencord_source.trim(),
+            ))));
         } else if let Some(plan) = &self.discord_launch.companion.plan
             && plan.status == PluginStatus::UpdateAvailable
             && plan.can_build
         {
-            self.companion_work(None, CompanionAction::Install(plan.source.clone()));
+            self.companion_work(CompanionAction::Install(plan.source.clone()));
         }
     }
+}
 
-    fn companion_install_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if !self.discord_launch.companion.checked && self.discord_launch.companion.pending.is_none()
-        {
-            self.discord_launch.companion.checked = true;
-            let hint = (!self.settings.vencord_source.trim().is_empty())
-                .then(|| PathBuf::from(self.settings.vencord_source.trim()));
-            self.companion_work(Some(ctx), CompanionAction::Detect(hint));
+fn companion_audio_message(status: Option<&str>) -> Option<&'static str> {
+    match status? {
+        "preload-unavailable" | "addon-unavailable" => Some(
+            "Discord has loaded speaker names without the audio adapter. Repair the companion, then quit Discord completely and reopen it.",
+        ),
+        "unsupported-native-build" => Some(
+            "This Discord voice version is not supported by the audio adapter. Check for an Articulate update.",
+        ),
+        "native-hook-unavailable" => Some(
+            "The audio adapter could not attach to Discord. Quit Discord completely and reopen it. Repair the companion if this continues.",
+        ),
+        "waiting-for-voice-engine" => {
+            Some("Waiting for Discord to initialize voice audio. Join a voice channel to continue.")
         }
-        let busy = self.discord_launch.companion.pending.is_some();
-        ui.add_space(8.0);
-        ui.label(RichText::new("Companion installation").strong());
-        if let Some(detection) = &self.discord_launch.companion.detection {
-            ui.label(if detection.installed {
-                "Vencord detected"
-            } else {
-                "No installed Vencord detected"
-            });
-            if detection.selected_active {
-                ui.small("Discord is configured to use the selected custom Vencord build. Restart Discord after a companion update.");
-            } else if detection.source.is_some() {
-                ui.small("This source build is not active in Discord yet. Build the companion, then install the custom build.");
-            }
-            if detection.source.is_none() {
-                ui.label("The companion needs a custom Vencord build. A regular Vencord installation cannot load the plugin files on their own.");
-            }
-        }
-        if busy {
-            ui.horizontal_wrapped(|ui| {
-                ui.spinner();
-                ui.label(&self.discord_launch.companion.progress);
-            });
-            ctx.request_repaint_after(Duration::from_millis(100));
+        "waiting-for-articulate" | "control-unavailable" => Some(
+            "The audio adapter is loaded but cannot reach Articulate. Reconnect Discord in these settings.",
+        ),
+        "audio-transport-unavailable" => Some(
+            "The separate audio connection was interrupted. Reconnect Discord before starting another capture.",
+        ),
+        "disabled" => Some(
+            "The audio adapter has not been enabled by the companion. Repair the companion and restart Discord if this continues.",
+        ),
+        _ => None,
+    }
+}
+
+fn companion_runtime_status(
+    build: Option<PluginStatus>,
+    native: bool,
+    connected: bool,
+    revision: Option<&str>,
+    expected: &str,
+) -> &'static str {
+    if build.is_some_and(|status| status != PluginStatus::Current)
+        || (build == Some(PluginStatus::Current) && !native)
+    {
+        "update_required"
+    } else if connected && revision == Some(expected) {
+        "current"
+    } else if build == Some(PluginStatus::Current) && native {
+        if connected {
+            "restart_required"
         } else {
-            if let Some(plan) = &self.discord_launch.companion.plan {
-                let status = plan.status;
-                let source = plan.source.clone();
-                let can_build = plan.can_build;
-                ui.label(match status {
-                    PluginStatus::Missing => "Ready to add the companion",
-                    PluginStatus::Current => "Companion files are up to date",
-                    PluginStatus::UpdateAvailable => "A companion update is available",
-                });
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            can_build,
-                            egui::Button::new(if status == PluginStatus::UpdateAvailable {
-                                "Update companion"
-                            } else if status == PluginStatus::Current {
-                                "Rebuild companion"
-                            } else {
-                                "Install companion"
-                            }),
-                        )
-                        .clicked()
-                    {
-                        self.companion_work(Some(ctx), CompanionAction::Install(source.clone()));
-                    }
-                    if ui
-                        .add_enabled(
-                            status == PluginStatus::Current,
-                            egui::Button::new("Install custom build in Discord"),
-                        )
-                        .clicked()
-                    {
-                        self.companion_work(
-                            Some(ctx),
-                            CompanionAction::OpenInstaller(source.clone()),
-                        );
-                    }
-                });
-                if !can_build {
-                    ui.small("Building this custom Vencord source requires Node.js 22 or newer. Reopen Articulate after installing Node.js.");
-                    ui.hyperlink_to("Download Node.js", "https://nodejs.org/en/download");
-                }
-                ui.small(if self.discord_launch.companion.native_enabled {
-                    "Separate participant audio is included. Restart Discord after rebuilding, then rejoin your call."
-                } else {
-                    "Rebuild the companion to include separate participant audio."
-                });
-            }
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Set up automatically").clicked() {
-                    let existing = self
-                        .discord_launch
-                        .companion
-                        .detection
-                        .as_ref()
-                        .and_then(|detection| detection.source.clone());
-                    self.companion_work(
-                        Some(ctx),
-                        existing
-                            .map(CompanionAction::Install)
-                            .unwrap_or(CompanionAction::Prepare),
-                    );
-                }
-                if ui.button("Check installation").clicked() {
-                    self.discord_launch.companion.checked = false;
-                    self.discord_launch.companion.error = None;
-                }
-            });
-            if !self.discord_launch.companion.progress.is_empty() {
-                ui.label(&self.discord_launch.companion.progress);
-            }
+            "offline"
         }
-        ui.small("Automatic setup prepares Vencord and builds the companion locally. The Vencord installer closes the Discord client you select, disconnecting any active call.");
-        if let Some(report) = &self.discord_launch.companion.report
-            && report.built
-        {
-            ui.small(if report.changed {
-                "The companion was updated and compiled successfully."
-            } else {
-                "The companion was compiled successfully."
-            });
-        }
-        if ui
-            .checkbox(
-                &mut self.settings.vencord_auto_update,
-                "Keep the companion up to date",
-            )
-            .changed()
-        {
-            self.save();
-        }
-        ui.small("When enabled, Articulate rebuilds your selected custom source when this app includes a newer companion. Discord is never restarted automatically.");
-        ui.collapsing("Use an existing Vencord source checkout", |ui| {
-            ui.add_enabled_ui(!busy, |ui| {
-                let previous = self.settings.vencord_source.clone();
-                ui.label("Vencord source folder");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.vencord_source)
-                            .desired_width((ui.available_width() - 100.0).max(120.0)),
-                    );
-                    if ui.button("Browse…").clicked() {
-                        match super::file_picker::open(
-                            "Choose package.json in your Vencord source checkout",
-                            "json",
-                        ) {
-                            Ok(Some(path)) => {
-                                self.settings.vencord_source = path
-                                    .parent()
-                                    .unwrap_or(&path)
-                                    .to_string_lossy()
-                                    .into_owned()
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                self.discord_launch.companion.error = Some(format!("{error:#}"))
-                            }
-                        }
-                    }
-                });
-                if previous != self.settings.vencord_source {
-                    self.discord_launch.companion.checked = true;
-                    self.discord_launch.companion.plan = None;
-                    self.save();
-                }
-                if ui.button("Use this folder").clicked() {
-                    self.discord_launch.companion.checked = true;
-                    self.companion_work(
-                        Some(ctx),
-                        CompanionAction::Detect(Some(PathBuf::from(
-                            self.settings.vencord_source.trim(),
-                        ))),
-                    );
-                }
-            });
-        });
-        if let Some(error) = &self.discord_launch.companion.error {
-            ui.label(RichText::new(error).color(Color32::from_rgb(244, 180, 160)));
-        }
-        ui.add_space(10.0);
-    }
-
-    fn discord_launch_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if self.discord_launch.pending.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Relaunching Discord…");
-            });
-        } else if self.discord_launch.confirm {
-            ui.label(RichText::new("Relaunch Discord?").strong());
-            ui.label("This disconnects any active Discord call. Rejoin your voice channel after Discord opens.");
-            ui.label(RichText::new("Local debugging lets apps on this computer inspect Discord. Restart Discord normally to turn it off.").small().color(MUTED));
-            ui.horizontal(|ui| {
-                if ui.button("Relaunch and connect").clicked() {
-                    self.relaunch_discord(ctx);
-                }
-                if ui.button("Cancel").clicked() {
-                    self.discord_launch.confirm = false;
-                }
-            });
-        } else if ui
-            .button("Relaunch Discord")
-            .on_hover_text(
-                "Open Discord with local debugging and connect speaker names automatically",
-            )
-            .clicked()
-        {
-            self.discord_launch.confirm = true;
-        }
-        if let Some(error) = &self.discord_launch.error {
-            ui.label(
-                RichText::new(
-                    "Could not relaunch Discord. Try again or use the manual connection.",
-                )
-                .color(Color32::from_rgb(244, 180, 160)),
-            );
-            ui.collapsing("Relaunch details", |ui| {
-                ui.label(error);
-            });
-        }
+    } else {
+        "unverified"
     }
 }
 
@@ -1034,28 +823,108 @@ fn current_observation(snapshot: &Snapshot) -> Option<&crate::discord::Observati
     })
 }
 
-pub(super) fn connection_label(snapshot: Option<&Snapshot>) -> (&'static str, bool) {
-    match snapshot {
-        None => ("Not connected", false),
-        Some(Snapshot {
-            status: Status::Connecting,
-            ..
-        }) => ("Connecting…", false),
-        Some(Snapshot {
-            status: Status::Unavailable(_),
-            ..
-        }) => ("Reconnecting…", false),
-        Some(snapshot) => match current_observation(snapshot) {
-            Some(observation) if observation.channel_id.is_some() => ("Ready", true),
-            Some(_) => ("Join a voice channel", false),
-            None => ("Reconnecting…", false),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_files_never_prove_the_running_companion_is_current() {
+        let expected = "a".repeat(64);
+        let old = "b".repeat(64);
+        let current = Some(PluginStatus::Current);
+        assert_eq!(
+            companion_runtime_status(current, true, true, Some(&expected), &expected),
+            "current"
+        );
+        assert_eq!(
+            companion_runtime_status(current, true, true, Some(&old), &expected),
+            "restart_required"
+        );
+        assert_eq!(
+            companion_runtime_status(current, true, true, None, &expected),
+            "restart_required"
+        );
+        assert_eq!(
+            companion_runtime_status(current, true, false, Some(&expected), &expected),
+            "offline"
+        );
+        assert_eq!(
+            companion_runtime_status(current, false, true, Some(&expected), &expected),
+            "update_required"
+        );
+        assert_eq!(
+            companion_runtime_status(
+                Some(PluginStatus::UpdateAvailable),
+                true,
+                true,
+                Some(&expected),
+                &expected
+            ),
+            "update_required"
+        );
+        assert_eq!(
+            companion_runtime_status(None, false, false, None, &expected),
+            "unverified"
+        );
+    }
+
+    #[test]
+    fn connection_readiness_requires_fresh_confirmed_membership() {
+        let mut snapshot = Snapshot {
+            audio_status: None,
+            companion_revision: None,
+            status: Status::Ready,
+            observation: Some(crate::discord::Observation {
+                at: Instant::now(),
+                generation: 1,
+                channel_id: Some("123".into()),
+                participants: Vec::new(),
+                valid: true,
+            }),
+        };
+        assert!(current_observation(&snapshot).is_some());
+        snapshot.observation.as_mut().unwrap().at = Instant::now() - Duration::from_secs(2);
+        assert!(current_observation(&snapshot).is_none());
+        snapshot.observation.as_mut().unwrap().at = Instant::now();
+        snapshot.observation.as_mut().unwrap().valid = false;
+        assert!(current_observation(&snapshot).is_none());
+        snapshot.observation.as_mut().unwrap().valid = true;
+        snapshot.status = Status::Connecting;
+        assert!(current_observation(&snapshot).is_none());
+    }
+
+    #[test]
+    fn automatic_status_explains_missing_connection_and_exposes_paused_retry() {
+        let (mut app, _) = super::super::tests::app();
+        app.settings.discord_auto_transcribe = true;
+        app.poll_automatic_call();
+        let state = app.desktop_discord_status();
+        assert_eq!(state["connected"], false);
+        assert_eq!(state["listener_started"], false);
+        assert_eq!(state["pairing_state"], "automatic");
+        assert_eq!(state["automatic_can_retry"], false);
+        assert!(
+            state["automatic_status"]
+                .as_str()
+                .unwrap()
+                .starts_with("Connect Discord")
+        );
+        app.discord_launch.error = Some("Synthetic listener failure".into());
+        app.poll_automatic_call();
+        assert!(
+            app.discord_launch
+                .automatic_status
+                .contains("Synthetic listener failure")
+        );
+        assert_eq!(app.desktop_discord_status()["automatic_can_retry"], true);
+        app.discord_launch.error = None;
+        app.discord_launch.automation.suppressed = Some("123".into());
+        assert_eq!(app.desktop_discord_status()["automatic_can_retry"], true);
+        app.discord_launch.automation.retry();
+        assert_eq!(app.desktop_discord_status()["automatic_can_retry"], false);
+        app.call = Some(call_capture::Control::new());
+        assert!(app.desktop_discord_retry().is_err());
+    }
 
     #[test]
     fn automatic_calls_debounce_join_leave_and_wait_for_audio_readiness() {
@@ -1458,78 +1327,6 @@ mod tests {
     }
 
     #[test]
-    fn companion_setup_wraps_errors_and_scrolls_to_pairing() {
-        for (width, height) in [(850.0, 620.0), (1200.0, 840.0)] {
-            let (mut app, _) = super::super::tests::app();
-            app.page = 3;
-            app.call_tab = 2;
-            app.settings.discord_companion = true;
-            app.settings.discord_pairing_key = "b".repeat(64);
-            app.discord_launch.companion.checked = true;
-            app.discord_launch.companion.detection = Some(Detection::default());
-            let error = format!(
-                "Synthetic setup error at C:\\Example\\{}plugin. Choose another source folder and try again.",
-                "long-folder-name\\".repeat(30)
-            );
-            app.discord_launch.companion.error = Some(error.clone());
-            let ctx = egui::Context::default();
-            theme::configure(&ctx);
-            let mut error_seen = false;
-            let mut pairing_visible = false;
-            for frame in 0..10 {
-                let mut events = vec![egui::Event::PointerMoved(egui::pos2(
-                    width / 2.0,
-                    height - 90.0,
-                ))];
-                if frame > 0 {
-                    events.push(egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0.0, -500.0),
-                        modifiers: Default::default(),
-                    });
-                }
-                let output = ctx.run(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            egui::vec2(width, height),
-                        )),
-                        time: Some(frame as f64 / 30.0),
-                        events,
-                        ..Default::default()
-                    },
-                    |ctx| app.surface(ctx),
-                );
-                for shape in &output.shapes {
-                    if let egui::epaint::Shape::Text(text) = &shape.shape {
-                        if text.galley.job.text == error {
-                            error_seen = true;
-                            assert!(
-                                text.galley.size().x <= width - 48.0,
-                                "Long paths must wrap inside the setup panel"
-                            );
-                        }
-                        if text.galley.job.text == "Copy pairing key"
-                            && shape
-                                .clip_rect
-                                .contains(text.pos + text.galley.size() / 2.0)
-                        {
-                            pairing_visible = true;
-                        }
-                    }
-                }
-            }
-            assert!(error_seen, "The diagnostic text should be rendered");
-            assert!(
-                pairing_visible,
-                "Pairing controls must remain reachable by scrolling at {width}x{height}"
-            );
-            assert!(app.discord_launch.companion.pending.is_none());
-            assert!(app.discord.is_none());
-        }
-    }
-
-    #[test]
     fn companion_background_errors_are_reported_without_changing_capture() {
         let (mut app, _) = super::super::tests::app();
         let control = call_capture::Control::new();
@@ -1553,42 +1350,103 @@ mod tests {
     }
 
     #[test]
-    fn companion_setup_keeps_pairing_key_out_of_rendered_text_and_stays_disconnected() {
-        let (mut app, _) = super::super::tests::app();
-        app.settings.discord_companion = true;
-        app.settings.discord_pairing_key = "a".repeat(64);
-        let ctx = egui::Context::default();
-        theme::configure(&ctx);
-        ctx.enable_accesskit();
-        let output = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(850.0, 620.0),
-                )),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| app.discord_card(ui, ctx, None));
-            },
+    fn missing_discord_presence_stops_only_owned_capture_after_a_grace_period() {
+        let at = Instant::now();
+        let mut state = AutoCall::default();
+        let inside = || Presence::In("123".into());
+        state.tick(at, inside(), true, false, false, true);
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(1),
+                inside(),
+                true,
+                false,
+                false,
+                true
+            ),
+            Some(AutoAction::Start)
         );
-        let tree = output.platform_output.accesskit_update.unwrap();
-        assert!(
-            tree.nodes
-                .iter()
-                .any(|(_, node)| node.label() == Some("Copy pairing key"))
+        state.capture_started();
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(2),
+                Presence::Unknown,
+                true,
+                true,
+                false,
+                false
+            ),
+            None
         );
-        assert!(!tree.nodes.iter().any(|(_, node)| {
-            node.label()
-                .is_some_and(|label| label.contains(&app.settings.discord_pairing_key))
-        }));
-        assert!(
-            !tree
-                .nodes
-                .iter()
-                .any(|(_, node)| node.label() == Some("Relaunch Discord"))
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(6),
+                Presence::Unknown,
+                true,
+                true,
+                false,
+                false
+            ),
+            None
         );
-        assert!(app.discord.is_none());
+        // A restored connection resets the grace period.
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(7),
+                inside(),
+                true,
+                true,
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(8),
+                Presence::Unknown,
+                true,
+                true,
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(13),
+                Presence::Unknown,
+                true,
+                true,
+                false,
+                false
+            ),
+            Some(AutoAction::Stop)
+        );
+        assert_eq!(
+            state.tick(
+                at + Duration::from_secs(14),
+                Presence::Unknown,
+                true,
+                true,
+                true,
+                false
+            ),
+            None
+        );
+        let mut manual = AutoCall::default();
+        manual.tick(at, Presence::Unknown, true, true, false, false);
+        assert_eq!(
+            manual.tick(
+                at + Duration::from_secs(60),
+                Presence::Unknown,
+                true,
+                true,
+                false,
+                false
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1624,67 +1482,6 @@ mod tests {
         assert!(app.discord_launch.error.is_some());
     }
 
-    #[test]
-    fn speaker_connection_buttons_remain_enabled_during_capture() {
-        for (snapshot, label) in [
-            (None, "Connect"),
-            (
-                Some(Snapshot {
-                    status: Status::Ready,
-                    observation: None,
-                }),
-                "Disconnect",
-            ),
-        ] {
-            let (mut app, _) = super::super::tests::app();
-            let control = call_capture::Control::new();
-            app.call = Some(control.clone());
-            app.call_rows.push(calls::Row {
-                start_ms: 0,
-                end_ms: 1000,
-                microphone: true,
-                speakers: Vec::new(),
-                discord: None,
-                text: "Keep this transcript.".into(),
-            });
-            let ctx = egui::Context::default();
-            theme::configure(&ctx);
-            ctx.enable_accesskit();
-            let output = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(850.0, 620.0),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default()
-                        .show(ctx, |ui| app.discord_card(ui, ctx, snapshot.as_ref()));
-                },
-            );
-            let tree = output
-                .platform_output
-                .accesskit_update
-                .expect("Accessible button state is available");
-            let button = tree
-                .nodes
-                .iter()
-                .find(|(_, node)| node.label() == Some(label))
-                .expect("Speaker connection button is rendered");
-            assert!(
-                !button.1.is_disabled(),
-                "{label} must be available while a call is recording"
-            );
-            assert!(std::sync::Arc::ptr_eq(app.call.as_ref().unwrap(), &control));
-            assert_eq!(control.stop_ns.load(Ordering::SeqCst), 0);
-            assert_eq!(app.call_rows[0].text, "Keep this transcript.");
-            assert!(
-                app.discord.is_none(),
-                "Rendering never initiates a connection"
-            );
-        }
-    }
     #[test]
     fn failed_automatic_start_retries_without_rejoining_and_preserves_native_gate() {
         let mut state = AutoCall::default();

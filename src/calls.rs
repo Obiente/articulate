@@ -12,6 +12,7 @@ use std::{
 
 mod activity;
 mod native;
+mod turns;
 
 /// A requested companion capture never silently becomes mixed output capture.
 pub fn select_native_source(companion_selected: bool, native_ready: bool) -> Result<bool> {
@@ -31,10 +32,30 @@ pub struct Row {
     /// A session-local match to observed Discord activity, independent of acoustic IDs.
     pub discord: Option<crate::discord_attribution::Attribution>,
     pub text: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::sensevoice::deserialize_cues"
+    )]
+    pub cues: Vec<crate::sensevoice::Cue>,
 }
 
-pub fn append_rows(transcript: &mut Vec<Row>, incoming: Vec<Row>) {
+// Bundle natural continuations without hiding a later turn's own timestamp.
+const ROW_CONTINUATION_GAP_MS: u64 = 1200;
+
+pub fn append_rows(transcript: &mut Vec<Row>, mut incoming: Vec<Row>) {
+    incoming.sort_by_key(|row| row.start_ms);
     for row in incoming {
+        if transcript
+            .last()
+            .is_some_and(|last| row.start_ms < last.start_ms)
+        {
+            // A late result retains its timestamp and text. We cannot split an
+            // already committed paragraph without word-level ASR timestamps.
+            let position = transcript.partition_point(|existing| existing.start_ms <= row.start_ms);
+            transcript.insert(position, row);
+            continue;
+        }
         let known_single_speaker = row.microphone
             || row
                 .discord
@@ -43,6 +64,7 @@ pub fn append_rows(transcript: &mut Vec<Row>, incoming: Vec<Row>) {
             || (row.speakers.len() == 1 && (1..=4).contains(&row.speakers[0]));
         if let Some(last) = transcript.last_mut()
             && known_single_speaker
+            && row.start_ms.saturating_sub(last.end_ms) <= ROW_CONTINUATION_GAP_MS
             && last.microphone == row.microphone
             && match (&last.discord, &row.discord) {
                 (Some(previous), Some(next)) => previous == next && next.speakers.len() == 1,
@@ -54,6 +76,11 @@ pub fn append_rows(transcript: &mut Vec<Row>, incoming: Vec<Row>) {
                 last.text.push(' ');
             }
             last.text.push_str(&row.text);
+            for cue in row.cues {
+                if !last.cues.contains(&cue) {
+                    last.cues.push(cue);
+                }
+            }
             last.end_ms = last.end_ms.max(row.end_ms);
             for id in row.speakers {
                 if !last.speakers.contains(&id) {
@@ -71,6 +98,10 @@ pub enum Update {
     Started,
     /// Native capture is armed; true means an authenticated PCM frame arrived.
     NativeAudio(bool),
+    /// Cumulative missing native packets, retained with this recording.
+    AudioGap(u64),
+    AudioContext(Row),
+    AudioContextStatus(String),
     Levels(f32, f32),
     /// Replace the current uncommitted text as more audio context arrives.
     Preview(Vec<Row>),
@@ -78,11 +109,48 @@ pub enum Update {
     Rows(Vec<Row>),
 }
 pub struct Request {
+    pub audio_context: bool,
     pub microphone: Option<String>,
     pub output: Option<String>,
     pub cpu: bool,
     pub native_audio: bool,
+    /// Spoken notes capture only the microphone, even if Discord is connected.
+    pub microphone_only: bool,
     pub control: Arc<Control>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Microphone,
+    Native,
+    Mixed,
+}
+
+impl Request {
+    fn source(&self) -> Source {
+        if self.microphone_only {
+            Source::Microphone
+        } else if self.native_audio {
+            Source::Native
+        } else {
+            Source::Mixed
+        }
+    }
+}
+
+fn microphone_rows(text: String, samples: usize, offset_ms: u64) -> Vec<Row> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    vec![Row {
+        cues: Vec::new(),
+        start_ms: offset_ms,
+        end_ms: offset_ms + samples as u64 / 16,
+        microphone: true,
+        speakers: Vec::new(),
+        discord: None,
+        text,
+    }]
 }
 
 pub fn process_window(
@@ -92,18 +160,7 @@ pub fn process_window(
     remote: &[f32],
     offset_ms: u64,
 ) -> Result<Vec<Row>> {
-    let mut rows = Vec::new();
-    let text = engine.transcribe(mic)?;
-    if !text.is_empty() {
-        rows.push(Row {
-            start_ms: offset_ms,
-            end_ms: offset_ms + mic.len() as u64 / 16,
-            microphone: true,
-            speakers: Vec::new(),
-            discord: None,
-            text,
-        });
-    }
+    let mut rows = microphone_rows(engine.transcribe(mic)?, mic.len(), offset_ms);
     let turns = tracker.identify(remote)?;
     for turn in crate::call_segments::plan(&turns, remote.len()) {
         let text = engine.transcribe(&remote[turn.audio_start..turn.audio_end])?;
@@ -111,6 +168,7 @@ pub fn process_window(
             continue;
         }
         rows.push(Row {
+            cues: Vec::new(),
             start_ms: offset_ms + turn.start as u64 / 16,
             end_ms: offset_ms + turn.end as u64 / 16,
             microphone: false,
@@ -130,22 +188,12 @@ fn process_activity_window(
     offset_ms: u64,
     segments: &[crate::discord_attribution::ActivitySegment],
 ) -> Result<Vec<Row>> {
-    let mut rows = Vec::new();
-    let text = engine.transcribe(mic)?;
-    if !text.is_empty() {
-        rows.push(Row {
-            start_ms: offset_ms,
-            end_ms: offset_ms + mic.len() as u64 / 16,
-            microphone: true,
-            speakers: Vec::new(),
-            discord: None,
-            text,
-        });
-    }
+    let mut rows = microphone_rows(engine.transcribe(mic)?, mic.len(), offset_ms);
     for segment in activity::plan(segments, remote.len()) {
         let text = engine.transcribe(&remote[segment.audio_start..segment.audio_end])?;
         if !text.is_empty() {
             rows.push(Row {
+                cues: Vec::new(),
                 start_ms: offset_ms + segment.start as u64 / 16,
                 end_ms: offset_ms + segment.end as u64 / 16,
                 microphone: false,
@@ -181,9 +229,9 @@ impl Draft {
         MAX_DRAFT_SAMPLES.saturating_sub(self.mic.len().max(self.remote.len())) as f64 / 16_000.0
     }
 
-    fn endpoint(&self) -> bool {
+    fn endpoint(&self, microphone_only: bool) -> bool {
         self.mic.len().max(self.remote.len()) >= MAX_DRAFT_SAMPLES
-            || (quiet_tail(&self.mic) && quiet_tail(&self.remote))
+            || (quiet_tail(&self.mic) && (microphone_only || quiet_tail(&self.remote)))
     }
 
     fn commit(&mut self, update: &mut impl FnMut(Update)) {
@@ -204,9 +252,11 @@ fn quiet_tail(pcm: &[f32]) -> bool {
 }
 
 pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)) -> Result<()> {
-    if request.native_audio {
+    let source = request.source();
+    if source == Source::Native {
         return native::run(engine, request, update);
     }
+    let microphone_only = source == Source::Microphone;
     let mut tracker: Option<Tracker> = None;
     if request.control.abort.load(Ordering::Relaxed)
         || request.control.stop_ns.load(Ordering::SeqCst) != 0
@@ -218,14 +268,26 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
         false,
         request.control.clone(),
     )?;
-    let mut output = Track::open(request.output.as_deref(), true, request.control.clone())?;
+    let mut output = if microphone_only {
+        None
+    } else {
+        Some(Track::open(
+            request.output.as_deref(),
+            true,
+            request.control.clone(),
+        )?)
+    };
     update(Update::Started);
+    let mut context = crate::sensevoice::Worker::start(request.audio_context);
     let mut cursor = 0.0;
     let mut draft_start = 0.0;
     let mut draft = Draft::default();
     let mut checkpoint = None;
     let result = (|| -> Result<()> {
         loop {
+            if let Some(context) = &mut context {
+                context.poll(&mut update);
+            }
             if request.control.abort.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -245,15 +307,23 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                     break;
                 }
                 draft.mic.extend(microphone.take_until(end)?);
-                draft.remote.extend(output.take_until(end)?);
+                if let Some(output) = &mut output {
+                    draft.remote.extend(output.take_until(end)?);
+                }
                 let offset_ms = (draft_start * 1000.0) as u64;
-                let discord_context = request.control.discord().zip(request.control.origin()).map(
-                    |(discord, origin)| {
-                        let from = origin + Duration::from_secs_f64(draft_start);
-                        let to = origin + Duration::from_secs_f64(end);
-                        (origin, discord.history(from, to))
-                    },
-                );
+                let discord = if microphone_only {
+                    None
+                } else {
+                    request.control.discord()
+                };
+                let discord_context =
+                    discord
+                        .zip(request.control.origin())
+                        .map(|(discord, origin)| {
+                            let from = origin + Duration::from_secs_f64(draft_start);
+                            let to = origin + Duration::from_secs_f64(end);
+                            (origin, discord.history(from, to))
+                        });
                 let activity = discord_context.as_ref().and_then(|(origin, history)| {
                     crate::discord_attribution::plan_activity(
                         *origin,
@@ -262,7 +332,9 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                         history,
                     )
                 });
-                let rows = if let Some(segments) = activity {
+                let rows = if microphone_only {
+                    microphone_rows(engine.transcribe(&draft.mic)?, draft.mic.len(), offset_ms)
+                } else if let Some(segments) = activity {
                     process_activity_window(
                         engine,
                         &draft.mic,
@@ -294,7 +366,29 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                 };
                 draft.rows = rows;
                 cursor = end;
-                if draft.endpoint() || (stopping && cursor >= now) {
+                if draft.endpoint(microphone_only) || (stopping && cursor >= now) {
+                    if let Some(context) = &mut context {
+                        for row in &draft.rows {
+                            if !row.microphone
+                                && (row.speakers.len() != 1 || row.speakers[0] == 0)
+                                && !row.discord.as_ref().is_some_and(|d| d.speakers.len() == 1)
+                            {
+                                continue;
+                            }
+                            let pcm = if row.microphone {
+                                &draft.mic
+                            } else {
+                                &draft.remote
+                            };
+                            let from = (row.start_ms.saturating_sub(offset_ms) as usize * 16)
+                                .min(pcm.len());
+                            let to =
+                                (row.end_ms.saturating_sub(offset_ms) as usize * 16).min(pcm.len());
+                            if to > from {
+                                context.submit(row, &pcm[from..to]);
+                            }
+                        }
+                    }
                     // Empty successful revisions must clear previous previews.
                     update(Update::Rows(std::mem::take(&mut draft.rows)));
                     draft.mic.clear();
@@ -310,7 +404,9 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
             } else {
                 update(Update::Levels(
                     f32::from_bits(microphone.level.load(Ordering::Relaxed)),
-                    f32::from_bits(output.level.load(Ordering::Relaxed)),
+                    output.as_ref().map_or(0.0, |track| {
+                        f32::from_bits(track.level.load(Ordering::Relaxed))
+                    }),
                 ));
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -320,6 +416,11 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
     // An incomplete decode never replaces the last successful preview. Flushing
     // it also preserves text when capture fails or the user cancels mid-phrase.
     draft.commit(&mut update);
+    drop(microphone);
+    drop(output);
+    if let Some(context) = &mut context {
+        context.finish(&mut update, &request.control.abort);
+    }
     result
 }
 
@@ -368,16 +469,81 @@ pub fn text(rows: &[Row], names: &[String; 4]) -> String {
                 r.start_ms / 60000,
                 r.start_ms / 1000 % 60,
                 label(r, names),
-                r.text
+                display_text(r)
             )
         })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
 
+pub fn display_text(row: &Row) -> String {
+    let mut text = row.text.clone();
+    for cue in &row.cues {
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        text.push_str(&format!(
+            "[Audio cue, approximate {:02}:{:02}-{:02}:{:02}: {}]",
+            cue.start_ms / 60000,
+            cue.start_ms / 1000 % 60,
+            cue.end_ms / 60000,
+            cue.end_ms / 1000 % 60,
+            cue.label
+        ));
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spoken_note_source_excludes_native_and_mixed_audio() {
+        let mut request = Request {
+            audio_context: false,
+            microphone: None,
+            output: Some("Unused output".into()),
+            cpu: false,
+            native_audio: true,
+            microphone_only: true,
+            control: Control::new(),
+        };
+        assert_eq!(request.source(), Source::Microphone);
+        request.native_audio = false;
+        assert_eq!(request.source(), Source::Microphone);
+        request.microphone_only = false;
+        assert_eq!(request.source(), Source::Mixed);
+        request.native_audio = true;
+        assert_eq!(request.source(), Source::Native);
+    }
+
+    #[test]
+    fn spoken_note_commits_on_microphone_silence_without_a_remote_track() {
+        let mut draft = Draft {
+            mic: vec![0.0; ENDPOINT_SAMPLES],
+            ..Default::default()
+        };
+        assert!(draft.endpoint(true));
+        assert!(!draft.endpoint(false));
+        draft.mic[ENDPOINT_SAMPLES - 1] = 0.1;
+        assert!(!draft.endpoint(true));
+        draft.mic.resize(MAX_DRAFT_SAMPLES, 0.1);
+        assert!(draft.endpoint(true));
+        draft.rows = microphone_rows("Keep this idea.".into(), 32_000, 4_000);
+        let mut committed = Vec::new();
+        draft.commit(&mut |update| {
+            if let Update::Rows(rows) = update {
+                committed.extend(rows);
+            }
+        });
+        assert_eq!(committed.len(), 1);
+        assert!(committed[0].microphone);
+        assert!(committed[0].discord.is_none());
+        assert!(committed[0].speakers.is_empty());
+        assert_eq!((committed[0].start_ms, committed[0].end_ms), (4_000, 6_000));
+        assert!(microphone_rows(String::new(), 32_000, 4_000).is_empty());
+    }
 
     #[test]
     #[ignore = "Requires downloaded models and an ARTICULATE_CALL_REPLAY WAV fixture"]
@@ -418,10 +584,10 @@ mod tests {
             remote: vec![0.1; 8 * 16_000],
             rows: vec![row(0, &[1], false, "Do you want?")],
         };
-        assert!(!draft.endpoint());
+        assert!(!draft.endpoint(false));
         draft.mic.extend(vec![0.0; 4 * 16_000]);
         draft.remote.extend(vec![0.1; 4 * 16_000]);
-        assert!(!draft.endpoint());
+        assert!(!draft.endpoint(false));
         let segments = crate::call_segments::plan(
             &[
                 crate::speakers::Turn {
@@ -476,13 +642,13 @@ mod tests {
             remote: vec![0.1; ENDPOINT_SAMPLES],
             ..Default::default()
         };
-        assert!(!draft.endpoint());
+        assert!(!draft.endpoint(false));
         draft.remote.fill(0.0);
-        assert!(draft.endpoint());
+        assert!(draft.endpoint(false));
         draft.remote.fill(f32::NAN);
-        assert!(!draft.endpoint());
+        assert!(!draft.endpoint(false));
         draft.remote.resize(MAX_DRAFT_SAMPLES, 0.1);
-        assert!(draft.endpoint());
+        assert!(draft.endpoint(false));
         assert_eq!(draft.remaining_seconds(), 0.0);
         draft.commit(&mut |_| {});
         assert_eq!(draft.remaining_seconds(), 24.0);
@@ -490,6 +656,7 @@ mod tests {
 
     fn row(start: u64, speakers: &[i32], microphone: bool, text: &str) -> Row {
         Row {
+            cues: Vec::new(),
             start_ms: start,
             end_ms: start + 8000,
             microphone,
@@ -508,6 +675,66 @@ mod tests {
         assert_eq!(
             text(&rows, &Default::default()),
             "[00:00] Speaker 1: First sentence. Second sentence."
+        );
+    }
+
+    #[test]
+    fn interleaved_turns_sort_by_time_without_grouping_by_person() {
+        let mut rows = Vec::new();
+        // Input grouped by the ASR producer must still display A / B / A.
+        append_rows(
+            &mut rows,
+            vec![
+                row(0, &[1], false, "First speaker starts."),
+                row(9000, &[1], false, "First speaker replies."),
+                row(4000, &[2], false, "Second speaker interrupts."),
+            ],
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.start_ms).collect::<Vec<_>>(),
+            [0, 4000, 9000]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.speakers[0]).collect::<Vec<_>>(),
+            [1, 2, 1]
+        );
+        assert_eq!(
+            rows[0].end_ms, 8000,
+            "Overlapping turns keep their true bounds"
+        );
+        assert_eq!(rows[1].end_ms, 12000);
+        assert_eq!(rows[2].text, "First speaker replies.");
+    }
+
+    #[test]
+    fn short_continuations_bundle_but_long_pauses_keep_their_timestamp() {
+        let mut rows = vec![row(0, &[1], false, "First thought.")];
+        append_rows(&mut rows, vec![row(8500, &[1], false, "Same thought.")]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "First thought. Same thought.");
+        append_rows(
+            &mut rows,
+            vec![row(30_000, &[1], false, "A later thought.")],
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].start_ms, rows[0].end_ms), (0, 16_500));
+        assert_eq!((rows[1].start_ms, rows[1].end_ms), (30_000, 38_000));
+    }
+
+    #[test]
+    fn late_rows_keep_chronological_order_and_do_not_join_backward() {
+        let mut rows = vec![
+            row(0, &[1], false, "First."),
+            row(20_000, &[1], false, "Last."),
+        ];
+        append_rows(&mut rows, vec![row(10_000, &[2], false, "Middle.")]);
+        assert_eq!(
+            rows.iter().map(|row| row.start_ms).collect::<Vec<_>>(),
+            [0, 10_000, 20_000]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["First.", "Middle.", "Last."]
         );
     }
 

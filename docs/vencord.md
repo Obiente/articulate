@@ -1,10 +1,14 @@
 # Articulate companion for Vencord
 
-The optional companion sends current voice channel membership, display names and
+The optional companion sends current voice channel membership, usernames and
 speaking activity and separate participant audio directly to Articulate on the
 same computer. It does not require Discord's debugging port. Audio capture runs
 only while Articulate is recording. It does not read messages or account tokens,
 and does not send anything to an internet service.
+
+Speaker labels prefer Discord usernames over server nicknames and display names.
+Those names are only a fallback if a username is unavailable; participant identity
+continues to use the stable Discord user ID.
 
 This is a **custom Vencord userplugin**, not a plugin available in Vencord's
 official plugin list. Vencord requires a source build to use custom plugins;
@@ -66,22 +70,67 @@ not automatically adopted as app-owned files.
 ## Pairing
 
 1. In Articulate's Discord speaker setup, select the Vencord companion and connect.
-2. Copy the pairing key shown by Articulate.
-3. Enable **Articulate** in Vencord's plugins and paste the key into its settings.
-4. Join a voice channel. Articulate should report a connected speaker source.
+2. Enable **Articulate** in Vencord's plugins. The current companion pairs
+   automatically with Articulate on the same Windows account.
+3. Join a voice channel. Articulate should report a connected speaker source.
+
+No key needs to be copied or pasted. The companion's native helper reads only
+the pairing key from Articulate's local preferences and refreshes it every three
+seconds. It does not expose other preferences or offer a network endpoint for
+retrieving the key.
+
+If you installed an older custom build that still asks for a pairing key, update
+the companion from Articulate's setup, wait for the build to finish, and restart
+Discord. If that checkout is not the one Discord currently loads, choose
+**Open Discord installer** and select your Discord installation first. Reconnect
+from Articulate after the update; rebuilding source files alone does not replace
+the plugin already running in Discord.
 
 After pairing, Articulate automatically opens its receiver on startup and the
 companion reconnects. Explicitly disconnecting disables automatic connection;
-closing Articulate closes the listener. Changing the pairing key requires
-updating it on both sides. Treat the key like a local password; it authorizes
-submitting speaker metadata and participant audio during an active capture.
-Both apps store it in their local settings.
+closing Articulate closes the listener. Reconnecting retries the local pairing;
+the current companion picks up key changes automatically. The random key stays
+in Articulate's local settings and is held in memory by the companion. It
+authorizes submitting speaker metadata and participant audio during an active
+capture. Authentication remains required for every local protocol request.
 
 The optional **Transcribe calls automatically** setting starts a transcript on a
 confirmed voice-channel join when the speech model and separate-audio adapter
 are ready. A confirmed leave finishes only a transcript that this setting
-started. Temporary missing metadata does not finish a call. Manually finishing
-an automatic transcript prevents another start until you leave and join again.
+started. Brief metadata gaps are tolerated; five seconds without confirmed
+presence stops an automatic capture. Manually finishing an automatic transcript
+prevents another start until you leave and join again or choose **Retry automatic
+capture**. Settings shows pairing, participant audio readiness, and any reason
+automatic capture is waiting.
+
+If participant audio is interrupted and then resumes in the same authorized
+capture, recording continues. Missing local audio packets are counted and the
+transcript shows a missing-audio warning; the original timing gap is preserved.
+Packet loss alone does not end the call. A changed voice channel, expired local
+capture permission, invalid audio or exhausted capture buffer still stops it.
+Audio delivered after a section was finalized is trimmed at that boundary;
+new audio continues and the missing-audio warning is retained.
+
+Articulate uses a bundled local voice detector before speech recognition to
+reject silence and background noise. The detector works on each audio clip
+independently and does not filter text by language.
+
+The companion badge compares the version reported by the running Discord
+renderer with the companion bundled in this Articulate build. A successful
+build on disk does not confirm that Discord loaded it. **Restart Discord**
+means the prepared files and the running plugin differ; **Update needed** means
+the prepared files need updating. A disconnected companion cannot be verified.
+Updating this repository alone does not update an already running Articulate
+executable: rebuild and reopen the app before updating the companion.
+
+If speaker names connect but participant audio does not, Settings reports the
+adapter state separately. A missing adapter, unsupported voice version, or
+failed attachment prevents separate-track capture. It does not silently record
+mixed system audio instead.
+
+Actual recording starts and stops produce distinct sounds and a brief overlay
+without taking focus from Discord. **Sound feedback** in Settings controls the
+sounds. Failed starts show an error instead of playing the recording-start cue.
 
 ## What this provides
 

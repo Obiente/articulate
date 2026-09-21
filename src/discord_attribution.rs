@@ -140,6 +140,7 @@ mod tests {
 
     fn row(start_ms: u64, end_ms: u64, speakers: &[i32]) -> Row {
         Row {
+            cues: Vec::new(),
             start_ms,
             end_ms,
             speakers: speakers.to_vec(),

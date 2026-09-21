@@ -1,8 +1,301 @@
 use super::*;
 use crate::history::{Kind, Session, Summary};
-use theme::{INK, MUTED};
+
+#[derive(Default)]
+pub(super) struct State {
+    pending: std::collections::VecDeque<PendingFiling>,
+    routing: Option<Routing>,
+    pub moving: bool,
+    pub status: String,
+}
+
+struct PendingFiling {
+    session: Session,
+    summarized: bool,
+    retry_at: Option<Instant>,
+}
+
+struct Routing {
+    id: String,
+    events: Receiver<Result<crate::topics::Destination, String>>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for Routing {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
 
 impl App {
+    pub(super) fn notetaker_source_moved(&mut self, moved: crate::topics::Moved) {
+        self.notetaker.moving = false;
+        let was_filed = moved.previous_topic_id.is_some();
+        self.notetaker_forget_filing(&moved.source.id);
+        for current in [
+            &mut self.history.call,
+            &mut self.history.dictation,
+            &mut self.history.selected,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if current.id == moved.source.id {
+                current.clone_from(&moved.source);
+            }
+        }
+        self.history.items.retain(|item| item.id != moved.source.id);
+        self.history.items.insert(0, Summary::from(&moved.source));
+        self.notetaker_refresh_collections(moved.collections);
+        self.notetaker.status = if moved.source.topic_id.is_some() && was_filed {
+            "Moved to its new topic. Your original recording is kept."
+        } else if moved.source.topic_id.is_some() {
+            "Filed into its topic. You can move this recording at any time."
+        } else {
+            "This recording is now kept separately."
+        }
+        .into();
+        if let Some(worker) = &self.history.worker {
+            worker.list();
+        }
+    }
+
+    pub(super) fn notetaker_refresh_collections(&mut self, collections: Vec<Session>) {
+        for mut collection in collections {
+            self.brain.forget(&collection.id);
+            if collection.sources.is_empty() {
+                if let Some(previous) = collection.generated_summary.take() {
+                    collection.personal_notes = collection
+                        .personal_notes
+                        .split("\n\n")
+                        .filter(|paragraph| {
+                            !previous.items.iter().any(|item| item.text == *paragraph)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                }
+            } else {
+                self.brain_queue_session(collection.clone());
+            }
+            // Persist pruning immediately even when the model is not installed.
+            if let Some(worker) = &self.history.worker {
+                worker.save(collection.clone());
+            }
+            if self
+                .history
+                .selected
+                .as_ref()
+                .is_some_and(|selected| selected.id == collection.id)
+            {
+                self.history.selected = Some(collection.clone());
+            }
+            self.history.items.retain(|item| item.id != collection.id);
+            self.history.items.insert(0, Summary::from(&collection));
+        }
+    }
+
+    pub(super) fn notetaker_routing_busy(&self) -> bool {
+        self.notetaker.routing.is_some() || self.notetaker.moving
+    }
+
+    pub(super) fn notetaker_queue_filing(&mut self, session: Session) {
+        if session.is_collection || session.topic_id.is_some() || session.text.trim().is_empty() {
+            return;
+        }
+        if self
+            .notetaker
+            .pending
+            .iter()
+            .any(|item| item.session.id == session.id)
+        {
+            return;
+        }
+        if self.notetaker.pending.len() >= 32 {
+            self.notetaker.status =
+                "This recording is saved separately. Open it to file it into a topic.".into();
+            return;
+        }
+        let summarized = self.brain_source_current(&session)
+            || session
+                .generated_summary
+                .as_ref()
+                .is_some_and(|draft| draft.validate(&super::brain_ui::source(&session)).is_ok());
+        self.notetaker.pending.push_back(PendingFiling {
+            session,
+            summarized,
+            retry_at: None,
+        });
+        if !crate::polish::profile_installed(crate::polish::ModelProfile::Summary) {
+            self.notetaker.status = "Saved separately. Download the notes model in Settings to organize your spoken notes.".into();
+        }
+    }
+
+    pub(super) fn notetaker_summary_ready(&mut self, session: &Session) {
+        if let Some(pending) = self
+            .notetaker
+            .pending
+            .iter_mut()
+            .find(|p| p.session.id == session.id)
+        {
+            pending.session = session.clone();
+            pending.summarized = true;
+        }
+    }
+
+    pub(super) fn notetaker_forget_filing(&mut self, id: &str) {
+        self.notetaker.pending.retain(|p| p.session.id != id);
+        if self
+            .notetaker
+            .routing
+            .as_ref()
+            .is_some_and(|job| job.id == id)
+        {
+            self.notetaker.routing = None;
+        }
+    }
+
+    pub(super) fn notetaker_poll_filing(&mut self) {
+        if let Some(job) = &self.notetaker.routing {
+            let result = match job.events.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "Topic filing stopped. Your recording is saved separately.".into(),
+                )),
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(result) = result {
+                let id = job.id.clone();
+                self.notetaker.routing = None;
+                match result {
+                    Ok(destination) => {
+                        self.history_save_personal_notes();
+                        if let Some(pending) =
+                            self.notetaker.pending.iter().find(|p| p.session.id == id)
+                            && let Some(worker) = &self.history.worker
+                        {
+                            self.notetaker.moving = true;
+                            worker.move_source(
+                                id.clone(),
+                                destination,
+                                pending.session.topic_id.clone(),
+                            );
+                        }
+                        self.notetaker.pending.retain(|p| p.session.id != id);
+                        self.notetaker.status = "Saving your recording into its topic…".into();
+                    }
+                    Err(error) => {
+                        self.notetaker.status = error;
+                        if let Some(pending) = self
+                            .notetaker
+                            .pending
+                            .iter_mut()
+                            .find(|p| p.session.id == id)
+                        {
+                            pending.retry_at = Some(Instant::now() + Duration::from_secs(45));
+                        }
+                    }
+                }
+            }
+        }
+        if self.notetaker_routing_busy()
+            || self.history.worker.is_none()
+            || self.brain_working()
+            || self.polish_working()
+            || self.call.is_some()
+            || self.recording.is_some()
+            || self.busy
+            || self.loading
+            || !crate::polish::profile_installed(crate::polish::ModelProfile::Summary)
+        {
+            return;
+        }
+        let Some(pending) = self
+            .notetaker
+            .pending
+            .iter()
+            .find(|p| p.retry_at.is_none_or(|at| at <= Instant::now()))
+        else {
+            return;
+        };
+        if !pending.summarized {
+            self.brain_queue_session(pending.session.clone());
+            return;
+        }
+        let session = pending.session.clone();
+        let candidates = self
+            .history
+            .items
+            .iter()
+            .filter(|item| item.can_receive_sources)
+            .take(crate::topics::MAX_CANDIDATES)
+            .map(|item| crate::topics::Candidate {
+                id: item.id.clone(),
+                title: item.title.clone(),
+                preview: item.preview.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (sender, events) = mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_cancel = cancel.clone();
+        let id = session.id.clone();
+        match std::thread::Builder::new()
+            .name("note-topic-filing".into())
+            .spawn(move || {
+                let result = crate::brain::route_topic(&session, &candidates, &task_cancel)
+                    .map_err(|e| e.to_string());
+                let _ = sender.send(result);
+            }) {
+            Ok(_) => {
+                self.notetaker.routing = Some(Routing { id, events, cancel });
+                self.notetaker.status = "Finding the right topic for your note…".into();
+            }
+            Err(error) => self.notetaker.status = error.to_string(),
+        }
+    }
+
+    pub(super) fn is_note_capture(&self) -> bool {
+        self.history
+            .call
+            .as_ref()
+            .is_some_and(|s| s.kind == Kind::Note)
+    }
+
+    pub(super) fn notetaker_toggle_capture(&mut self) -> Result<(), String> {
+        if self.call.is_some() && self.is_note_capture() {
+            return self.notetaker_stop_capture();
+        }
+        self.notetaker_start_capture()
+    }
+
+    pub(super) fn notetaker_start_capture(&mut self) -> Result<(), String> {
+        if !self.ready || self.loading || self.downloading.is_some() {
+            return Err("Wait for the speech model before recording a note.".into());
+        }
+        if self.recording.is_some() || self.call.is_some() || self.busy || self.preview_inflight {
+            return Err("Finish the current recording before starting a spoken note.".into());
+        }
+        self.history_save_personal_notes();
+        if !self.start_stream_capture(true) {
+            return Err(self.call_status.clone());
+        }
+        self.history.selected = self.history.call.clone();
+        self.history.open_requested = None;
+        self.history.notetaker_tab = 0;
+        self.page = 6;
+        Ok(())
+    }
+
+    pub(super) fn notetaker_stop_capture(&mut self) -> Result<(), String> {
+        if !self.is_note_capture() {
+            return Err("There is no spoken note recording to finish.".into());
+        }
+        if let Some(control) = &self.call {
+            control.stop();
+            self.call_status = "Finishing your spoken note…".into();
+        }
+        Ok(())
+    }
+
     pub(super) fn notetaker_hub(&mut self) {
         self.history_save_personal_notes();
         self.history.selected = None;
@@ -23,7 +316,6 @@ impl App {
         self.history.detail_search.clear();
         self.history.notice.clear();
         self.history.confirm_delete = false;
-        self.history.notetaker_assort = assort_ui::State::configured(self.settings.assort.clone());
         self.page = 6;
         self.history_save_personal_notes();
     }
@@ -38,7 +330,6 @@ impl App {
             return;
         }
         self.history.notetaker_tab = 0;
-        self.history.notetaker_assort = assort_ui::State::configured(self.settings.assort.clone());
         if let Some(session) = &self.history.call
             && session.id == id
         {
@@ -62,8 +353,13 @@ impl App {
     }
 
     /// Mirror personal edits immediately, before a concurrent ASR snapshot can
-    /// enqueue its next save. Transcript/highlight fields remain independent.
+    /// enqueue its next save. Transcript fields remain independent.
+    #[allow(
+        dead_code,
+        reason = "Document editing and complete note export retained for the Tauri workspace"
+    )]
     fn notetaker_changed(&mut self, session: &Session) {
+        self.brain.remember(session);
         if let Some(current) = &mut self.history.call
             && current.id == session.id
         {
@@ -71,7 +367,11 @@ impl App {
             current
                 .generated_summary
                 .clone_from(&session.generated_summary);
+            current
+                .protected_note_items
+                .clone_from(&session.protected_note_items);
             current.title.clone_from(&session.title);
+            current.title_is_manual = session.title_is_manual;
             self.history_call_changed();
         }
         self.history.selected_dirty.get_or_insert_with(Instant::now);
@@ -86,6 +386,10 @@ impl App {
             return;
         };
         self.history.selected_dirty = None;
+        self.brain.remember(&session);
+        if self.history.pending_deletions.contains(&session.id) {
+            return;
+        }
         if let Some(current) = &mut self.history.call
             && current.id == session.id
         {
@@ -93,7 +397,11 @@ impl App {
             current
                 .generated_summary
                 .clone_from(&session.generated_summary);
+            current
+                .protected_note_items
+                .clone_from(&session.protected_note_items);
             current.title.clone_from(&session.title);
+            current.title_is_manual = session.title_is_manual;
             self.history_save_call();
             self.history.selected = self.history.call.clone();
         } else if let Some(worker) = &self.history.worker {
@@ -102,623 +410,24 @@ impl App {
         self.history.items.retain(|item| item.id != session.id);
         self.history.items.insert(0, Summary::from(&session));
     }
-
-    fn notetaker_save_status(&mut self, ui: &mut egui::Ui) {
-        if let Some(error) = self.history.error.clone() {
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(Color32::LIGHT_YELLOW, "Changes need attention")
-                    .on_hover_text(error);
-                if ui.button("Retry saving").clicked() {
-                    self.history.notetaker_retry = true;
-                }
-            });
-            return;
-        }
-        let settled = self
-            .history
-            .worker
-            .as_ref()
-            .map(|worker| worker.saves_settled());
-        match settled {
-            Some(Err(error)) => {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(Color32::LIGHT_YELLOW, "Not saved yet")
-                        .on_hover_text(error);
-                    if ui.button("Retry saving").clicked() {
-                        self.history.notetaker_retry = true;
-                    }
-                });
-            }
-            Some(Ok(true))
-                if self.history.selected_dirty.is_none() && self.history.call_dirty.is_none() =>
-            {
-                ui.label(RichText::new("Saved on this device").small().color(MUTED));
-            }
-            Some(_) => {
-                ui.label(RichText::new("Saving…").small().color(MUTED));
-            }
-            None => {
-                ui.label(
-                    RichText::new(
-                        "Saving is unavailable. Keep this window open or copy your notes.",
-                    )
-                    .small()
-                    .color(MUTED),
-                );
-            }
-        }
-    }
-
-    pub(super) fn notetaker_ui(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
-        if self.history.selected.is_some() {
-            self.notetaker_detail_ui(ui);
-            return;
-        }
-        ui.horizontal(|ui| {
-            theme::page_title(ui, "Notetaker");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add(primary("New note")).clicked() {
-                    self.notetaker_new_note();
-                }
-                if ui.button("Record a conversation").clicked() {
-                    self.page = 3;
-                    self.call_tab = 2;
-                }
-            });
-        });
-        ui.label(RichText::new("Your conversations and personal notes, together.").color(MUTED));
-        ui.add_space(12.0);
-        self.notetaker_active_card(ui);
-        if self.history.error.is_some() {
-            self.notetaker_save_status(ui);
-        }
-        ui.add(
-            egui::TextEdit::singleline(&mut self.history.notetaker_search)
-                .hint_text("Search titles and previews")
-                .desired_width(f32::INFINITY)
-                .margin(egui::vec2(12.0, 10.0)),
-        );
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.history.notetaker_filter, 0, "All notes");
-            ui.selectable_value(&mut self.history.notetaker_filter, 1, "Conversations");
-            ui.selectable_value(&mut self.history.notetaker_filter, 2, "Personal notes");
-            if ui.small_button("Refresh").clicked()
-                && let Some(worker) = &self.history.worker
-            {
-                worker.list();
-            }
-        });
-        ui.add_space(12.0);
-        if self.history.open_requested.is_some() && self.history.error.is_none() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Opening your note…");
-            });
-        }
-        let query = self.history.notetaker_search.trim().to_lowercase();
-        let mut items: Vec<_> = self
-            .history
-            .items
-            .iter()
-            .filter(|item| {
-                item.kind != Kind::Dictation
-                    && !(self.call.is_some()
-                        && self.history.call.as_ref().is_some_and(|s| s.id == item.id))
-                    && (self.history.notetaker_filter != 1 || item.kind == Kind::Call)
-                    && (self.history.notetaker_filter != 2 || item.kind == Kind::Note)
-                    && (query.is_empty()
-                        || format!("{} {}", item.title, item.preview)
-                            .to_lowercase()
-                            .contains(&query))
-            })
-            .collect();
-        items.sort_by(|a, b| {
-            b.created_ms
-                .cmp(&a.created_ms)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let mut open = None;
-        egui::ScrollArea::vertical()
-            .id_salt("notetaker_hub")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let mut group = String::new();
-                for item in &items {
-                    let day = day_label(item.created_ms);
-                    if day != group {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(&day).small().color(MUTED));
-                        ui.add_space(6.0);
-                        group = day;
-                    }
-                    egui::Frame::new()
-                        .fill(theme::SURFACE)
-                        .corner_radius(12)
-                        .inner_margin(16.0)
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.horizontal_top(|ui| {
-                                ui.add(if item.kind == Kind::Call {
-                                    theme::Icon::Phone.image(22.0, ACCENT)
-                                } else {
-                                    theme::Icon::Book.image(22.0, ACCENT)
-                                });
-                                ui.vertical(|ui| {
-                                    ui.set_min_width(ui.available_width());
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new(&item.title).size(18.0).color(INK),
-                                            )
-                                            .frame(false)
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(&item.title)
-                                        .clicked()
-                                    {
-                                        open = Some(item.id.clone());
-                                    }
-                                    ui.label(
-                                        RichText::new(meeting_metadata(item)).small().color(MUTED),
-                                    )
-                                    .on_hover_text(full_time(item.created_ms));
-                                    if !item.preview.is_empty() {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&item.preview).color(MUTED),
-                                            )
-                                            .truncate(),
-                                        );
-                                    }
-                                });
-                            });
-                        });
-                    ui.add_space(6.0);
-                }
-                if items.is_empty() {
-                    ui.add_space(32.0);
-                    ui.label(
-                        RichText::new(if self.history.loading {
-                            "Opening your notes…"
-                        } else if query.is_empty() {
-                            "A place to think and remember"
-                        } else {
-                            "No matching notes"
-                        })
-                        .size(23.0),
-                    );
-                    ui.label(
-                        RichText::new(if query.is_empty() {
-                            "Start a personal note now, or record a conversation when you're ready."
-                        } else {
-                            "Try a different title or phrase."
-                        })
-                        .color(MUTED),
-                    );
-                }
-            });
-        if let Some(id) = open {
-            self.notetaker_open(id);
-        }
-    }
-
-    fn notetaker_active_card(&mut self, ui: &mut egui::Ui) {
-        let Some(control) = &self.call else {
-            return;
-        };
-        let seconds = control.end_seconds() as u64;
-        let title = self
-            .history
-            .call
-            .as_ref()
-            .map(|s| s.title.as_str())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Current conversation");
-        let title = title.to_owned();
-        egui::Frame::new()
-            .fill(theme::SELECTED)
-            .corner_radius(12)
-            .inner_margin(16.0)
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let width = (ui.available_width() - 200.0).max(120.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(width, 50.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "Recording · {:02}:{:02}",
-                                    seconds / 60,
-                                    seconds % 60
-                                ))
-                                .small()
-                                .color(ACCENT),
-                            );
-                            ui.add(egui::Label::new(RichText::new(title).size(19.0)).truncate());
-                        },
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Open current note").clicked() {
-                            self.notetaker_return_to_capture();
-                        }
-                    });
-                });
-            });
-        ui.add_space(14.0);
-    }
-
-    pub(super) fn call_personal_notes_ui(&mut self, ui: &mut egui::Ui) {
-        if self.history.call.is_none() && self.call.is_some() {
-            self.history.call = Some(Session::new(Kind::Call));
-        }
-        let Some(mut session) = self.history.call.take() else {
-            ui.add_space(16.0);
-            ui.label("Start a conversation to write alongside the transcript, or create a personal note.");
-            if ui.button("New personal note").clicked() {
-                self.notetaker_new_note();
-            }
-            return;
-        };
-        self.notetaker_save_status(ui);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Your own notes").color(MUTED));
-            note_copy_actions(ui, &session.personal_notes, &mut self.history.notice);
-        });
-        ui.add_space(8.0);
-        let changed = personal_editor(ui, &mut session, "live_personal_notes");
-        self.history.call = Some(session);
-        if changed {
-            self.history_call_changed();
-        }
-        if !self.history.notice.is_empty() {
-            ui.label(RichText::new(&self.history.notice).small().color(MUTED));
-        }
-    }
-
-    pub(super) fn notetaker_detail_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(mut session) = self.history.selected.take() else {
-            return;
-        };
-        // The active call remains the authoritative transcript while personal
-        // edits are mirrored synchronously by notetaker_changed.
-        if let Some(current) = &self.history.call
-            && current.id == session.id
-        {
-            session.rows.clone_from(&current.rows);
-            session.text.clone_from(&current.text);
-            session.notes.clone_from(&current.notes);
-        }
-        let mut back = false;
-        let mut changed = false;
-        let mut deleting = false;
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(if self.page == 5 {
-                        "Back to history"
-                    } else {
-                        "Back to Notetaker"
-                    })
-                    .frame(false),
-                )
-                .clicked()
-            {
-                back = true;
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.notetaker_save_status(ui);
-            });
-        });
-        ui.add_space(8.0);
-        changed |= ui
-            .add(
-                egui::TextEdit::singleline(&mut session.title)
-                    .hint_text("Untitled note")
-                    .font(egui::FontId::proportional(28.0))
-                    .frame(false)
-                    .desired_width(f32::INFINITY)
-                    .char_limit(120),
-            )
-            .changed();
-        ui.label(
-            RichText::new(format!(
-                "{} · {}",
-                if session.kind == Kind::Call {
-                    "Conversation"
-                } else {
-                    "Personal note"
-                },
-                full_time(session.created_ms)
-            ))
-            .small()
-            .color(MUTED),
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.history.notetaker_tab, 0, "My notes");
-            if session.kind == Kind::Call {
-                ui.selectable_value(&mut self.history.notetaker_tab, 3, "Summary");
-                ui.selectable_value(&mut self.history.notetaker_tab, 1, "Highlights");
-                ui.selectable_value(&mut self.history.notetaker_tab, 2, "Transcript");
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("More", |ui| {
-                    if ui.button("Copy full note").clicked() {
-                        self.history.notice = copy_text(&full_note(&session), "Full note copied");
-                        ui.close();
-                    }
-                    if ui.button("Export full note").clicked() {
-                        self.history.notice = export_text(&full_note(&session));
-                        ui.close();
-                    }
-                    if ui.button("Delete note").clicked() {
-                        self.history.confirm_delete = true;
-                        ui.close();
-                    }
-                });
-            });
-        });
-        if self.history.confirm_delete {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Delete this note and its transcript from this device?");
-                if ui.button("Delete permanently").clicked()
-                    && let Some(worker) = &self.history.worker
-                {
-                    worker.delete(session.id.clone());
-                    self.history.selected_dirty = None;
-                    deleting = true;
-                    back = true;
-                }
-                if ui.button("Keep note").clicked() {
-                    self.history.confirm_delete = false;
-                }
-            });
-        }
-        if !self.history.notice.is_empty() {
-            ui.label(RichText::new(&self.history.notice).small().color(ACCENT));
-        }
-        ui.separator();
-        match self.history.notetaker_tab {
-            3 if session.kind == Kind::Call => {
-                changed |= self.brain_summary_ui(ui, &mut session);
-            }
-            1 if session.kind == Kind::Call => {
-                egui::ScrollArea::vertical()
-                    .id_salt(("saved_highlights", &session.id))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let input = source_transcript(&session);
-                        let configuration = self.history.notetaker_assort.configuration.clone();
-                        if let Some(summary) = assort_ui::show(
-                            ui,
-                            &mut self.history.notetaker_assort,
-                            input.as_ref(),
-                            true,
-                        ) && let Some(input) = input.as_ref()
-                        {
-                            match assort_ui::to_notes(
-                                &summary,
-                                input,
-                                &session.rows,
-                                &session.speaker_names,
-                            ) {
-                                Ok(notes) => {
-                                    session.notes = Some(notes);
-                                    if self
-                                        .history
-                                        .call
-                                        .as_ref()
-                                        .is_some_and(|s| s.id == session.id)
-                                    {
-                                        self.call_notes.clone_from(&session.notes);
-                                        if let Some(current) = &mut self.history.call {
-                                            current.notes.clone_from(&session.notes);
-                                        }
-                                    }
-                                    changed = true;
-                                }
-                                Err(error) => self.history.notice = error.to_string(),
-                            }
-                        }
-                        if configuration != self.history.notetaker_assort.configuration {
-                            self.settings.assort =
-                                self.history.notetaker_assort.configuration.clone();
-                            self.assort.configuration.clone_from(&self.settings.assort);
-                            self.save();
-                        }
-                        if let Some(notes) = &session.notes {
-                            ui.add_space(16.0);
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("Saved highlights").size(20.0));
-                                if ui.button("Copy highlights").clicked() {
-                                    self.history.notice = copy_text(
-                                        &notes.text(&session.speaker_names),
-                                        "Highlights copied",
-                                    );
-                                }
-                            });
-                            ui.label(
-                                RichText::new("Exact excerpts with speaker-turn time ranges.")
-                                    .small()
-                                    .color(MUTED),
-                            );
-                            for (heading, quotes) in [
-                                ("Highlights", &notes.highlights),
-                                ("Possible actions", &notes.actions),
-                            ] {
-                                if quotes.is_empty() {
-                                    continue;
-                                }
-                                ui.add_space(14.0);
-                                ui.strong(heading);
-                                for quote in quotes {
-                                    ui.label(
-                                        RichText::new(quote.attribution(&session.speaker_names))
-                                            .small()
-                                            .color(ACCENT),
-                                    );
-                                    ui.add(
-                                        egui::Label::new(RichText::new(&quote.text).size(18.0))
-                                            .selectable(true),
-                                    );
-                                    ui.add_space(12.0);
-                                }
-                            }
-                        }
-                    });
-            }
-            2 if session.kind == Kind::Call => {
-                ui.horizontal_wrapped(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.history.detail_search)
-                            .hint_text("Find words or a speaker")
-                            .margin(egui::vec2(10.0, 8.0))
-                            .desired_width((ui.available_width() - 300.0).clamp(140.0, 480.0)),
-                    );
-                    if ui.button("Copy transcript").clicked() {
-                        self.history.notice = copy_text(&session.text, "Transcript copied");
-                    }
-                    ui.menu_button("Export", |ui| {
-                        for (label, extension, format) in [
-                            ("Plain text", "txt", crate::call_export::Format::Text),
-                            ("Markdown", "md", crate::call_export::Format::Markdown),
-                            ("Subtitles (SRT)", "srt", crate::call_export::Format::Srt),
-                            (
-                                "Subtitles (WebVTT)",
-                                "vtt",
-                                crate::call_export::Format::WebVtt,
-                            ),
-                        ] {
-                            if ui.button(label).clicked() {
-                                let text = crate::call_export::export(
-                                    &session.rows,
-                                    &session.speaker_names,
-                                    format,
-                                );
-                                self.history.notice =
-                                    match crate::export_file::save(&text, extension) {
-                                        Ok(true) => "Transcript exported".into(),
-                                        Ok(false) => "Export cancelled".into(),
-                                        Err(error) => error.to_string(),
-                                    };
-                                ui.close();
-                            }
-                        }
-                    });
-                });
-                let query = self.history.detail_search.trim().to_lowercase();
-                egui::ScrollArea::vertical()
-                    .id_salt(("notetaker_transcript", &session.id))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_max_width(840.0_f32.min(ui.available_width()));
-                        if session.rows.is_empty() {
-                            ui.label("This conversation has no transcript yet.");
-                        }
-                        for row in &session.rows {
-                            if !query.is_empty()
-                                && !row.text.to_lowercase().contains(&query)
-                                && !calls::label(row, &session.speaker_names)
-                                    .to_lowercase()
-                                    .contains(&query)
-                            {
-                                continue;
-                            }
-                            ui.add_space(16.0);
-                            theme::transcript_row(ui, row, &session.speaker_names, &self.avatars);
-                        }
-                    });
-            }
-            _ => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Write what matters to you.").color(MUTED));
-                    note_copy_actions(ui, &session.personal_notes, &mut self.history.notice);
-                });
-                ui.add_space(8.0);
-                changed |= personal_editor(ui, &mut session, "saved_personal_notes");
-            }
-        }
-        if changed && !deleting {
-            self.notetaker_changed(&session);
-        }
-        self.history.selected = Some(session);
-        if back {
-            self.history_save_personal_notes();
-            self.history.selected = None;
-            self.history.confirm_delete = false;
-        }
-    }
 }
 
-fn primary(label: &str) -> egui::Button<'_> {
-    egui::Button::new(RichText::new(label).color(Color32::from_rgb(13, 34, 30)))
-        .fill(ACCENT)
-        .min_size(egui::vec2(110.0, 38.0))
-}
-
-fn personal_editor(ui: &mut egui::Ui, session: &mut Session, salt: &str) -> bool {
-    let mut changed = false;
-    let height = ui.available_height().max(100.0);
-    egui::ScrollArea::vertical()
-        .id_salt((salt, &session.id))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let width = ui.available_width().min(920.0);
-            changed = ui
-                .add_sized(
-                    [width, (height - 16.0).max(100.0)],
-                    egui::TextEdit::multiline(&mut session.personal_notes)
-                        .id(egui::Id::new((salt, &session.id)))
-                        .font(egui::FontId::proportional(19.0))
-                        .desired_width(width)
-                        .desired_rows(12)
-                        .margin(egui::vec2(16.0, 14.0))
-                        .char_limit(1_000_000)
-                        .hint_text("Ideas, questions, next steps…"),
-                )
-                .changed();
-        });
-    changed
-}
-
-fn note_copy_actions(ui: &mut egui::Ui, text: &str, notice: &mut String) {
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        if ui
-            .add_enabled(!text.is_empty(), egui::Button::new("Export notes"))
-            .clicked()
-        {
-            *notice = export_text(text);
-        }
-        if ui
-            .add_enabled(!text.is_empty(), egui::Button::new("Copy notes"))
-            .clicked()
-        {
-            *notice = copy_text(text, "Notes copied");
-        }
-    });
-}
-fn copy_text(text: &str, success: &str) -> String {
-    platform::copy(text)
-        .map(|()| success.into())
-        .unwrap_or_else(|error| error.to_string())
-}
-fn export_text(text: &str) -> String {
-    match crate::export_file::save(text, "md") {
-        Ok(true) => "Note exported".into(),
-        Ok(false) => "Export cancelled".into(),
-        Err(error) => error.to_string(),
-    }
-}
+#[allow(
+    dead_code,
+    reason = "Document editing and complete note export retained for the Tauri workspace"
+)]
 fn full_note(session: &Session) -> String {
     let mut text = format!(
-        "# {}\n\n{}\n\n## My notes\n\n{}\n",
+        "# {}\n\n{}\n\n## Notes\n\n{}\n",
         session.title,
         full_time(session.created_ms),
         session.personal_notes
     );
-    if let Some(summary) = &session.generated_summary {
+    // Older sessions can have a saved summary without a notes document.
+    // Once the document exists, it is the authoritative edited version.
+    if session.personal_notes.trim().is_empty()
+        && let Some(summary) = &session.generated_summary
+    {
         let stale = summary.validate(&super::brain_ui::source(session)).is_err();
         text.push_str(&format!(
             "\n## Summary{}\n\n{}\n",
@@ -741,36 +450,19 @@ fn full_note(session: &Session) -> String {
     }
     text
 }
-fn source_transcript(session: &Session) -> Option<crate::classification::Transcript> {
-    let mut segments: Vec<_> = session
-        .rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| !row.text.trim().is_empty())
-        .map(|(index, row)| crate::classification::Segment {
-            id: format!("row-{index}"),
-            start_ms: row.start_ms,
-            end_ms: row.end_ms,
-            speaker: Some(calls::label(row, &session.speaker_names)),
-            text: row.text.clone(),
-        })
-        .collect();
-    if segments.is_empty() {
-        return None;
-    }
-    segments.sort_by_key(|segment| segment.start_ms);
-    Some(crate::classification::Transcript {
-        id: session.id.clone(),
-        title: session.title.clone(),
-        goal: "Capture final decisions, assigned actions, and important facts.".into(),
-        segments,
-    })
-}
+#[allow(
+    dead_code,
+    reason = "Document editing and complete note export retained for the Tauri workspace"
+)]
 fn local_time(ms: u64) -> time::OffsetDateTime {
     let utc = time::OffsetDateTime::from_unix_timestamp((ms / 1000).min(i64::MAX as u64) as i64)
         .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     utc.to_offset(time::UtcOffset::local_offset_at(utc).unwrap_or(time::UtcOffset::UTC))
 }
+#[allow(
+    dead_code,
+    reason = "Document editing and complete note export retained for the Tauri workspace"
+)]
 fn full_time(ms: u64) -> String {
     let time = local_time(ms);
     format!(
@@ -782,45 +474,27 @@ fn full_time(ms: u64) -> String {
         time.minute()
     )
 }
-fn day_label(ms: u64) -> String {
-    let time = local_time(ms);
-    let now = time::OffsetDateTime::now_utc();
-    let now = now.to_offset(time::UtcOffset::local_offset_at(now).unwrap_or(time::UtcOffset::UTC));
-    if time.date() == now.date() {
-        "Today".into()
-    } else if Some(time.date()) == now.date().previous_day() {
-        "Yesterday".into()
-    } else {
-        format!(
-            "{:04}-{:02}-{:02}",
-            time.year(),
-            u8::from(time.month()),
-            time.day()
-        )
-    }
-}
-fn meeting_metadata(item: &Summary) -> String {
-    let time = local_time(item.created_ms);
-    let kind = if item.kind == Kind::Call {
-        "Conversation"
-    } else {
-        "Personal note"
-    };
-    if item.duration_ms > 0 {
-        format!(
-            "{kind} · {:02}:{:02} · {} min",
-            time.hour(),
-            time.minute(),
-            item.duration_ms.div_ceil(60_000)
-        )
-    } else {
-        format!("{kind} · {:02}:{:02}", time.hour(), time.minute())
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_before_navigation_refreshes_active_summary_owner() {
+        let (mut app, _) = super::super::tests::app();
+        let mut session = Session::new(Kind::Call);
+        session.personal_notes = "Latest user edit".into();
+        // The owner-cache regression is exercised through its public test helper.
+        app.prepare_active_summary_owner_for_test(&session);
+        session.personal_notes = "Revised immediately before leaving".into();
+        app.history.selected = Some(session.clone());
+        app.history.selected_dirty = Some(Instant::now());
+        app.notetaker_hub();
+        assert_eq!(
+            app.active_summary_owner_notes_for_test(&session.id),
+            session.personal_notes
+        );
+    }
 
     #[test]
     fn personal_note_needs_no_model_or_audio_and_does_not_touch_dictation() {
@@ -837,6 +511,116 @@ mod tests {
             commands.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn spoken_note_uses_only_microphone_and_keeps_dictation_separate() {
+        let (mut app, commands) = super::super::tests::app();
+        app.preview_inflight = false;
+        app.settings.audio_feedback = false;
+        app.settings.discord_companion = true;
+        app.settings.insert = true;
+        app.settings.output = Some("Unrelated output".into());
+        app.text = "An earlier dictation".into();
+        app.notetaker_start_capture().unwrap();
+        let Command::Call(request, _) = commands.try_recv().unwrap() else {
+            panic!("Spoken notes must use streaming capture");
+        };
+        assert!(request.microphone_only);
+        assert!(!request.native_audio);
+        assert!(request.output.is_none());
+        assert!(app.target.is_none());
+        assert!(app.recording.is_none());
+        assert!(app.is_note_capture());
+        assert_eq!(app.history.selected.as_ref().unwrap().kind, Kind::Note);
+        assert_eq!(app.text, "An earlier dictation");
+        app.notetaker_toggle_capture().unwrap();
+        assert!(request.control.stop_ns.load(Ordering::SeqCst) != 0);
+    }
+
+    #[test]
+    fn spoken_note_source_updates_leave_written_document_untouched() {
+        let (mut app, _) = super::super::tests::app();
+        let mut note = Session::new(Kind::Note);
+        note.title = "Spoken note".into();
+        note.personal_notes = "A reminder I wrote myself.".into();
+        app.history.call = Some(note.clone());
+        app.history.selected = Some(note.clone());
+        app.call_rows.push(calls::Row {
+            cues: Vec::new(),
+            start_ms: 0,
+            end_ms: 2000,
+            microphone: true,
+            speakers: Vec::new(),
+            discord: None,
+            text: "I want to plan a workshop.".into(),
+        });
+        app.history_save_call();
+        let saved = app.history.call.as_ref().unwrap();
+        assert_eq!(saved.personal_notes, note.personal_notes);
+        assert_eq!(saved.original, saved.text);
+        assert!(saved.text.contains("plan a workshop"));
+        assert_eq!(app.history.selected.as_ref().unwrap().rows.len(), 1);
+    }
+
+    #[test]
+    fn quick_note_cannot_start_over_another_capture() {
+        let (mut app, commands) = super::super::tests::app();
+        app.call = Some(call_capture::Control::new());
+        app.history.call = Some(Session::new(Kind::Call));
+        assert!(app.notetaker_toggle_capture().is_err());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(app.history.call.as_ref().unwrap().kind, Kind::Call);
+    }
+
+    #[test]
+    fn empty_topic_after_move_keeps_manual_paragraphs_and_source_identity() {
+        let (mut app, _) = super::super::tests::app();
+        let mut collection = Session::new(Kind::Note);
+        collection.is_collection = true;
+        collection.title = "Workshop".into();
+        collection.personal_notes = "Generated workshop detail.\n\nMy own reminder.".into();
+        collection.generated_summary = Some(crate::brain::Draft {
+            title: None,
+            schema: 1,
+            source_id: collection.id.clone(),
+            source_hash: "synthetic".into(),
+            model: crate::brain::MODEL_LABEL.into(),
+            sections: 1,
+            elapsed_ms: 1,
+            items: vec![crate::brain::Item {
+                kind: crate::brain::Kind::Fact,
+                text: "Generated workshop detail.".into(),
+                section: 1,
+                sources: Vec::new(),
+            }],
+        });
+        app.history.selected = Some(collection.clone());
+        let mut source = Session::new(Kind::Note);
+        source.text = "Original independent recording.".into();
+        source.original = source.text.clone();
+        app.history.call = Some(source.clone());
+        app.notetaker_source_moved(crate::topics::Moved {
+            source: source.clone(),
+            previous_topic_id: Some(collection.id.clone()),
+            collections: vec![collection],
+        });
+        let selected = app.history.selected.as_ref().unwrap();
+        assert_eq!(selected.personal_notes, "My own reminder.");
+        assert!(selected.generated_summary.is_none());
+        assert_eq!(app.history.call.as_ref().unwrap().id, source.id);
+        assert_eq!(app.history.call.as_ref().unwrap().original, source.original);
+    }
+
+    #[test]
+    fn deleting_queued_source_prevents_later_automatic_filing() {
+        let (mut app, _) = super::super::tests::app();
+        let mut source = Session::new(Kind::Note);
+        source.text = "Save this thought separately.".into();
+        app.notetaker_queue_filing(source.clone());
+        assert_eq!(app.notetaker.pending.len(), 1);
+        app.notetaker_forget_filing(&source.id);
+        assert!(app.notetaker.pending.is_empty());
     }
 
     #[test]
@@ -873,6 +657,7 @@ mod tests {
         app.history.selected = Some(session.clone());
         app.notetaker_changed(&session);
         app.call_rows.push(calls::Row {
+            cues: Vec::new(),
             start_ms: 0,
             end_ms: 2000,
             microphone: true,
@@ -897,6 +682,7 @@ mod tests {
         let (mut app, _) = super::super::tests::app();
         let mut session = Session::new(Kind::Call);
         session.generated_summary = Some(crate::brain::Draft {
+            title: None,
             schema: 1,
             source_id: session.id.clone(),
             source_hash: "synthetic".into(),
@@ -931,11 +717,12 @@ mod tests {
     }
 
     #[test]
-    fn highlight_sources_and_full_export_keep_personal_notes_separate() {
+    fn full_export_keeps_saved_notes_and_legacy_excerpts() {
         let mut session = Session::new(Kind::Call);
         session.title = "Planning".into();
         session.personal_notes = "A private idea not spoken.".into();
         session.rows.push(calls::Row {
+            cues: Vec::new(),
             start_ms: 0,
             end_ms: 2000,
             microphone: true,
@@ -945,14 +732,31 @@ mod tests {
         });
         session.text = calls::text(&session.rows, &session.speaker_names);
         session.notes = Some(crate::notes::Notes::build(&session.rows));
-        let input = source_transcript(&session).unwrap();
-        assert_eq!(input.segments.len(), 1);
-        assert!(!input.segments[0].text.contains("private idea"));
         assert_eq!(session.personal_notes, "A private idea not spoken.");
         let exported = full_note(&session);
-        assert!(exported.contains("## My notes\n\nA private idea not spoken."));
+        assert!(exported.contains("## Notes\n\nA private idea not spoken."));
         assert!(exported.contains("## Transcript"));
+        assert!(exported.contains("## Highlights"));
     }
+    #[test]
+    fn edited_document_exports_without_duplicate_generated_baseline() {
+        let mut session = Session::new(Kind::Call);
+        session.personal_notes = "The updated plan, including my edits.".into();
+        session.generated_summary = Some(crate::brain::Draft {
+            title: None,
+            schema: 1,
+            source_id: session.id.clone(),
+            source_hash: "synthetic".into(),
+            model: crate::brain::MODEL_LABEL.into(),
+            sections: 0,
+            elapsed_ms: 1,
+            items: vec![],
+        });
+        let exported = full_note(&session);
+        assert!(exported.contains(&session.personal_notes));
+        assert!(!exported.contains("## Summary"));
+    }
+
     #[test]
     fn active_note_edits_and_later_transcript_survive_restart_in_order() {
         let (mut app, _) = super::super::tests::app();
@@ -969,6 +773,7 @@ mod tests {
         app.history.selected = Some(session.clone());
         app.notetaker_changed(&session);
         app.call_rows.push(calls::Row {
+            cues: Vec::new(),
             start_ms: 0,
             end_ms: 2000,
             microphone: true,
@@ -989,50 +794,6 @@ mod tests {
             "My revised thought, independent of speech."
         );
         assert_eq!(reopened.rows[0].text, "New words from the call.");
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-    #[test]
-    fn typing_into_native_editor_autosaves_and_reopens_exact_text() {
-        let (mut app, _) = super::super::tests::app();
-        app.notetaker_new_note();
-        let id = app.history.selected.as_ref().unwrap().id.clone();
-        let temp = std::env::temp_dir();
-        let directory = temp.join(format!("articulate-notetaker-typing-{id}"));
-        assert_eq!(directory.parent(), Some(temp.as_path()));
-        app.history.worker = Some(crate::history::Worker::test_directory(directory.clone()));
-        let ctx = egui::Context::default();
-        theme::configure(&ctx);
-        let input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(850.0, 620.0),
-            )),
-            ..Default::default()
-        };
-        let _ = ctx.run(input(), |ctx| app.surface(ctx));
-        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(("saved_personal_notes", &id))));
-        let mut raw = input();
-        raw.events.push(egui::Event::Text(
-            "Remember the plan.\nAsk Casey before Thursday.".into(),
-        ));
-        let _ = ctx.run(raw, |ctx| app.surface(ctx));
-        assert_eq!(
-            app.history.selected.as_ref().unwrap().personal_notes,
-            "Remember the plan.\nAsk Casey before Thursday."
-        );
-        assert!(app.history.selected_dirty.is_some());
-        app.history.selected_dirty = Some(Instant::now() - Duration::from_secs(1));
-        app.history_poll();
-        assert!(app.history.selected_dirty.is_none());
-        drop(app);
-        let reopened = crate::history::History::open(directory.clone())
-            .unwrap()
-            .load(&id)
-            .unwrap();
-        assert_eq!(
-            reopened.personal_notes,
-            "Remember the plan.\nAsk Casey before Thursday."
-        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

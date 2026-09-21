@@ -30,6 +30,10 @@ pub struct Report {
     pub apps: Vec<AppUsage>,
     /// Last 28 calendar days, oldest first, including zero-activity dates.
     pub days: Vec<DayActivity>,
+    #[allow(
+        dead_code,
+        reason = "Preserve the date-basis flag for React insights messaging"
+    )]
     pub dates_use_utc: bool,
     pub dictionary_replacements: u64,
     pub cleanup_edits: u64,

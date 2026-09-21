@@ -2,6 +2,7 @@
 mod guard;
 mod install;
 pub(crate) mod runtime;
+pub(crate) mod speech;
 mod transfer;
 mod transport;
 
@@ -14,9 +15,12 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-pub use install::{
-    DOWNLOAD_BYTES, MODEL_NAME, SUMMARY_DOWNLOAD_BYTES, installed, profile_installed,
-};
+pub(crate) fn gpu_available() -> bool {
+    install::gpu_available()
+}
+#[cfg(test)]
+use install::installed;
+pub use install::profile_installed;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelProfile {
     Polish,
@@ -73,7 +77,28 @@ pub struct Preview {
     pub source: String,
     pub text: String,
     pub blocked: Option<String>,
+    pub cleanup_only: bool,
     pub elapsed_ms: u64,
+}
+
+fn preview(request: &Request, candidate: String, elapsed_ms: u64) -> Preview {
+    let blocked = guard::check(&request.source, &candidate, &request.protected)
+        .err()
+        .map(|error| error.to_string());
+    let cleaned = speech::clean(&request.source, &request.protected);
+    let cleanup_only = blocked.is_some() && cleaned != request.source;
+    Preview {
+        original: request.original.clone(),
+        source: request.source.clone(),
+        text: if blocked.is_some() {
+            cleaned
+        } else {
+            candidate
+        },
+        blocked,
+        cleanup_only,
+        elapsed_ms,
+    }
 }
 
 pub enum Event {
@@ -148,25 +173,11 @@ impl Worker {
                                 .unwrap()
                                 .polish(&task.request, &task.cancel)?;
                             check_cancel(&task.cancel)?;
-                            let blocked = guard::check(
-                                &task.request.source,
-                                &candidate,
-                                &task.request.protected,
-                            )
-                            .err()
-                            .map(|e| e.to_string());
-                            let text = if blocked.is_some() {
-                                task.request.source.clone()
-                            } else {
-                                candidate
-                            };
-                            Ok(Preview {
-                                original: task.request.original.clone(),
-                                source: task.request.source.clone(),
-                                text,
-                                blocked,
-                                elapsed_ms: start.elapsed().as_millis() as u64,
-                            })
+                            Ok(preview(
+                                &task.request,
+                                candidate,
+                                start.elapsed().as_millis() as u64,
+                            ))
                         })();
                         let event = match result {
                             _ if task.cancel.load(Ordering::Acquire) => {
@@ -237,6 +248,95 @@ fn progress(events: &mpsc::Sender<Event>, stage: &str, fraction: Option<f32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejected_rewriting_keeps_useful_speech_cleanup_as_a_reviewable_preview() {
+        let source = "I was checking up on the um on the invoice. It hasn't been paid.";
+        let request = Request {
+            original: source.into(),
+            source: source.into(),
+            style: Style::Professional,
+            protected: vec![],
+        };
+        let result = preview(&request, "The invoice has been paid.".into(), 1);
+        assert!(result.blocked.is_some());
+        assert!(result.cleanup_only);
+        assert_eq!(
+            result.text,
+            "I was checking up on the invoice. It hasn't been paid."
+        );
+        assert_eq!(result.original, source);
+        assert_eq!(result.source, source);
+        let request = Request {
+            original: "Do not send it.".into(),
+            source: "Do not send it.".into(),
+            ..request
+        };
+        let result = preview(&request, "Do send it.".into(), 1);
+        assert!(result.blocked.is_some());
+        assert!(!result.cleanup_only);
+        assert_eq!(result.text, request.source);
+    }
+
+    #[test]
+    #[ignore = "Requires an explicitly prepared isolated model cache; only reads model assets"]
+    fn managed_speech_cleanup_regressions() {
+        let directory =
+            std::env::var_os("ARTICULATE_POLISH_TEST_DIR").expect("Set an isolated test directory");
+        assert!(std::path::Path::new(&directory).is_absolute());
+        let mut worker = Worker::default();
+        for (source, expected) in [
+            (
+                "Hey, how are you doing? I was just checking up on the um on the invoice. It hasn't been paid, just like the other three past monthly invoices. Please let me know when you're able to pay.",
+                "on the invoice",
+            ),
+            (
+                "I I need to need to send the invoice. I need to send the invoice.",
+                "send the invoice",
+            ),
+            (
+                "Please schedule it for Tuesday, sorry, Thursday at 3, I mean 4 pm.",
+                "Thursday",
+            ),
+            (
+                "Send the invoice to Alice, I mean send the invoice to Bob.",
+                "Bob",
+            ),
+        ] {
+            let job = worker
+                .start(Request {
+                    original: source.into(),
+                    source: source.into(),
+                    style: Style::Professional,
+                    protected: vec![],
+                })
+                .unwrap();
+            loop {
+                match job.events.recv_timeout(Duration::from_secs(90)).unwrap() {
+                    Event::Complete(result) => {
+                        assert!(
+                            result.blocked.is_none() || result.cleanup_only,
+                            "{:?}",
+                            result.blocked
+                        );
+                        assert_ne!(result.text, source);
+                        assert!(result.text.contains(expected), "{}", result.text);
+                        assert_eq!(result.text.matches(expected).count(), 1, "{}", result.text);
+                        assert!(!result.text.contains(" um "));
+                        assert_eq!(result.original, source);
+                        println!(
+                            "elapsed_ms={} cleanup_only={} text={}",
+                            result.elapsed_ms, result.cleanup_only, result.text
+                        );
+                        break;
+                    }
+                    Event::Failed(error) => panic!("{error}"),
+                    Event::Cancelled => panic!("Cancelled"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     #[test]
     fn bounded_requests_and_cancellation() {
         let request = Request {

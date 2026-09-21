@@ -19,6 +19,10 @@ pub struct Recording {
     rate: u32,
     captured: Vec<f32>,
     pub samples: Arc<AtomicUsize>,
+    #[allow(
+        dead_code,
+        reason = "Preserve microphone metering for React recording feedback"
+    )]
     pub level: Arc<AtomicU32>,
     pub failed: Arc<AtomicBool>,
     pub full: Arc<AtomicBool>,

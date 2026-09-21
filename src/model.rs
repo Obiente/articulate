@@ -13,6 +13,18 @@ pub const SHA256: &str = "9a0d81792dfea2d5f278b8a63deb3ea6e02139ce42c2301f32ea19
 const URL: &str = "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/3555bd238a8572bbace3ebf60d23b036dc0a5dbe/Qwen3-ASR-1.7B-Q8_0.gguf";
 
 pub fn data_dir() -> PathBuf {
+    // Controller tests can save preferences. Never let those writes touch a real profile.
+    if cfg!(test) {
+        if let Some(root) = std::env::var_os("ARTICULATE_BRAIN_TEST_DIR") {
+            let root = PathBuf::from(root);
+            assert!(
+                root.is_absolute(),
+                "Use an absolute isolated model test directory"
+            );
+            return root.join("TranscribeLocal");
+        }
+        return std::env::temp_dir().join(format!("articulate-tests-{}", std::process::id()));
+    }
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -27,6 +39,10 @@ pub fn download(mut progress: impl FnMut(f32)) -> Result<PathBuf> {
     download_file(NAME, SIZE, SHA256, URL, &mut progress)
 }
 
+#[allow(
+    dead_code,
+    reason = "Preserve speaker-model download for React audio setup"
+)]
 pub fn download_speakers(mut progress: impl FnMut(f32)) -> Result<PathBuf> {
     download_file(
         crate::speakers::NAME,
@@ -37,7 +53,7 @@ pub fn download_speakers(mut progress: impl FnMut(f32)) -> Result<PathBuf> {
     )
 }
 
-fn download_file(
+pub(crate) fn download_file(
     name: &str,
     size: u64,
     expected_hash: &str,

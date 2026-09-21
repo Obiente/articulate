@@ -61,7 +61,7 @@ function () {
         seen.add(id);
         const user = users.getUser(id);
         const member = channel?.guild_id ? members.getMember(channel.guild_id, id) : null;
-        const name = member?.nick || user?.globalName || user?.username;
+        const name = user?.username || member?.nick || user?.globalName;
         if (typeof name !== 'string' || !name) throw new Error('Display name unavailable');
         const avatar = /^\d{1,20}$/.test(id) && typeof user?.avatar === 'string' && /^(?:a_)?[a-f0-9]{32}$/.test(user.avatar)
           ? { user_id: id, hash: user.avatar } : null;

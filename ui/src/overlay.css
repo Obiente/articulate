@@ -1,0 +1,90 @@
+html:has(.dictation-overlay),
+body:has(.dictation-overlay),
+body:has(.dictation-overlay) #root {
+  background: transparent;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  overflow: hidden;
+}
+.dictation-overlay {
+  margin: 8px;
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 20px;
+  border: 1px solid #3b5749;
+  border-radius: 18px;
+  background: #13231df5;
+  color: #f0f6f2;
+  font:
+    14px/1.45 Inter,
+    Segoe UI,
+    sans-serif;
+  /* An outer blur is clipped by the transparent native window and can reveal
+     its rectangular edges. Keep the rounded surface's own border instead. */
+  box-shadow: none;
+}
+.dictation-overlay strong {
+  font-weight: 500;
+}
+.dictation-overlay p {
+  margin: 3px 0 0;
+  color: #b7d5c7;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.overlay-signal {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 30px;
+  flex-shrink: 0;
+}
+.overlay-signal i {
+  width: 3px;
+  height: 8px;
+  border-radius: 3px;
+  background: #93dfc2;
+}
+.overlay-signal.listening i {
+  animation: voice-pulse 800ms ease-in-out infinite alternate;
+}
+.overlay-signal i:nth-child(2) {
+  animation-delay: -200ms;
+  height: 16px;
+}
+.overlay-signal i:nth-child(3) {
+  animation-delay: -350ms;
+  height: 24px;
+}
+.overlay-signal i:nth-child(4) {
+  animation-delay: -600ms;
+  height: 16px;
+}
+.overlay-signal.finishing {
+  animation: finish-pulse 1s ease-in-out infinite alternate;
+}
+@keyframes voice-pulse {
+  to {
+    transform: scaleY(0.4);
+    opacity: 0.6;
+  }
+}
+@keyframes finish-pulse {
+  to {
+    opacity: 0.35;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .overlay-signal,
+  .overlay-signal i {
+    animation: none !important;
+  }
+}

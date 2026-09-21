@@ -38,11 +38,22 @@ pub fn effective(rules: &[StyleRule], app: Option<&str>, clean_speech: bool) -> 
         .map_or(fallback, |rule| rule.style)
 }
 
-pub fn apply(input: &str, style: WritingStyle) -> (String, usize) {
+pub fn apply(input: &str, style: WritingStyle, protected: &[String]) -> (String, usize) {
     if style == WritingStyle::Verbatim {
         return (input.to_owned(), 0);
     }
-    let (mut text, mut changes) = crate::cleanup::apply(input);
+    let (baseline, prior_changes) = crate::cleanup::apply(input);
+    let mut text = crate::polish::speech::clean(input, protected);
+    let mut changes = if text == input {
+        0
+    } else {
+        (prior_changes
+            + baseline
+                .split_whitespace()
+                .count()
+                .saturating_sub(text.split_whitespace().count()))
+        .max(1)
+    };
     if style == WritingStyle::Chat && removable_period(&text) {
         // Keep trailing whitespace exactly, including the destination's spacing.
         let period = text.trim_end().len() - 1;
@@ -105,7 +116,7 @@ mod tests {
         );
         assert_eq!(effective(&[], None, false), WritingStyle::Verbatim);
         let raw = "I I do not agree.\n\nNo, no.";
-        assert_eq!(apply(raw, WritingStyle::Verbatim), (raw.into(), 0));
+        assert_eq!(apply(raw, WritingStyle::Verbatim, &[]), (raw.into(), 0));
     }
 
     #[test]
@@ -148,15 +159,15 @@ mod tests {
     #[test]
     fn chat_applies_conservative_cleanup_and_preserves_negation() {
         assert_eq!(
-            apply("I I do not agree.", WritingStyle::Chat),
+            apply("I I do not agree.", WritingStyle::Chat, &[]),
             ("I do not agree".into(), 2)
         );
         assert_eq!(
-            apply("No, no, do not send it.  ", WritingStyle::Chat),
+            apply("No, no, do not send it.  ", WritingStyle::Chat, &[]),
             ("No, no, do not send it  ".into(), 1)
         );
         assert_eq!(
-            apply("I I do not agree.", WritingStyle::Clean),
+            apply("I I do not agree.", WritingStyle::Clean, &[]),
             ("I do not agree.".into(), 1)
         );
     }
@@ -180,7 +191,11 @@ mod tests {
             "Use command: cargo check.",
             "Good night。",
         ] {
-            assert_eq!(apply(text, WritingStyle::Chat), (text.into(), 0), "{text}");
+            assert_eq!(
+                apply(text, WritingStyle::Chat, &[]),
+                (text.into(), 0),
+                "{text}"
+            );
         }
     }
 }

@@ -28,17 +28,37 @@ constexpr uint8_t module_sha[32] = {
     0xd1,0x31,0xa8,0x08,0xf8,0xce,0xa9,0xe1,0x10,0x3e,0x40,0xa1,0x2e,0x64,0xb0,0x14 };
 constexpr uint32_t max_samples = 5760 * 2;
 constexpr uint32_t max_packet = 64 + max_samples * 2;
-struct Frame { uint32_t size = 0; std::array<uint8_t, max_packet> bytes{}; };
-std::array<Frame, 128> frames;
+// A bounded multi-producer/single-consumer ring. Only a slot's owner touches
+// its payload; release/acquire publication replaces a shared audio-thread lock.
+struct Frame {
+    std::atomic<uint32_t> turn{0};
+    uint32_t size = 0;
+    std::array<uint8_t, max_packet> bytes{};
+};
+struct Ring {
+    std::array<Frame, 128> frames;
+    Ring() noexcept { for (uint32_t i = 0; i < frames.size(); ++i) frames[i].turn.store(i); }
+} ring;
+// Low32: reserved ring positions, high32: dropped callbacks. Updating both in
+// one atomic gives each reserved slot a strictly ordered delivery sequence.
+std::atomic<uint64_t> producer_state{0}, capture_baseline{0}, configuration{0};
+std::atomic<uint64_t> produced{0}, polled{0}, queue_full{0}, contention{0};
+std::atomic<uint64_t> configuration_discard{0}, stop_flush{0}, max_depth{0};
+std::atomic<uint32_t> consumed_position{0};
+static_assert(std::atomic<uint64_t>::is_always_lock_free);
+std::atomic<uint64_t> capture_id{0};
 std::array<std::atomic<uint64_t>, 256> allowed{};
 std::atomic<uint32_t> allowed_count{0};
-uint32_t head = 0, tail = 0;
-uint64_t capture_id = 0, sequence = 0;
-uint32_t capture_epoch = 0;
-SRWLOCK queue_lock = SRWLOCK_INIT;
+uint32_t head = 0;
+// Stop revokes capture permission, but transport recovery may rearm the SAME
+// nonce. Keep its sequence baseline until an actually different capture begins.
+// Accessed only while holding control_lock; it never grants audio access.
+uint64_t sequence_capture = 0;
+// Serializes control and the single consumer, never an audio callback.
+SRWLOCK control_lock = SRWLOCK_INIT;
 SRWLOCK install_lock = SRWLOCK_INIT;
 std::atomic<bool> armed{false};
-std::atomic<uint64_t> generation{0}, lease_until{0}, published_capture{0}, pending_drops{0};
+std::atomic<uint64_t> generation{0}, lease_until{0};
 Connect original = nullptr;
 std::atomic<void*> installed_target{nullptr};
 
@@ -54,51 +74,87 @@ uint64_t user_id(const std::string& text) noexcept {
     }
     return value;
 }
+// Reserve without waiting for another audio callback or for the UI consumer.
+// Contention gets a fixed retry budget; full queues record an explicit gap.
+bool reserve(uint32_t& position, uint64_t& ticket) noexcept {
+    auto state = producer_state.load(std::memory_order_relaxed);
+    for (unsigned attempt = 0; attempt < 16; ++attempt) {
+        position = static_cast<uint32_t>(state);
+        const auto turn = ring.frames[position % ring.frames.size()].turn.load(std::memory_order_acquire);
+        const auto difference = static_cast<int32_t>(turn - position);
+        if (difference == 0) {
+            const auto next = (state & 0xffffffff00000000ULL) | static_cast<uint32_t>(position + 1);
+            if (producer_state.compare_exchange_weak(state, next, std::memory_order_relaxed)) {
+                const auto observed_depth = static_cast<uint32_t>(position + 1 - consumed_position.load(std::memory_order_relaxed));
+                // Consumer accounting can lag its slot release by a few
+                // instructions. The physical ring remains strictly bounded.
+                const uint64_t depth = observed_depth > ring.frames.size() ? ring.frames.size() : observed_depth;
+                auto peak = max_depth.load(std::memory_order_relaxed);
+                for (unsigned i = 0; i < 16 && peak < depth; ++i)
+                    if (max_depth.compare_exchange_weak(peak, depth, std::memory_order_relaxed)) break;
+                ticket = state; return true;
+            }
+        } else if (difference < 0) {
+            queue_full.fetch_add(1, std::memory_order_relaxed);
+            producer_state.fetch_add(1ULL << 32, std::memory_order_relaxed);
+            return false;
+        }
+        else state = producer_state.load(std::memory_order_relaxed);
+    }
+    contention.fetch_add(1, std::memory_order_relaxed);
+    producer_state.fetch_add(1ULL << 32, std::memory_order_relaxed);
+    return false;
+}
+void discard_ready(std::atomic<uint64_t>& discarded) noexcept {
+    for (size_t i = 0; i < ring.frames.size(); ++i) {
+        auto& frame = ring.frames[head % ring.frames.size()];
+        if (frame.turn.load(std::memory_order_acquire) != static_cast<uint32_t>(head + 1)) break;
+        if (frame.size) discarded.fetch_add(1, std::memory_order_relaxed);
+        SecureZeroMemory(frame.bytes.data(), frame.size); frame.size = 0;
+        frame.turn.store(static_cast<uint32_t>(head + ring.frames.size()), std::memory_order_release);
+        ++head;
+        consumed_position.store(head, std::memory_order_relaxed);
+    }
+}
 void record(uint64_t connection, const std::string& user, const int16_t* data,
     uint64_t samples, int rate, uint64_t channels, bool muted) noexcept {
-    if (!armed.load(std::memory_order_relaxed) || GetTickCount64() >= lease_until.load(std::memory_order_relaxed) || muted || !data || !samples
+    const auto version = configuration.load(std::memory_order_acquire);
+    if ((version & 1) || !armed.load(std::memory_order_acquire) || GetTickCount64() >= lease_until.load(std::memory_order_relaxed) || muted || !data || !samples
         || samples > 5760 || channels < 1 || channels > 2 || rate < 8000 || rate > 96000) return;
     const auto id = user_id(user);
     if (!id) return;
-    const auto observed_capture = published_capture.load(std::memory_order_acquire);
-    const auto observed_epoch = pending_drops.load(std::memory_order_acquire) & 0xffffffff00000000ULL;
+    const auto nonce = capture_id.load(std::memory_order_relaxed);
+    const auto baseline = capture_baseline.load(std::memory_order_relaxed);
     bool permitted = false;
     for (uint32_t i = 0, count = allowed_count.load(std::memory_order_relaxed); i < count; ++i)
         permitted |= allowed[i].load(std::memory_order_relaxed) == id;
-    if (!permitted) return;
-    // Never wait or allocate on Discord's real-time audio thread.
-    if (!TryAcquireSRWLockExclusive(&queue_lock)) {
-        auto value = pending_drops.load(std::memory_order_relaxed);
-        while ((value & 0xffffffff00000000ULL) == observed_epoch && (value & 0xffffffffULL) != 0xffffffffULL) {
-            if (pending_drops.compare_exchange_weak(value, value + 1, std::memory_order_relaxed)) break;
-        }
-        return;
-    }
-    permitted = false;
-    for (uint32_t i = 0; i < allowed_count; ++i) permitted |= allowed[i].load(std::memory_order_relaxed) == id;
-    if (!armed.load(std::memory_order_relaxed) || observed_capture != capture_id || !permitted) {
-        ReleaseSRWLockExclusive(&queue_lock); return;
-    }
-    const auto missed = pending_drops.exchange(static_cast<uint64_t>(capture_epoch) << 32, std::memory_order_relaxed) & 0xffffffffULL;
-    sequence += 1 + missed;
-    const auto seq = sequence;
-    if (tail - head == frames.size()) { ReleaseSRWLockExclusive(&queue_lock); return; }
-    auto& frame = frames[tail++ % frames.size()];
+    if (!permitted || configuration.load(std::memory_order_acquire) != version) return;
+    uint32_t position = 0; uint64_t ticket = 0;
+    if (!reserve(position, ticket)) return;
+    auto& frame = ring.frames[position % ring.frames.size()];
     auto* p = frame.bytes.data();
     std::memset(p, 0, 64);
     std::memcpy(p, "APCM", 4);
     little(p + 4, 1, 2); little(p + 6, 64, 2);
+    const uint64_t seq = static_cast<uint32_t>(position - static_cast<uint32_t>(baseline))
+        + static_cast<uint64_t>(static_cast<uint32_t>((ticket >> 32) - (baseline >> 32))) + 1;
     little(p + 8, connection, 8); little(p + 16, seq, 8);
     FILETIME time; GetSystemTimePreciseAsFileTime(&time);
     const uint64_t ticks = (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
     little(p + 24, (ticks - 116444736000000000ULL) / 10, 8);
     little(p + 32, id, 8); little(p + 40, static_cast<uint32_t>(rate), 4);
     little(p + 44, channels, 2); little(p + 48, samples, 4);
-    little(p + 52, capture_id, 8);
+    little(p + 52, nonce, 8);
     const auto bytes = static_cast<uint32_t>(samples * channels * sizeof(int16_t));
     std::memcpy(p + 64, data, bytes);
     frame.size = 64 + bytes;
-    ReleaseSRWLockExclusive(&queue_lock);
+    // A stop, nonce or membership change may race the payload copy. Publish an
+    // empty slot so the consumer can advance, never audio from an old grant.
+    if (configuration.load(std::memory_order_acquire) != version || !armed.load(std::memory_order_acquire)) {
+        SecureZeroMemory(p, frame.size); frame.size = 0;
+        configuration_discard.fetch_add(1, std::memory_order_relaxed);
+    } else produced.fetch_add(1, std::memory_order_relaxed);
+    frame.turn.store(static_cast<uint32_t>(position + 1), std::memory_order_release);
 }
 void* __fastcall connect_hook(void* self, void* result, const std::string* user,
     const void* options, void* connected, void* speaking, Received* receive, void* capture) {
@@ -177,44 +233,73 @@ int ArticulateAudioStart() noexcept {
 }
 int ArticulateAudioArm(uint64_t capture, const uint64_t* ids, uint32_t count) noexcept {
     if (count > allowed.size() || (count && (!ids || !capture)) || !installed_target) return 1;
-    AcquireSRWLockExclusive(&queue_lock);
-    if (capture_id != capture) {
-        armed.store(false, std::memory_order_relaxed);
-        SecureZeroMemory(frames.data(), sizeof(frames)); head = tail = 0; sequence = 0;
-        pending_drops.store(static_cast<uint64_t>(++capture_epoch) << 32, std::memory_order_release);
+    AcquireSRWLockExclusive(&control_lock);
+    bool unchanged = capture_id.load(std::memory_order_relaxed) == capture && allowed_count.load(std::memory_order_relaxed) == count;
+    for (uint32_t i = 0; unchanged && i < count; ++i) unchanged = allowed[i].load(std::memory_order_relaxed) == ids[i];
+    if (!unchanged) {
+        configuration.fetch_add(1, std::memory_order_acq_rel);
+        armed.store(false, std::memory_order_release);
+        if (sequence_capture != capture) {
+            discard_ready(configuration_discard);
+            capture_baseline.store(producer_state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sequence_capture = capture;
+        }
+        capture_id.store(capture, std::memory_order_relaxed);
+        for (uint32_t i = 0; i < count; ++i) allowed[i].store(ids[i], std::memory_order_relaxed);
+        allowed_count.store(count, std::memory_order_relaxed);
+        configuration.fetch_add(1, std::memory_order_release);
     }
-    capture_id = capture;
-    published_capture.store(capture, std::memory_order_release);
-    allowed_count = count;
-    for (uint32_t i = 0; i < count; ++i) allowed[i] = ids[i];
     lease_until.store(GetTickCount64() + 1500, std::memory_order_relaxed);
-    armed.store(count != 0, std::memory_order_relaxed);
-    ReleaseSRWLockExclusive(&queue_lock);
+    armed.store(count != 0, std::memory_order_release);
+    ReleaseSRWLockExclusive(&control_lock);
     return 0;
 }
 uint32_t ArticulateAudioPoll(uint8_t* out, uint32_t capacity) noexcept {
     if (!out) return 0;
-    AcquireSRWLockExclusive(&queue_lock);
+    AcquireSRWLockExclusive(&control_lock);
     uint32_t size = 0;
-    if (head != tail) {
-        auto& frame = frames[head % frames.size()];
-        if (capacity >= frame.size) {
-            size = frame.size; std::memcpy(out, frame.bytes.data(), size);
-            SecureZeroMemory(frame.bytes.data(), size); frame.size = 0; ++head;
-        }
+    for (size_t i = 0; i < ring.frames.size(); ++i) {
+        auto& frame = ring.frames[head % ring.frames.size()];
+        if (frame.turn.load(std::memory_order_acquire) != static_cast<uint32_t>(head + 1)) break;
+        uint64_t nonce = 0;
+        if (frame.size >= 64) std::memcpy(&nonce, frame.bytes.data() + 52, sizeof(nonce));
+        const bool current = frame.size && armed.load(std::memory_order_acquire) && nonce == capture_id.load(std::memory_order_relaxed);
+        if (current && capacity < frame.size) break;
+        if (current) { size = frame.size; std::memcpy(out, frame.bytes.data(), size); polled.fetch_add(1, std::memory_order_relaxed); }
+        else if (frame.size) configuration_discard.fetch_add(1, std::memory_order_relaxed);
+        SecureZeroMemory(frame.bytes.data(), frame.size); frame.size = 0;
+        frame.turn.store(static_cast<uint32_t>(head + ring.frames.size()), std::memory_order_release);
+        ++head;
+        consumed_position.store(head, std::memory_order_relaxed);
+        if (size) break;
     }
-    ReleaseSRWLockExclusive(&queue_lock);
+    ReleaseSRWLockExclusive(&control_lock);
     return size;
 }
 void ArticulateAudioStop() noexcept {
-    armed.store(false, std::memory_order_relaxed);
-    published_capture.store(0, std::memory_order_release);
-    AcquireSRWLockExclusive(&queue_lock);
-    capture_id = 0; allowed_count = 0;
+    AcquireSRWLockExclusive(&control_lock);
+    configuration.fetch_add(1, std::memory_order_acq_rel);
+    armed.store(false, std::memory_order_release);
+    capture_id.store(0, std::memory_order_relaxed); allowed_count.store(0, std::memory_order_relaxed);
     for (auto& id : allowed) id.store(0, std::memory_order_relaxed);
-    SecureZeroMemory(frames.data(), sizeof(frames)); head = tail = 0;
-    ReleaseSRWLockExclusive(&queue_lock);
+    discard_ready(stop_flush);
+    configuration.fetch_add(1, std::memory_order_release);
+    ReleaseSRWLockExclusive(&control_lock);
+}
+void ArticulateAudioGetStats(ArticulateAudioStats* out) noexcept {
+    if (!out) return;
+    // An approximate concurrent snapshot is sufficient; never take the audio or
+    // control path's locks just to report diagnostics.
+    const auto consumed = consumed_position.load(std::memory_order_relaxed);
+    const auto depth = static_cast<uint32_t>(producer_state.load(std::memory_order_relaxed)) - consumed;
+    *out = {produced.load(), polled.load(), queue_full.load(), contention.load(),
+        configuration_discard.load(), stop_flush.load(), max_depth.load(),
+        depth > ring.frames.size() ? ring.frames.size() : depth, ring.frames.size()};
 }
 #ifdef ARTICULATE_ADAPTER_TEST
 int ArticulateAudioHookSynthetic(void* target) noexcept { return install(target); }
+void ArticulateAudioHoldConsumerForTest(bool hold) noexcept {
+    if (hold) AcquireSRWLockExclusive(&control_lock);
+    else ReleaseSRWLockExclusive(&control_lock);
+}
 #endif

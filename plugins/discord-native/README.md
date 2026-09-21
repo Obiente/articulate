@@ -74,17 +74,42 @@ disabled or its 1.5-second native lease expires. The hook stays dormant after st
 and its DLL is pinned until process exit, so surviving connection callbacks never
 point into unloaded code. Installed Discord files are not rewritten by the addon.
 
+A transient control-request failure has a bounded 1.2-second recovery window
+from the last successful arm, without extending the native lease. An explicit
+inactive response or disable stops immediately. Stale responses cannot re-arm
+an intervening stop. When the same recording resumes, packet numbering continues;
+only a new capture nonce starts at one. Any queued audio discarded on stop stays
+visible as a forward sequence gap rather than being replayed.
+
+Control, audio draining, diagnostics and HTTP deadlines use `node:timers`
+explicitly. Chromium window timers can throttle a background Discord renderer,
+allowing the bounded audio queue to fill between drain attempts. A synthetic
+six-participant, 100-packets-per-second-per-person test exercises both a one-second
+consumer pause and normal 20ms draining; this does not establish live timing.
+
+The companion submits authenticated, numeric-only `POST /diagnostics` snapshots
+every five seconds and after an audio transport failure. Articulate keeps one
+bounded `logs/discord-audio.json` file in its data folder, containing queue/drop
+counters, scheduling/request delays and receiver sequence-failure counters.
+No audio, transcript text, participant IDs, capture nonces or pairing keys are
+included. Periodic disk writes are rate-limited; terminal failures are saved
+immediately. Diagnostic failures never change capture state.
+
 ## PCM transport
 
-`POST /pcm` uses the existing loopback pairing key in an authorization header.
-The body is a 64-byte little-endian header followed by interleaved signed PCM16:
+The control response advertises `pcm_batch: true`. The companion then sends
+ordered `POST /pcm-batch` requests using the existing loopback pairing key in an
+authorization header. Each batch contains up to 64 packets within 128 KiB, each
+preceded by its `u32` little-endian byte length. Only one audio request is in
+flight at a time. Older receivers retain the single-packet `POST /pcm` route.
+Each packet is a 64-byte little-endian header followed by interleaved signed PCM16:
 
 | Offset | Field |
 | --- | --- |
 | 0 | ASCII `APCM` |
 | 4 | `u16` version, 1 |
 | 6 | `u16` header length, 64 |
-| 8 | `u64` native connection generation |
+| 8 | `u64` native Connect callback serial, not a call-wide generation |
 | 16 | `u64` sequence, global within a capture, starting at 1 |
 | 24 | `u64` observation Unix microseconds |
 | 32 | `u64` remote participant ID |
@@ -96,8 +121,17 @@ The body is a 64-byte little-endian header followed by interleaved signed PCM16:
 | 60 | Four reserved zero bytes |
 
 The maximum is 5,760 samples per channel, two channels and 96 kHz. The fixed queue
-holds 128 packets. Audio callbacks never wait for the consumer or allocate memory.
-Overflow/contention drops frames and causes sequence gaps. The receiver must reject
-stale nonces, unexpected identities/formats and gaps rather than silently combining
-incomplete or different calls. Observation time is receipt time, not a verified
-source-clock timestamp. Real sample-clock alignment is a remaining validation task.
+holds 128 packets in a bounded multi-producer ring. Audio callbacks never take the
+consumer/control lock, wait for the consumer, or allocate memory. True overflow
+and exhausted producer reservation retries remain visible as sequence gaps.
+The receiver recovers gaps of up to four packets, with a limit of eight missing
+packets in five seconds. It saves an interruption warning with that transcript
+and retains timestamp gaps on the separate participant tracks. Larger or repeated
+loss stops capture. Callback serials are tracked independently for each participant:
+newer callbacks replace that person's old source, and late old-source packets are
+acknowledged without recording duplicate audio. Different people may use different
+serials at the same time. Same-person replacement trims already received samples
+and preserves timestamp gaps. Replayed/reordered packets, stale nonces, unexpected
+identities and voice-channel changes remain rejected. Observation time is the
+native callback's wall-clock time, not a verified source-clock timestamp. Real
+sample-clock alignment is a remaining validation task.

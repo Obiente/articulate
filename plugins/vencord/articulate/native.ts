@@ -1,8 +1,45 @@
 import type { IpcMainInvokeEvent } from "electron";
+import { lstat, open } from "node:fs/promises";
 import { request } from "node:http";
+import { isAbsolute, join } from "node:path";
 
 let pending = false;
 let lastRequest = 0;
+const audioStates = new Set(["disabled", "addon-unavailable", "waiting", "waiting-for-voice-engine",
+    "unsupported-native-build", "native-hook-unavailable", "waiting-for-articulate", "ready",
+    "capturing", "control-unavailable", "audio-transport-unavailable", "preload-unavailable"]);
+
+// Read only the same user's fixed Articulate settings file. Never accept a
+// renderer-supplied path or expose the remaining settings through IPC.
+export async function getPairingKey(_event: IpcMainInvokeEvent): Promise<string> {
+    const localData = process.env.LOCALAPPDATA;
+    if (process.platform !== "win32" || !localData || !isAbsolute(localData)) return "";
+    // This directory name is retained by Articulate for existing user profiles.
+    const directory = join(localData, "TranscribeLocal");
+    const path = join(directory, "settings.json");
+    try {
+        const parent = await lstat(directory);
+        const metadata = await lstat(path);
+        if (!parent.isDirectory() || parent.isSymbolicLink()
+            || !metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 1024 * 1024) return "";
+        const file = await open(path, "r");
+        try {
+            const current = await file.stat();
+            if (!current.isFile() || current.size > 1024 * 1024) return "";
+            const bytes = Buffer.alloc(1024 * 1024 + 1);
+            let length = 0;
+            while (length < bytes.length) {
+                const read = await file.read(bytes, length, bytes.length - length, null);
+                if (!read.bytesRead) break;
+                length += read.bytesRead;
+            }
+            if (length > 1024 * 1024) return "";
+            const value = JSON.parse(bytes.subarray(0, length).toString("utf8"));
+            const key = value?.discord_pairing_key;
+            return typeof key === "string" && /^[a-f0-9]{64}$/i.test(key) ? key : "";
+        } finally { await file.close(); }
+    } catch { return ""; }
+}
 
 // A deliberately narrow IPC operation. No caller-supplied URL, path or headers.
 export async function publish(_event: IpcMainInvokeEvent, token: string, snapshot: string): Promise<boolean> {
@@ -15,8 +52,10 @@ export async function publish(_event: IpcMainInvokeEvent, token: string, snapsho
             || !Number.isSafeInteger(value.observed_ms) || Math.abs(Date.now() - value.observed_ms) > 250
             || !Array.isArray(value.participants) || value.participants.length > 256
             || typeof value.valid !== "boolean"
+            || (value.companion_revision !== undefined && (typeof value.companion_revision !== "string" || !/^[a-f0-9]{64}$/.test(value.companion_revision)))
+            || (value.audio_status !== undefined && (typeof value.audio_status !== "string" || !audioStates.has(value.audio_status)))
             || !(value.channel_id === null || (typeof value.channel_id === "string" && /^\d{1,24}$/.test(value.channel_id)))
-            || Object.keys(value).some(key => !["version", "observed_ms", "channel_id", "participants", "valid"].includes(key))) return false;
+            || Object.keys(value).some(key => !["version", "observed_ms", "channel_id", "participants", "valid", "companion_revision", "audio_status"].includes(key))) return false;
         const ids = new Set<string>();
         for (const participant of value.participants) {
             if (!participant || typeof participant !== "object"

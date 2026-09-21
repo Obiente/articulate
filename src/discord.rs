@@ -2,8 +2,17 @@
 //!
 //! The renderer observer reads only current voice membership and speaking state.
 //! Its lease removes its own listeners even if this process disappears.
+#[allow(
+    dead_code,
+    reason = "Preserve validated participant avatar cache for React participant images"
+)]
 pub mod avatar;
+mod diagnostics;
 pub mod install;
+#[allow(
+    dead_code,
+    reason = "Preserve guarded Discord relaunch for React connection setup"
+)]
 pub mod launch;
 pub mod pcm;
 pub mod plugin;
@@ -53,6 +62,10 @@ pub struct Observation {
 pub enum Status {
     Connecting,
     Ready,
+    #[allow(
+        dead_code,
+        reason = "Preserve the connection failure detail for React status messaging"
+    )]
     Unavailable(String),
 }
 
@@ -60,6 +73,8 @@ pub enum Status {
 pub struct Snapshot {
     pub status: Status,
     pub observation: Option<Observation>,
+    pub companion_revision: Option<String>,
+    pub audio_status: Option<String>,
 }
 
 struct State {
@@ -89,6 +104,8 @@ impl Connection {
             pcm: pcm::Hub::default(),
             state: Mutex::new(State {
                 snapshot: Snapshot {
+                    audio_status: None,
+                    companion_revision: None,
                     status: Status::Connecting,
                     observation: None,
                 },
@@ -212,6 +229,8 @@ impl Shared {
     fn unavailable(&self, message: &str) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.snapshot = Snapshot {
+            audio_status: None,
+            companion_revision: None,
             status: Status::Unavailable(message.into()),
             observation: None,
         };
@@ -230,7 +249,16 @@ impl Shared {
         );
     }
 
-    fn publish(&self, mut observation: Observation) {
+    fn publish(&self, observation: Observation) {
+        self.publish_companion(observation, None, None);
+    }
+
+    fn publish_companion(
+        &self,
+        mut observation: Observation,
+        revision: Option<String>,
+        audio_status: Option<String>,
+    ) {
         if self.stopped() {
             return;
         }
@@ -257,11 +285,15 @@ impl Shared {
         }
         state.snapshot = if observation.valid {
             Snapshot {
+                audio_status,
+                companion_revision: revision,
                 status: Status::Ready,
                 observation: Some(observation.clone()),
             }
         } else {
             Snapshot {
+                audio_status: None,
+                companion_revision: None,
                 status: Status::Unavailable("Discord activity is temporarily unavailable.".into()),
                 observation: None,
             }
@@ -739,6 +771,8 @@ mod tests {
                     pcm: pcm::Hub::default(),
                     state: Mutex::new(State {
                         snapshot: Snapshot {
+                            audio_status: None,
+                            companion_revision: None,
                             status: Status::Connecting,
                             observation: None,
                         },
@@ -938,6 +972,8 @@ mod tests {
             pcm: pcm::Hub::default(),
             state: Mutex::new(State {
                 snapshot: Snapshot {
+                    audio_status: None,
+                    companion_revision: None,
                     status: Status::Connecting,
                     observation: None,
                 },

@@ -65,7 +65,23 @@ fn numbers(text: &str) -> Vec<String> {
         })
         .collect()
 }
-fn protected_occurrences(text: &str, phrase: &str) -> usize {
+
+fn anchored_symbols(text: &str) -> Vec<(usize, char)> {
+    text.char_indices()
+        .filter(|(at, c)| {
+            matches!(c, '+' | '-' | '=' | '<' | '>' | '%' | '$' | '€' | '£' | '@' | '/' | '\\' | '_')
+                // Preserve != and unary ! while allowing ordinary sentence
+                // exclamation punctuation to be adjusted by the editor.
+                || (*c == '!'
+                    && text[*at + c.len_utf8()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|next| next == '=' || next.is_alphanumeric()))
+        })
+        .map(|(at, c)| (content(&text[..at]).len(), c))
+        .collect()
+}
+pub(super) fn protected_occurrences(text: &str, phrase: &str) -> usize {
     let text = text.to_lowercase();
     let phrase = phrase.to_lowercase();
     text.match_indices(&phrase)
@@ -86,6 +102,11 @@ fn protected_occurrences(text: &str, phrase: &str) -> usize {
 /// This is a conservative rejection gate, not proof of preserved meaning.
 /// Review remains mandatory even when every lexical check succeeds.
 pub(super) fn check(source: &str, candidate: &str, protected: &[String]) -> Result<()> {
+    // Validate against only the explicit, bounded speech repairs. This permits
+    // a repeated amount or a stated correction to disappear, without allowing
+    // the editor to drop an unrelated number, name or negation.
+    let cleaned = super::speech::clean(source, protected);
+    let source = cleaned.as_str();
     ensure!(
         !candidate.trim().is_empty() && candidate.len() <= 8_000,
         "The draft was empty or too long. Your original wording was kept."
@@ -120,6 +141,10 @@ pub(super) fn check(source: &str, candidate: &str, protected: &[String]) -> Resu
         content(source) == content(candidate),
         "The draft changed or removed substantive wording. Your original wording was kept."
     );
+    ensure!(
+        anchored_symbols(source) == anchored_symbols(candidate),
+        "The draft changed a symbol or technical expression. Your wording was kept."
+    );
     // Existing questions and symbolic operators must not disappear.
     for c in [
         '?', '+', '-', '=', '<', '>', '%', '$', '€', '£', '@', '/', '\\', '_',
@@ -143,6 +168,33 @@ pub(super) fn check(source: &str, candidate: &str, protected: &[String]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepts_speech_repairs_without_relaxing_unrelated_facts() {
+        let source = "Hey, how are you doing? I was just checking up on the um on the invoice. It hasn't been paid, just like the other three past monthly invoices. Please let me know when you're able to pay.";
+        let cleaned = source.replace("on the um on the", "on the");
+        assert!(check(source, &cleaned, &[]).is_ok());
+        assert!(check(source, &cleaned.replace("hasn't", "has"), &[]).is_err());
+        assert!(check(source, &cleaned.replace("three", "two"), &[]).is_err());
+        assert!(
+            check(
+                "Meet Tuesday, sorry, Thursday at 3, I mean 4 pm.",
+                "Meet Thursday at 4 pm.",
+                &[]
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "Meet Tuesday, sorry, Thursday at 3, I mean 4 pm.",
+                "Meet Thursday at 5 pm.",
+                &[]
+            )
+            .is_err()
+        );
+        assert!(check("Send 42 euros. Send 42 euros.", "Send 42 euros.", &[]).is_ok());
+        assert!(check("Send 42 euros. Send 24 euros.", "Send 42 euros.", &[]).is_err());
+        assert!(check("I I need to need to send it.", "I need to send it.", &[]).is_ok());
+    }
     #[test]
     fn permits_bounded_grammar_and_exact_repeated_clause_edits() {
         assert!(
@@ -203,6 +255,10 @@ mod tests {
     #[test]
     fn rejects_names_numbers_negation_pronouns_added_facts_and_role_changes() {
         for (source, candidate) in [
+            ("Use x != y.", "Use x = y."),
+            ("Use !enabled.", "Use enabled."),
+            ("Use x = y and z != q.", "Use x != y and z = q."),
+            ("Use x < y and z > q.", "Use x > y and z < q."),
             ("Send 42 euros to Casey.", "Send 24 euros to Casey."),
             ("Do not send it.", "Do send it."),
             ("Send it to Casey.", "Send it to Jordan."),

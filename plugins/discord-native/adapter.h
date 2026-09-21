@@ -12,6 +12,14 @@ extern "C" __declspec(dllexport) uint32_t ArticulateAudioPoll(uint8_t* packet, u
 // Stops capture and clears audio. The hook remains dormant until process exit.
 extern "C" __declspec(dllexport) void ArticulateAudioStop() noexcept;
 
+// Lifetime aggregate counters only. No audio, participant IDs or capture nonces.
+struct ArticulateAudioStats {
+    uint64_t produced, polled, queue_full, contention, configuration_discard;
+    uint64_t stop_flush, max_depth, queue_depth, queue_capacity;
+};
+extern "C" __declspec(dllexport) void ArticulateAudioGetStats(ArticulateAudioStats* out) noexcept;
+
 #ifdef ARTICULATE_ADAPTER_TEST
 int ArticulateAudioHookSynthetic(void* target) noexcept;
+void ArticulateAudioHoldConsumerForTest(bool hold) noexcept;
 #endif

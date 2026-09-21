@@ -6,7 +6,6 @@ use crate::{
     integration, learning, macros, model,
     platform::{self, Target},
 };
-use eframe::egui::{self, Color32, RichText};
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
@@ -18,24 +17,19 @@ use std::{
 };
 use transcribe_cpp::CancelToken;
 
-const ACCENT: Color32 = Color32::from_rgb(144, 223, 201);
 mod assort_ui;
 mod brain_ui;
+mod capture_feedback;
+
+pub(crate) mod desktop;
 mod discord_ui;
-mod editors;
-mod file_picker;
 mod history_ui;
 mod insights_ui;
 mod notetaker;
 mod polish_ui;
-mod preferences;
 mod search_ui;
 mod shortcut_gesture;
-mod surface;
-mod theme;
-#[cfg(test)]
-mod ui_capture;
-mod update_ui;
+mod transcript_editor;
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -45,6 +39,7 @@ struct Settings {
     entries: Vec<Entry>,
     macros: Vec<macros::VoiceMacro>,
     model_path: String,
+    transcription_language: String,
     microphone: Option<String>,
     #[serde(default = "enabled")]
     clean_speech: bool,
@@ -54,8 +49,10 @@ struct Settings {
     #[serde(default = "enabled")]
     live_insert: bool,
     hotkey: platform::Hotkey,
+    quick_note_hotkey: platform::Hotkey,
     hotkey_mode: platform::HotkeyMode,
     audio_feedback: bool,
+    audio_context: bool,
     styles: Vec<crate::writing_style::StyleRule>,
     discord_companion: bool,
     discord_pairing_key: String,
@@ -71,6 +68,12 @@ struct Settings {
 fn enabled() -> bool {
     true
 }
+fn default_quick_note_hotkey() -> platform::Hotkey {
+    platform::Hotkey {
+        key: "N".into(),
+        ..platform::Hotkey::default()
+    }
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -79,14 +82,17 @@ impl Default for Settings {
             entries: Vec::new(),
             macros: Vec::new(),
             model_path: String::new(),
+            transcription_language: String::new(),
             microphone: None,
             clean_speech: true,
             output: None,
             learn_corrections: true,
             live_insert: true,
             hotkey: platform::Hotkey::default(),
+            quick_note_hotkey: default_quick_note_hotkey(),
             hotkey_mode: platform::HotkeyMode::default(),
             audio_feedback: true,
+            audio_context: false,
             styles: Vec::new(),
             discord_companion: false,
             discord_pairing_key: String::new(),
@@ -102,30 +108,44 @@ impl Default for Settings {
 }
 
 enum Command {
-    Load(PathBuf, bool),
+    Load(PathBuf, bool, Option<String>),
     Transcribe(Vec<f32>, u64, bool, CancelToken),
     Call(calls::Request, CancelToken),
 }
 enum Event {
-    Loaded(String),
+    Loaded(String, Vec<String>),
     Text(Result<String, String>, f32, u64, bool),
     Error(String),
     Progress(f32),
     Downloaded(PathBuf),
     Call(calls::Update),
     CallFinished(Result<(), String>),
+    #[allow(
+        dead_code,
+        reason = "Speaker model download event retained for model management"
+    )]
+    ContextProgress(f32),
+    ContextInstalled(Result<(), String>),
     SpeakersDownloaded,
+    SpeakersProgress(f32),
+    SpeakersDownloadFailed(String),
 }
 
 pub struct App {
-    assort: assort_ui::State,
     polish: polish_ui::State,
-    updates: crate::update::State,
     pending_install: Option<crate::update::InstallRequest>,
     history: history_ui::State,
     insights: insights_ui::State,
     saved_search: search_ui::State,
     brain: brain_ui::State,
+    notetaker: notetaker::State,
+    capture_feedback: capture_feedback::State,
+    updater: crate::update::State,
+    context_progress: Option<f32>,
+    context_status: String,
+    call_context: Vec<calls::Row>,
+    speakers_downloading: Option<f32>,
+    speakers_download_status: String,
     dictation_metrics: crate::insights::DictationMetrics,
     settings: Settings,
     commands: Sender<Command>,
@@ -135,11 +155,13 @@ pub struct App {
     hotkey_tx: Sender<platform::Hotkey>,
     hotkey_draft: platform::Hotkey,
     hotkey_pending: bool,
+    quick_note_hotkeys: Receiver<platform::HotkeyEvent>,
+    quick_note_hotkey_tx: Sender<platform::Hotkey>,
+    quick_note_hotkey_pending: bool,
+    quick_note_shortcut_error: Option<String>,
     hold_recording: bool,
     shortcut_gesture: shortcut_gesture::Gesture,
-    style_app: String,
-    style_draft: crate::writing_style::WritingStyle,
-    style_message: String,
+
     call_search: String,
     call_tab: usize,
     cancel: CancelToken,
@@ -151,13 +173,12 @@ pub struct App {
     downloading: Option<f32>,
     status: String,
     backend: String,
+    speech_languages: Vec<String>,
     text: String,
     raw: String,
     elapsed: Option<f32>,
     words_changed: usize,
-    heard: String,
-    wanted: String,
-    wav_path: String,
+
     page: usize,
     utterance: u64,
     preview_inflight: bool,
@@ -170,7 +191,7 @@ pub struct App {
     chunk_inflight: bool,
     call: Option<std::sync::Arc<call_capture::Control>>,
     discord: Option<std::sync::Arc<crate::discord::Connection>>,
-    avatars: crate::discord::avatar::Cache,
+
     discord_launch: discord_ui::LaunchState,
     call_rows: Vec<calls::Row>,
     call_committed: Vec<calls::Row>,
@@ -193,19 +214,14 @@ pub struct App {
     integration_pending: Option<integration::Action>,
     dictation_app: Option<String>,
     macro_used: Option<String>,
-    correction_editor: editors::CorrectionEditor,
-    macro_editor: editors::MacroEditor,
+
     call_notes: Option<crate::notes::Notes>,
-    library_input: String,
-    meter: [f32; 32],
-    meter_at: Instant,
+
     last_seconds: u64,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let ctx = cc.egui_ctx.clone();
-        theme::configure(&ctx);
+    fn new() -> Self {
         let settings_path = model::data_dir().join("settings.json");
         let (mut settings, warning) = match std::fs::read(&settings_path) {
             Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
@@ -224,7 +240,7 @@ impl App {
         let worker_tx = tx.clone();
         let cancel = CancelToken::new();
         let worker_cancel = cancel.clone();
-        let worker_ctx = ctx.clone();
+
         std::thread::spawn(move || {
             let mut engine: Option<Engine> = None;
             while let Ok(command) = rx.recv() {
@@ -234,7 +250,6 @@ impl App {
                             engine.set_cancel_token(&token);
                             calls::run(engine, request, |update| {
                                 let _ = worker_tx.send(Event::Call(update));
-                                worker_ctx.request_repaint();
                             })
                             .map_err(|e| format!("{e:#}"))
                         } else {
@@ -242,13 +257,14 @@ impl App {
                         };
                         Event::CallFinished(result)
                     }
-                    Command::Load(path, cpu) => {
+                    Command::Load(path, cpu, language) => {
                         engine = None;
-                        match Engine::load(&path, cpu, &worker_cancel) {
+                        match Engine::load_with_language(&path, cpu, &worker_cancel, language) {
                             Ok(e) => {
                                 let backend = e.backend.clone();
+                                let languages = e.languages.clone();
                                 engine = Some(e);
-                                Event::Loaded(backend)
+                                Event::Loaded(backend, languages)
                             }
                             Err(e) => Event::Error(format!("Could not load the model: {e:#}")),
                         }
@@ -266,24 +282,32 @@ impl App {
                     }
                 };
                 let _ = worker_tx.send(result);
-                worker_ctx.request_repaint();
             }
         });
         let (hotkey_tx, hotkeys) = mpsc::channel();
         let hotkey_draft = settings.hotkey.clone();
         let hotkey_tx = platform::hotkey(settings.hotkey.clone(), hotkey_tx);
-        let integration_ctx = ctx.clone();
-        let (integration_tx, integration_rx) =
-            integration::start(move || integration_ctx.request_repaint());
+        let (quick_note_events, quick_note_hotkeys) = mpsc::channel();
+        let quick_note_hotkey_tx =
+            platform::hotkey(settings.quick_note_hotkey.clone(), quick_note_events);
+
+        let (integration_tx, integration_rx) = integration::start(|| {});
         let mut app = Self {
-            assort: assort_ui::State::configured(settings.assort.clone()),
             polish: Default::default(),
-            updates: Default::default(),
+
             pending_install: None,
             history: history_ui::State::start(),
             insights: Default::default(),
             saved_search: Default::default(),
             brain: Default::default(),
+            notetaker: Default::default(),
+            capture_feedback: Default::default(),
+            updater: Default::default(),
+            context_progress: None,
+            context_status: String::new(),
+            call_context: Vec::new(),
+            speakers_downloading: None,
+            speakers_download_status: String::new(),
             dictation_metrics: Default::default(),
             settings,
             commands,
@@ -293,11 +317,13 @@ impl App {
             hotkey_tx,
             hotkey_draft,
             hotkey_pending: true,
+            quick_note_hotkeys,
+            quick_note_hotkey_tx,
+            quick_note_hotkey_pending: true,
+            quick_note_shortcut_error: None,
             hold_recording: false,
             shortcut_gesture: Default::default(),
-            style_app: String::new(),
-            style_draft: crate::writing_style::WritingStyle::Clean,
-            style_message: String::new(),
+
             call_search: String::new(),
             call_tab: 0,
             cancel,
@@ -309,13 +335,12 @@ impl App {
             downloading: None,
             status: "Choose a model to get started".into(),
             backend: String::new(),
+            speech_languages: Vec::new(),
             text: String::new(),
             raw: String::new(),
             elapsed: None,
             words_changed: 0,
-            heard: String::new(),
-            wanted: String::new(),
-            wav_path: String::new(),
+
             page: 0,
             utterance: 0,
             preview_inflight: false,
@@ -328,7 +353,7 @@ impl App {
             chunk_inflight: false,
             call: None,
             discord: None,
-            avatars: Default::default(),
+
             discord_launch: Default::default(),
             call_rows: Vec::new(),
             call_committed: Vec::new(),
@@ -351,12 +376,9 @@ impl App {
             integration_pending: None,
             dictation_app: None,
             macro_used: None,
-            correction_editor: Default::default(),
-            macro_editor: Default::default(),
+
             call_notes: None,
-            library_input: String::new(),
-            meter: [0.0; 32],
-            meter_at: Instant::now(),
+
             last_seconds: 0,
         };
         if PathBuf::from(&app.settings.model_path).is_file() {
@@ -392,6 +414,8 @@ impl App {
             .send(Command::Load(
                 PathBuf::from(&self.settings.model_path),
                 self.settings.cpu,
+                (!self.settings.transcription_language.is_empty())
+                    .then(|| self.settings.transcription_language.clone()),
             ))
             .is_err()
         {
@@ -578,6 +602,32 @@ impl App {
         }
     }
 
+    fn cancel_dictation(&mut self) {
+        self.cancel.cancel();
+        self.insertion_cancel.cancel();
+        self.pending_final = None;
+        self.integration_pending = None;
+        self.target = None;
+        self.recording = None;
+        self.hold_recording = false;
+        self.shortcut_gesture = Default::default();
+        self.live_mode = false;
+        self.busy = false;
+        self.preview_inflight = false;
+        self.chunk_inflight = false;
+        self.integration_inflight = false;
+        // Late ASR and insertion acknowledgements belong to the cancelled job.
+        self.utterance += 1;
+        let _ = self.integration_tx.send(integration::Action::Cancel);
+        self.status = "Transcription cancelled. Your visible text is kept.".into();
+        self.overlay_message.clone_from(&self.status);
+        self.overlay_until = Some(Instant::now() + Duration::from_secs(5));
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Audio import controller retained for the Tauri file import flow"
+    )]
     fn transcribe(&mut self, pcm: Vec<f32>) {
         self.history_save_dictation();
         self.history.dictation = None;
@@ -631,7 +681,21 @@ impl App {
             self.dictation_app.as_deref(),
             self.settings.clean_speech,
         );
-        let (cleaned, count) = crate::writing_style::apply(&self.raw, style);
+        let protected: Vec<_> = self
+            .settings
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.enabled
+                    && entry.app.as_deref().is_none_or(|scope| {
+                        self.dictation_app
+                            .as_deref()
+                            .is_some_and(|app| scope.eq_ignore_ascii_case(app))
+                    })
+            })
+            .flat_map(|entry| [entry.heard.clone(), entry.wanted.clone()])
+            .collect();
+        let (cleaned, count) = crate::writing_style::apply(&self.raw, style, &protected);
         self.cleanup_count = count;
         (self.text, self.words_changed) = dictionary::apply_in(
             &cleaned,
@@ -710,12 +774,18 @@ impl App {
     }
 
     fn receive(&mut self) {
+        self.poll_capture_stop_feedback();
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Call(update) => match update {
                     calls::Update::Started => {
-                        self.discord_launch.automation.capture_started();
-                        self.call_status = "Listening to your microphone and call audio".into()
+                        self.capture_started_feedback();
+                        if self.is_note_capture() {
+                            self.call_status = "Listening to your thoughts".into();
+                        } else {
+                            self.discord_launch.automation.capture_started();
+                            self.call_status = "Listening to your microphone and call audio".into();
+                        }
                     }
                     calls::Update::NativeAudio(received) => {
                         self.call_native_received = received;
@@ -727,8 +797,40 @@ impl App {
                         .into();
                     }
                     calls::Update::Levels(mic, output) => self.call_levels = (mic, output),
+                    calls::Update::AudioContext(row) => {
+                        if self.call_context.len() < 4096 {
+                            crate::sensevoice::apply(&mut self.call_rows, &row);
+                            self.call_context.push(row);
+                            self.history_call_changed();
+                        }
+                    }
+                    calls::Update::AudioContextStatus(message) => self.context_status = message,
+                    calls::Update::AudioGap(lost) => {
+                        if self.call.is_some()
+                            && let Some(session) = &mut self.history.call
+                            && session.kind == crate::history::Kind::Call
+                            && lost > session.audio_packets_lost
+                        {
+                            session.audio_packets_lost = lost;
+                            if let Some(selected) = &mut self.history.selected
+                                && selected.id == session.id
+                            {
+                                selected.audio_packets_lost = lost;
+                            }
+                            self.history_call_changed();
+                        }
+                    }
                     calls::Update::Rows(rows) => {
-                        calls::append_rows(&mut self.call_committed, rows);
+                        if self.is_note_capture() {
+                            // Keep source identities and timestamps immutable so
+                            // live note updates can reuse earlier model sections.
+                            self.call_committed.extend(rows);
+                        } else {
+                            calls::append_rows(&mut self.call_committed, rows);
+                        }
+                        for annotation in &self.call_context {
+                            crate::sensevoice::apply(&mut self.call_committed, annotation);
+                        }
                         self.call_rows.clone_from(&self.call_committed);
                         self.refresh_call_notes();
                         self.history_call_changed();
@@ -736,12 +838,17 @@ impl App {
                     calls::Update::Preview(rows) => {
                         self.call_rows.clone_from(&self.call_committed);
                         calls::append_rows(&mut self.call_rows, rows);
+                        for annotation in &self.call_context {
+                            crate::sensevoice::apply(&mut self.call_rows, annotation);
+                        }
                         self.refresh_call_notes();
                         self.history_call_changed();
                     }
                 },
                 Event::CallFinished(result) => {
-                    if result.is_err() {
+                    self.capture_finished_feedback(result.as_ref().err().map(String::as_str));
+                    let spoken_note = self.is_note_capture();
+                    if result.is_err() && !spoken_note {
                         self.discord_launch.automation.capture_failed(
                             Instant::now(),
                             !self.call_rows.is_empty(),
@@ -751,24 +858,47 @@ impl App {
                         );
                     }
                     self.history_save_call();
+                    if spoken_note && let Some(session) = &self.history.call {
+                        self.notetaker_queue_filing(session.clone());
+                    }
+                    self.brain_queue_finished_call();
                     self.call = None;
                     self.call_levels = (0.0, 0.0);
                     self.call_status = match result {
+                        Ok(()) if spoken_note => "Your spoken note is saved".into(),
                         Ok(()) => "Call transcript ready".into(),
                         Err(error) => error,
                     };
                 }
+                Event::ContextProgress(p) => self.context_progress = Some(p),
+                Event::ContextInstalled(result) => {
+                    self.context_progress = None;
+                    self.context_status = match result {
+                        Ok(()) => "Audio context is installed. Enable sound cues below.".into(),
+                        Err(e) => e,
+                    };
+                }
                 Event::SpeakersDownloaded => {
-                    self.downloading = None;
+                    self.speakers_downloading = None;
+                    self.speakers_download_status = "Speaker identification is ready".into();
                     self.call_status = "Speaker identification is ready".into();
                 }
-                Event::Loaded(backend) => {
+                Event::SpeakersProgress(progress) => self.speakers_downloading = Some(progress),
+                Event::SpeakersDownloadFailed(error) => {
+                    self.speakers_downloading = None;
+                    self.speakers_download_status = error;
+                }
+                Event::Loaded(backend, languages) => {
+                    self.speech_languages = languages;
                     self.loading = false;
                     self.ready = true;
                     self.backend = backend;
                     self.status = "Ready when you are".into();
                 }
                 Event::Text(result, elapsed, id, final_pass) => {
+                    if id != self.utterance {
+                        continue;
+                    }
                     self.preview_inflight = false;
                     let was_chunk = self.chunk_inflight;
                     self.chunk_inflight = false;
@@ -793,9 +923,6 @@ impl App {
                     }
                     if let Some(pcm) = self.pending_final.take() {
                         self.submit(pcm, true);
-                        continue;
-                    }
-                    if id != self.utterance {
                         continue;
                     }
                     if was_chunk {
@@ -944,6 +1071,31 @@ impl App {
                 }
             }
         }
+        while let Ok(event) = self.quick_note_hotkeys.try_recv() {
+            match event {
+                platform::HotkeyEvent::Pressed(_, _) if self.pending_install.is_none() => {
+                    if let Err(error) = self.notetaker_toggle_capture() {
+                        self.status.clone_from(&error);
+                        self.overlay_message = error;
+                        self.overlay_until = Some(Instant::now() + Duration::from_secs(5));
+                    }
+                }
+                platform::HotkeyEvent::Registered(hotkey) => {
+                    let changed = self.settings.quick_note_hotkey != hotkey;
+                    self.settings.quick_note_hotkey = hotkey;
+                    self.quick_note_hotkey_pending = false;
+                    self.quick_note_shortcut_error = None;
+                    if changed {
+                        self.save();
+                    }
+                }
+                platform::HotkeyEvent::Error { message, .. } => {
+                    self.quick_note_hotkey_pending = false;
+                    self.quick_note_shortcut_error = Some(message);
+                }
+                platform::HotkeyEvent::Pressed(_, _) | platform::HotkeyEvent::Released(_) => {}
+            }
+        }
         while let Ok(event) = self.integration_rx.try_recv() {
             match event {
                 integration::Event::LiveSupport(id, supported) if id == self.utterance => {
@@ -1027,9 +1179,11 @@ impl App {
             self.shortcut_gesture = Default::default();
         }
         self.history_poll();
+        self.updater.poll();
         self.poll_saved_search();
         self.polish_poll();
         self.brain_poll();
+        self.notetaker_poll_filing();
         self.preview();
     }
 
@@ -1057,114 +1211,17 @@ impl App {
         self.save();
     }
 
-    fn learning_notice(&mut self, ui: &mut egui::Ui) {
-        if self.remembered.is_empty() {
-            return;
-        }
-        let mut undo = false;
-        let mut dismiss = false;
-        egui::Frame::new()
-            .fill(theme::SURFACE)
-            .stroke(egui::Stroke::new(1.0_f32, theme::LINE))
-            .corner_radius(24)
-            .inner_margin(egui::Margin::symmetric(16, 8))
-            .show(ui, |ui| {
-                let change = self.remembered.last().unwrap();
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "{}: {} → {}",
-                            if change.updated_context() {
-                                "Updated context"
-                            } else if change.updated_existing() {
-                                "Updated correction"
-                            } else {
-                                "Remembered"
-                            },
-                            change.entry.heard,
-                            change.entry.wanted
-                        ))
-                        .color(ACCENT),
-                    );
-                    undo = ui.small_button("Undo").clicked();
-                    dismiss = ui.small_button("Dismiss").clicked();
-                });
-            });
-        if undo || dismiss {
-            let change = self.remembered.pop().unwrap();
-            if undo {
-                if change.undo(&mut self.settings.entries) {
-                    self.save();
-                    self.status = "Learning undone. Your edited text is unchanged.".into();
-                } else {
-                    self.status =
-                        "This correction has changed since then. Review it in Vocabulary.".into();
-                }
-            }
-        }
-    }
-
-    fn overlay(&self, ctx: &egui::Context) {
-        let recording = self.target.is_some() && self.recording.is_some();
-        let finishing = self.target.is_some() && self.busy;
-        let notice = self.overlay_until.is_some_and(|t| t > Instant::now());
-        if !(recording || finishing || notice) {
-            return;
-        }
-        let message = if recording {
-            let seconds = self.recording.as_ref().unwrap().seconds() as u64;
-            format!(
-                "Listening  {:02}:{:02}\n{}",
-                seconds / 60,
-                seconds % 60,
-                self.shortcut_instruction()
-            )
-        } else if finishing {
-            "Finishing your transcript...".into()
-        } else {
-            self.overlay_message.clone()
-        };
-        let monitor = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(egui::vec2(1280.0, 720.0));
-        ctx.show_viewport_deferred(
-            egui::ViewportId::from_hash_of("dictation_indicator"),
-            egui::ViewportBuilder::default()
-                .with_title("Articulate dictation")
-                .with_inner_size([420.0, 84.0])
-                .with_position([(monitor.x - 420.0) / 2.0, monitor.y - 150.0])
-                .with_decorations(false)
-                .with_resizable(false)
-                .with_always_on_top()
-                .with_taskbar(false)
-                .with_active(false)
-                .with_mouse_passthrough(true),
-            move |ctx, _| {
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(19, 23, 26))
-                            .inner_margin(14.0),
-                    )
-                    .show(ctx, |ui| {
-                        ui.label(RichText::new(&message).color(ACCENT).size(15.0));
-                    });
-                ctx.request_repaint_after(Duration::from_millis(100));
-            },
-        );
-    }
-
-    fn download(&mut self, ctx: &egui::Context) {
+    fn download(&mut self) {
         self.downloading = Some(0.0);
         self.status = "Downloading the speech model...".into();
         let tx = self.event_tx.clone();
-        let ctx = ctx.clone();
+
         std::thread::spawn(move || {
             let mut last = Instant::now();
             let result = model::download(|p| {
                 if last.elapsed() > Duration::from_millis(100) {
                     let _ = tx.send(Event::Progress(p));
-                    ctx.request_repaint();
+
                     last = Instant::now();
                 }
             });
@@ -1172,232 +1229,7 @@ impl App {
                 Ok(p) => Event::Downloaded(p),
                 Err(e) => Event::Error(format!("{e:#}")),
             });
-            ctx.request_repaint();
         });
-    }
-
-    fn settings_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let muted = theme::MUTED;
-        let idle = !self.busy
-            && self.call.is_none()
-            && !self.preview_inflight
-            && !self.loading
-            && self.recording.is_none()
-            && self.downloading.is_none();
-
-        theme::page_title(ui, "Settings");
-        ui.add_space(16.0);
-        let section_id = egui::Id::new("settings_section");
-        let mut section = ctx.data_mut(|data| data.get_temp::<usize>(section_id).unwrap_or(0));
-        ui.horizontal_wrapped(|ui| {
-            for (index, label) in [
-                "General",
-                "Audio & models",
-                "Integrations",
-                "Files & library",
-                "Updates & about",
-            ]
-            .iter()
-            .enumerate()
-            {
-                ui.selectable_value(&mut section, index, *label);
-            }
-        });
-        ui.add_space(18.0);
-        egui::Frame::new().fill(theme::SURFACE).corner_radius(12).inner_margin(20.0).show(ui,|ui| {
-            ui.set_min_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y=8.0;
-                match section {
-                    0 => {
-                        ui.label(RichText::new("General").size(20.0).strong());
-                        ui.separator();
-                        self.shortcut_preferences(ui,idle);
-                        ui.separator();
-                        let changed=ui.add_enabled_ui(idle, |ui| {
-                            let mut changed=theme::preference_switch(ui,&mut self.settings.insert,"Insert into your app","Write into the focused text field without pressing Enter.");
-                            let toggle_mode = self.settings.hotkey_mode == platform::HotkeyMode::Toggle;
-                            changed |= ui.add_enabled_ui(self.settings.insert && toggle_mode, |ui| theme::preference_switch(ui,&mut self.settings.live_insert,"Live insertion",if toggle_mode { "Type as you speak. Editing or moving the caret pauses typing." } else { "Available in Press to toggle mode. Hold mode inserts after finishing." })).inner;
-                            changed |= theme::preference_switch(ui,&mut self.settings.clean_speech,"Natural cleanup","Clean up repeated words and spoken corrections. Keep the original.");
-                            changed
-                        }).inner;
-                        if changed {self.save();}
-                        if theme::preference_switch(ui,&mut self.settings.learn_corrections,"Learn from corrections","Remember short spelling edits in your transcript or a supported app.") {
-                            self.edited_at=None;
-                            self.edit_baseline.clone_from(&self.text);
-                            if !self.settings.learn_corrections {let _=self.integration_tx.send(integration::Action::StopLearning);}
-                            self.save();
-                        }
-                        self.style_preferences(ui,idle);
-                    }
-                    1 => {
-        ui.label(RichText::new("Audio & recognition").size(20.0).strong());
-        ui.add_space(12.0);
-        ui.add_enabled_ui(idle, |ui| {
-            ui.label("Microphone");
-            let old = self.settings.microphone.clone();
-            ui.horizontal_wrapped(|ui| {
-                egui::ComboBox::from_id_salt("microphone")
-                    .width((ui.available_width()-110.0).clamp(180.0,440.0))
-                    .selected_text(
-                        self.settings
-                            .microphone
-                            .as_deref()
-                            .unwrap_or("Windows default microphone"),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.settings.microphone,
-                            None,
-                            "Windows default microphone",
-                        );
-                        for name in &self.microphones {
-                            ui.selectable_value(
-                                &mut self.settings.microphone,
-                                Some(name.clone()),
-                                name,
-                            );
-                        }
-                    });
-                if ui.button("Refresh").clicked() {
-                    self.microphones = audio::input_devices();
-                }
-            });
-            if old != self.settings.microphone {
-                self.save();
-            }
-            ui.add_space(14.0);
-            if ui
-                .checkbox(&mut self.settings.cpu, "Use CPU only")
-                .changed()
-            {
-                self.save();
-                if self.ready {
-                    self.load();
-                }
-            }
-            ui.label(
-                RichText::new("Turn on if you prefer to keep your graphics card free.")
-                    .small()
-                    .color(muted),
-            );
-            ui.add_space(12.0);
-            egui::CollapsingHeader::new("Speech model")
-                .default_open(!self.ready)
-                .show(ui, |ui| {
-                    ui.add_space(8.0);
-                    ui.label("Qwen3-ASR 1.7B · 8-bit · 2.19 GB");
-                    ui.label(
-                        RichText::new(
-                            "Recommended for accuracy. Download once, then transcribe offline.",
-                        )
-                        .small()
-                        .color(muted),
-                    );
-                    ui.add_space(8.0);
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.settings.model_path)
-                            .hint_text("Path to a local GGUF model")
-                            .desired_width(f32::INFINITY),
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Load local model").clicked() {
-                            self.save();
-                            self.load();
-                        }
-                        if ui.button("Download recommended model").clicked() {
-                            self.download(ctx);
-                        }
-                    });
-                    ui.label(
-                        RichText::new("Model downloads are provided by Hugging Face.")
-                            .small()
-                            .color(muted),
-                    );
-                });
-        });
-        if let Some(progress) = self.downloading {
-            ui.add(egui::ProgressBar::new(progress).show_percentage());
-        }
-        ui.add_space(8.0);
-        ui.label(RichText::new(&self.status).small().color(muted));
-
-                        ui.add_space(16.0);
-                        self.brain_settings_ui(ui);
-                        ui.separator();
-                        self.polish_settings_ui(ui);
-                        ui.separator();
-                        self.assort_settings_ui(ui);
-                        if ui.button("Speaker recognition and call audio").clicked() { self.page = 3; self.call_tab = 2; }
-                    }
-                    2 => {
-                        ui.label(RichText::new("Discord").size(22.0));
-                        ui.label(RichText::new("Connect speakers and audio from your voice calls.").color(muted));
-                        if ui.button("Open Discord setup").clicked() { self.page = 3; self.call_tab = 2; }
-                    }
-                    3 => {
-        ui.label(RichText::new("Files & vocabulary").size(20.0).strong());
-        ui.add_space(12.0);
-        ui.collapsing("Transcribe an audio file", |ui| {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Choose a WAV file on this computer.")
-                    .small()
-                    .color(muted),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.wav_path)
-                    .hint_text("Path to a WAV file")
-                    .desired_width(f32::INFINITY),
-            );
-            if ui
-                .add_enabled(
-                    idle && self.ready && !self.wav_path.is_empty(),
-                    egui::Button::new("Transcribe file"),
-                )
-                .clicked()
-            {
-                match audio::read_wav(&self.wav_path) {
-                    Ok(pcm) => {
-                        self.target = None;
-                        self.transcribe(pcm);
-                        self.page = 0;
-                    }
-                    Err(e) => self.status = format!("{e:#}"),
-                }
-            }
-        });
-        ui.add_space(10.0);
-        ui.collapsing("Move your vocabulary & shortcuts", |ui| {
-            ui.add_space(8.0);
-            self.library_ui(ui);
-        });
-
-                    }
-                    _ => {
-        if let Some(request) = update_ui::show(
-            ui,
-            &mut self.updates,
-            idle && !self.integration_inflight && self.history.error.is_none(),
-        ) {
-            self.history_save_dictation();
-            self.history_save_call();
-            self.history_save_personal_notes();
-            self.pending_install = Some(request);
-            ctx.request_repaint();
-        }
-                        ui.add_space(24.0);
-                        ui.separator();
-                        ui.label(RichText::new("About Articulate").size(22.0));
-                        ui.label("Copyright 2026 Articulate contributors");
-                        ui.label(RichText::new("Free software, without warranty.").color(muted));
-                        ui.horizontal_wrapped(|ui| {
-                            ui.hyperlink_to("AGPL-3.0-or-later license", "https://www.gnu.org/licenses/agpl-3.0.html");
-                            ui.hyperlink_to("Source code", format!("https://github.com/Obiente/articulate/tree/v{}", env!("CARGO_PKG_VERSION")));
-                        });
-                    }
-                }
-        });
-        ctx.data_mut(|data| data.insert_temp(section_id, section));
     }
 }
 
@@ -1423,267 +1255,13 @@ impl App {
             .saves_settled()
     }
 
-    fn poll_pending_install(&mut self, ctx: &egui::Context) -> bool {
-        if self.pending_install.is_none() {
-            return false;
-        }
-        let result = self.install_saves_settled();
-        match result {
-            Ok(false) => {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
-                        ui.spinner();
-                        ui.heading("Saving before the update");
-                        ui.label("Your transcripts and notes are being saved on this device.");
-                    });
-                });
-                ctx.request_repaint_after(Duration::from_millis(50));
-                true
-            }
-            Ok(true) => {
-                let request = self.pending_install.take().unwrap();
-                match request.launch() {
-                    Ok(()) => {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        true
-                    }
-                    Err(error) => {
-                        self.updates.status = crate::update::Status::Error(format!("{error:#}"));
-                        self.page = 2;
-                        false
-                    }
-                }
-            }
-            Err(error) => {
-                self.pending_install = None;
-                self.updates.status = crate::update::Status::Error(error);
-                self.page = 2;
-                false
-            }
-        }
-    }
-
-    fn calls_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        if ui
-            .add(egui::Button::new("Back to Notetaker").frame(false))
-            .clicked()
-        {
-            self.notetaker_hub();
-        }
-
-        let muted = Color32::from_rgb(157, 172, 174);
-        let compact = ui.available_width() < 1000.0;
-        // Reserve most of the viewport for the conversation.
-        ui.spacing_mut().item_spacing = egui::vec2(10.0, 6.0);
-        ui.spacing_mut().button_padding = egui::vec2(12.0, 6.0);
-        ui.spacing_mut().interact_size.y = 28.0;
-        let idle = self.call.is_none()
-            && self.recording.is_none()
-            && !self.busy
-            && !self.preview_inflight
-            && !self.loading
-            && self.downloading.is_none();
-        egui::Frame::new()
-            .fill(Color32::from_rgb(23, 32, 34))
-            .corner_radius(18)
-            .inner_margin(8.0)
-            .show(ui, |ui| {
-                ui.set_min_width((ui.available_width() - 1.0).max(0.0));
-                ui.horizontal(|ui| {
-                    let title = self
-                        .history
-                        .call
-                        .as_ref()
-                        .map(|s| s.title.as_str())
-                        .unwrap_or("Conversation");
-                    ui.label(RichText::new(title).size(if compact { 24.0 } else { 30.0 }));
-                    if let Some(control) = &self.call {
-                        let seconds = control.end_seconds() as u64;
-                        ui.label(
-                            RichText::new(format!(
-                                "Recording · {:02}:{:02}",
-                                seconds / 60,
-                                seconds % 60
-                            ))
-                            .color(ACCENT),
-                        );
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        self.call_primary_action(ui, idle);
-                    });
-                });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    let status = if !self.ready {
-                        "Load a speech model in Settings to capture a call."
-                    } else if !crate::speakers::path().is_file() && !self.discord_activity_ready() {
-                        "Open Setup to connect Discord or prepare speaker recognition."
-                    } else {
-                        &self.call_status
-                    };
-                    // A missing local speaker model must not make this header
-                    // wrap and steal the transcript's reading space.
-                    let reserve = if compact && self.call.is_some() {
-                        410.0
-                    } else {
-                        280.0
-                    };
-                    ui.add_sized(
-                        [(ui.available_width() - reserve).max(80.0), 28.0],
-                        egui::Label::new(
-                            RichText::new(if self.call.is_some() {
-                                if self.call_native_audio {
-                                    if self.call_native_received {
-                                        "Native participant audio"
-                                    } else {
-                                        "Waiting for participant audio"
-                                    }
-                                } else {
-                                    "Mixed call audio"
-                                }
-                            } else {
-                                status
-                            })
-                            .small()
-                            .color(muted),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(status);
-                    ui.add_space(12.0);
-                    let snapshot = self
-                        .discord
-                        .as_ref()
-                        .map(|connection| connection.snapshot());
-                    let (label, active) = self.discord_connection_label(snapshot.as_ref());
-                    ui.label(
-                        RichText::new(format!("Discord · {label}"))
-                            .small()
-                            .color(if active { ACCENT } else { muted }),
-                    );
-                    if ui.small_button("Setup").clicked() {
-                        self.call_tab = 2;
-                    }
-                    if compact && self.call.is_some() {
-                        let id = egui::Id::new("call_following");
-                        let mut following = ui
-                            .ctx()
-                            .data_mut(|data| data.get_temp::<bool>(id).unwrap_or(true));
-                        if ui
-                            .small_button(if following {
-                                "Following live"
-                            } else {
-                                "Jump to latest"
-                            })
-                            .clicked()
-                        {
-                            following = !following;
-                        }
-                        ui.ctx().data_mut(|data| data.insert_temp(id, following));
-                    }
-                });
-            });
-        ui.add_space(4.0);
-        let narrow_toolbar = ui.available_width() < 900.0;
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.call_tab, 3, "My notes");
-            ui.selectable_value(&mut self.call_tab, 1, "Highlights");
-            ui.selectable_value(&mut self.call_tab, 0, "Transcript");
-            ui.selectable_value(&mut self.call_tab, 2, "Setup");
-            if !narrow_toolbar {
-                self.call_reader_actions(ui, compact);
-            }
-        });
-        if narrow_toolbar && self.call_tab == 0 {
-            ui.horizontal(|ui| self.call_reader_actions(ui, true));
-        }
-        ui.add_space(6.0);
-        ui.separator();
-        match self.call_tab {
-            3 => self.call_personal_notes_ui(ui),
-            1 => {
-                egui::ScrollArea::vertical()
-                    .id_salt("call_notes_panel")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.call_notes_ui(ui));
-            }
-            2 => {
-                egui::ScrollArea::vertical()
-                    .id_salt("call_setup_panel")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| self.call_setup_ui(ui, ctx, idle));
-            }
-            _ => self.call_transcript_ui(ui),
-        }
-    }
-
-    fn call_reader_actions(&mut self, ui: &mut egui::Ui, compact: bool) {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if self.call_tab == 0 && !self.call_rows.is_empty() {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.call_search)
-                        .hint_text("Find in transcript")
-                        .desired_width(if compact { 180.0 } else { 240.0 })
-                        .margin(egui::vec2(10.0, 8.0)),
-                );
-            }
-            if self.call_tab == 0 {
-                self.call_export_actions(ui, compact);
-            }
-        });
-    }
-
-    fn discord_activity_ready(&self) -> bool {
-        self.discord.as_ref().is_some_and(|connection| {
-            let snapshot = connection.snapshot();
-            matches!(snapshot.status, crate::discord::Status::Ready)
-                && snapshot.observation.is_some_and(|observation| {
-                    observation.valid
-                        && observation.channel_id.is_some()
-                        && observation.at.elapsed() < Duration::from_millis(750)
-                })
-        })
-    }
-
-    fn call_primary_action(&mut self, ui: &mut egui::Ui, idle: bool) {
-        if let Some(control) = &self.call {
-            if ui
-                .add_enabled(
-                    control.stop_ns.load(Ordering::SeqCst) == 0,
-                    egui::Button::new(
-                        RichText::new("Finish capture").color(Color32::from_rgb(13, 28, 25)),
-                    )
-                    .fill(ACCENT)
-                    .corner_radius(22)
-                    .min_size(egui::vec2(156.0, 36.0)),
-                )
-                .clicked()
-            {
-                self.discord_launch.automation.manual_finish();
-                control.stop();
-                self.call_status = "Finishing the last section...".into();
-            }
-        } else if ui
-            .add_enabled(
-                idle && self.ready
-                    && (crate::speakers::path().is_file() || self.discord_activity_ready()),
-                egui::Button::new(
-                    RichText::new("Capture conversation").color(Color32::from_rgb(13, 28, 25)),
-                )
-                .fill(ACCENT)
-                .corner_radius(22)
-                .min_size(egui::vec2(192.0, 36.0)),
-            )
-            .clicked()
-        {
-            self.start_call_capture();
-        }
-    }
-
     fn start_call_capture(&mut self) -> bool {
+        self.start_stream_capture(false)
+    }
+
+    fn start_stream_capture(&mut self, microphone_only: bool) -> bool {
         let native_audio = match calls::select_native_source(
-            self.settings.discord_companion,
+            !microphone_only && self.settings.discord_companion,
             self.discord
                 .as_ref()
                 .is_some_and(|connection| connection.native_audio_ready()),
@@ -1691,12 +1269,18 @@ impl App {
             Ok(native_audio) => native_audio,
             Err(message) => {
                 self.call_status = message.to_string();
+                self.capture_failed_feedback(microphone_only, &message.to_string());
                 self.call_tab = 2;
                 return false;
             }
         };
-        self.save();
+        if !microphone_only {
+            self.save();
+        }
         self.history_save_call();
+        if let Some(session) = &self.history.call {
+            self.brain.remember(session);
+        }
         self.history.call = None;
         self.history.call_deleted = false;
         self.call_tab = 0;
@@ -1706,15 +1290,24 @@ impl App {
         self.call_notes = None;
         self.speaker_names = Default::default();
         let control = call_capture::Control::new();
-        control.set_discord(self.discord.clone());
+        if !microphone_only {
+            control.set_discord(self.discord.clone());
+        }
         self.cancel = CancelToken::new();
         self.call_native_audio = native_audio;
         self.call_native_received = false;
+        self.call_context.clear();
         let request = calls::Request {
+            audio_context: self.settings.audio_context,
             microphone: self.settings.microphone.clone(),
-            output: self.settings.output.clone(),
+            output: if microphone_only {
+                None
+            } else {
+                self.settings.output.clone()
+            },
             cpu: self.settings.cpu,
             native_audio: self.call_native_audio,
+            microphone_only,
             control: control.clone(),
         };
         match self
@@ -1723,509 +1316,74 @@ impl App {
         {
             Ok(()) => {
                 self.call = Some(control);
-                self.history.call = Some(crate::history::Session::new(crate::history::Kind::Call));
+                let kind = if microphone_only {
+                    crate::history::Kind::Note
+                } else {
+                    crate::history::Kind::Call
+                };
+                let mut session = crate::history::Session::new(kind);
+                if microphone_only {
+                    session.title = "Spoken note".into();
+                    session.auto_file_pending = true;
+                }
+                self.history.call = Some(session);
+                self.capture_feedback.prepare(
+                    if microphone_only {
+                        capture_feedback::Kind::Note
+                    } else {
+                        capture_feedback::Kind::Call
+                    },
+                    self.history.call.as_ref().map(|session| session.id.clone()),
+                );
                 self.history_call_changed();
-                self.call_status = "Preparing call capture...".into();
+                self.call_status = if microphone_only {
+                    "Preparing your microphone..."
+                } else {
+                    "Preparing call capture..."
+                }
+                .into();
                 true
             }
             Err(_) => {
                 self.call_status = "The speech worker stopped. Restart the app.".into();
+                self.capture_failed_feedback(
+                    microphone_only,
+                    "The speech worker stopped. Restart the app.",
+                );
                 false
             }
         }
     }
 
-    fn call_export_actions(&mut self, ui: &mut egui::Ui, compact: bool) {
-        if ui
-            .add_enabled(
-                !self.call_rows.is_empty(),
-                egui::Button::new(if compact { "Copy" } else { "Copy transcript" })
-                    .min_size(egui::vec2(if compact { 60.0 } else { 140.0 }, 36.0))
-                    .corner_radius(22),
-            )
-            .clicked()
-        {
-            self.call_status =
-                match platform::copy(&calls::text(&self.call_rows, &self.speaker_names)) {
-                    Ok(()) => "Call transcript copied".into(),
-                    Err(e) => e.to_string(),
-                };
-        }
-        ui.add_enabled_ui(!self.call_rows.is_empty(), |ui| {
-            ui.menu_button("Export…", |ui| {
-                use crate::call_export::Format;
-                for (label, extension, format) in [
-                    ("Plain text", "txt", Format::Text),
-                    ("Markdown", "md", Format::Markdown),
-                    ("Subtitles (SRT)", "srt", Format::Srt),
-                    ("Subtitles (WebVTT)", "vtt", Format::WebVtt),
-                ] {
-                    ui.horizontal(|ui| {
-                        ui.label(label);
-                        if ui.small_button("Save").clicked() {
-                            let text = crate::call_export::export(
-                                &self.call_rows,
-                                &self.speaker_names,
-                                format,
-                            );
-                            self.call_status = match crate::export_file::save(&text, extension) {
-                                Ok(true) => "Call transcript saved".into(),
-                                Ok(false) => "Export cancelled".into(),
-                                Err(error) => {
-                                    format!("Could not save transcript: {error}")
-                                }
-                            };
-                            ui.close();
-                        }
-                        if ui.small_button("Copy").clicked() {
-                            let text = crate::call_export::export(
-                                &self.call_rows,
-                                &self.speaker_names,
-                                format,
-                            );
-                            self.call_status = match platform::copy(&text) {
-                                Ok(()) => format!("{label} copied"),
-                                Err(error) => error.to_string(),
-                            };
-                            ui.close();
-                        }
-                    });
-                }
-            });
-        });
-    }
-
-    fn call_setup_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, idle: bool) {
-        let muted = Color32::from_rgb(157, 172, 174);
-        if self.call.is_some() {
-            ui.columns(2, |cols| {
-                cols[0].add(
-                    egui::ProgressBar::new((self.call_levels.0 * 4.0).min(1.0))
-                        .text("Your microphone"),
-                );
-                cols[1].add(
-                    egui::ProgressBar::new((self.call_levels.1 * 4.0).min(1.0)).text("Call audio"),
-                );
-            });
-            ui.add_space(12.0);
-        }
-        egui::CollapsingHeader::new("Audio setup")
-            .default_open(false)
-            .show(ui, |ui| {
-        ui.add_space(8.0);
-        let previous_mic = self.settings.microphone.clone();
-        let previous_output = self.settings.output.clone();
-        ui.add_enabled_ui(idle, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Microphone");
-                egui::ComboBox::from_id_salt("call_mic")
-                    .width(300.0)
-                    .selected_text(
-                        self.settings
-                            .microphone
-                            .as_deref()
-                            .unwrap_or("Windows default"),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.settings.microphone, None, "Windows default");
-                        for name in &self.microphones {
-                            ui.selectable_value(
-                                &mut self.settings.microphone,
-                                Some(name.clone()),
-                                name,
-                            );
-                        }
-                    });
-            });
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Call output");
-                egui::ComboBox::from_id_salt("call_output")
-                    .width(300.0)
-                    .selected_text(self.settings.output.as_deref().unwrap_or("Windows default"))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.settings.output, None, "Windows default");
-                        for name in &self.outputs {
-                            ui.selectable_value(
-                                &mut self.settings.output,
-                                Some(name.clone()),
-                                name,
-                            );
-                        }
-                    });
-                if ui.small_button("Refresh").clicked() {
-                    self.outputs = call_capture::outputs();
-                    self.microphones = audio::input_devices();
-                }
-            });
-        });
-        if previous_mic != self.settings.microphone || previous_output != self.settings.output {
-            self.save();
-        }
-        ui.add_space(8.0);
-        ui.label(RichText::new("Captures your microphone and all sound from this output. Use headphones to keep voices separate.").small().color(muted));
-        });
-        ui.label(
-            RichText::new(format!(
-                "{}  +  {}",
-                self.settings
-                    .microphone
-                    .as_deref()
-                    .unwrap_or("Default microphone"),
-                self.settings
-                    .output
-                    .as_deref()
-                    .unwrap_or("Default call output")
-            ))
-            .small()
-            .color(muted),
-        );
-        ui.add_space(16.0);
-        self.discord_ui(ui, ctx);
-        ui.add_space(16.0);
-        if !self.ready {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new("Load a speech model to start capturing calls.").color(muted),
-                );
-                if ui.button("Open settings").clicked() {
-                    self.page = 2;
-                }
-            });
-            ui.add_space(12.0);
-        }
-        if !crate::speakers::path().is_file() {
-            ui.label(RichText::new("One step before your first call").strong());
-            ui.label(
-                RichText::new("Download speaker recognition, 237 MB. Future calls work offline.")
-                    .small()
-                    .color(muted),
-            );
-            if ui
-                .add_enabled(idle, egui::Button::new("Set up speaker recognition"))
-                .clicked()
-            {
-                self.downloading = Some(0.0);
-                let tx = self.event_tx.clone();
-                let ctx = ctx.clone();
-                std::thread::spawn(move || {
-                    let mut last = Instant::now();
-                    let result = model::download_speakers(|p| {
-                        if last.elapsed() > Duration::from_millis(100) {
-                            let _ = tx.send(Event::Progress(p));
-                            ctx.request_repaint();
-                            last = Instant::now();
-                        }
-                    });
-                    let _ = tx.send(match result {
-                        Ok(_) => Event::SpeakersDownloaded,
-                        Err(e) => Event::Error(e.to_string()),
-                    });
-                    ctx.request_repaint();
-                });
-            }
-        }
-        if let Some(progress) = self.downloading {
-            ui.add(egui::ProgressBar::new(progress).show_percentage());
-        }
-        let previous_names = self.speaker_names.clone();
-        ui.collapsing("Name the speakers", |ui| {
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Up to four remote voices. Check speaker labels before sharing.")
-                    .small()
-                    .color(muted),
-            );
-            ui.add_space(8.0);
-            for (i, name) in self.speaker_names.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Speaker {}", i + 1)).color(ACCENT));
-                    ui.add(
-                        egui::TextEdit::singleline(name)
-                            .hint_text("Add a name")
-                            .desired_width(220.0),
-                    );
-                });
-                ui.add_space(6.0);
-            }
-        });
-        if previous_names != self.speaker_names {
-            self.history_call_changed();
-        }
-    }
-
-    fn call_notes_ui(&mut self, ui: &mut egui::Ui) {
-        let muted = Color32::from_rgb(157, 172, 174);
-        egui::Frame::new().inner_margin(0.0).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Meeting notes").size(20.0).strong());
-                ui.add_space(12.0);
-                if let Some(notes) = &self.call_notes {
-                    if ui.button("Copy notes").clicked() {
-                        self.call_status = match platform::copy(&notes.text(&self.speaker_names)) {
-                            Ok(()) => "Meeting notes copied".into(),
-                            Err(error) => error.to_string(),
-                        };
-                    }
-                    if !notes.is_current(&self.call_rows) {
-                        ui.label(
-                            RichText::new("New transcript available")
-                                .small()
-                                .color(ACCENT),
-                        );
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(
-                    "Highlights and possible actions, with the speaker and time attached.",
-                )
-                .small()
-                .color(muted),
-            );
-            ui.add_space(10.0);
-            self.assort_notes_ui(ui);
-            if let Some(notes) = &self.call_notes {
-                egui::CollapsingHeader::new("Read meeting notes")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(
-                                "Excerpts from your transcript. Review actions before sharing.",
-                            )
-                            .small()
-                            .color(muted),
-                        );
-                        for (title, quotes) in [
-                            ("Highlights", &notes.highlights),
-                            ("Possible actions", &notes.actions),
-                        ] {
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(title).strong());
-                            if quotes.is_empty() {
-                                ui.label("No excerpts selected. Read the full transcript below.");
-                            }
-                            for quote in quotes {
-                                ui.label(
-                                    RichText::new(quote.attribution(&self.speaker_names))
-                                        .small()
-                                        .color(ACCENT),
-                                )
-                                .on_hover_text(format!("Transcript section {}", quote.row + 1));
-                                ui.label(&quote.text);
-                                ui.add_space(12.0);
-                            }
-                        }
-                    });
-            }
-        });
-        ui.add_space(12.0);
-        ui.collapsing("Advanced: simple excerpt fallback", |ui| {
-            ui.small("Selects excerpts with simple text rules if the notes model is unavailable.");
-            if ui
-                .add_enabled(
-                    !self.call_rows.is_empty(),
-                    egui::Button::new("Create simple excerpts"),
-                )
-                .clicked()
-            {
-                self.call_notes = Some(crate::notes::Notes::build(&self.call_rows));
-                self.history_call_changed();
-            }
-        });
-    }
-
-    fn assort_notes_ui(&mut self, ui: &mut egui::Ui) {
-        let input = self.assort_transcript();
-        let can_start = self.call.is_none() && !self.busy;
-        let previous = self.assort.configuration.clone();
-        if let Some(summary) = assort_ui::show(ui, &mut self.assort, input.as_ref(), can_start)
-            && let Some(input) = input.as_ref()
-        {
-            match assort_ui::to_notes(&summary, input, &self.call_rows, &self.speaker_names) {
-                Ok(notes) => {
-                    self.call_notes = Some(notes);
-                    self.history_call_changed();
-                    self.call_status = "Reviewed Assort highlights saved to your notes".into();
-                }
-                Err(error) => {
-                    self.call_status = format!("Could not save Assort highlights: {error:#}")
-                }
-            }
-        }
-        if previous != self.assort.configuration {
-            self.settings.assort = self.assort.configuration.clone();
-            self.save();
-        }
-    }
-
-    fn assort_transcript(&self) -> Option<crate::classification::Transcript> {
-        let mut segments: Vec<_> = self
-            .call_rows
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| !row.text.trim().is_empty())
-            .map(|(index, row)| crate::classification::Segment {
-                id: format!("row-{index}"),
-                start_ms: row.start_ms,
-                end_ms: row.end_ms,
-                speaker: Some(calls::label(row, &self.speaker_names)),
-                text: row.text.clone(),
+    fn call_row_is_provisional(&self, index: usize) -> bool {
+        self.call_rows.get(index).is_some_and(|row| {
+            self.call_committed.get(index).is_none_or(|committed| {
+                row.text != committed.text
+                    || row.start_ms != committed.start_ms
+                    || row.end_ms != committed.end_ms
+                    || row.microphone != committed.microphone
+                    || row.speakers != committed.speakers
+                    || row.discord != committed.discord
             })
-            .collect();
-        if segments.is_empty() {
-            return None;
-        }
-        segments.sort_by_key(|segment| segment.start_ms);
-        Some(crate::classification::Transcript {
-            id: self
-                .history
-                .call
-                .as_ref()
-                .map(|session| session.id.clone())
-                .unwrap_or_else(|| "current-call".into()),
-            title: self
-                .history
-                .call
-                .as_ref()
-                .map(|session| session.title.clone())
-                .filter(|title| !title.is_empty())
-                .unwrap_or_else(|| "Call notes".into()),
-            goal: "Capture final decisions, assigned actions, and important facts.".into(),
-            segments,
         })
     }
 
-    fn call_transcript_ui(&mut self, ui: &mut egui::Ui) {
-        let muted = Color32::from_rgb(157, 172, 174);
-        let query = self.call_search.trim().to_lowercase();
-        let matching: Vec<_> = self
-            .call_rows
-            .iter()
-            .filter(|row| {
-                query.is_empty()
-                    || row.text.to_lowercase().contains(&query)
-                    || calls::label(row, &self.speaker_names)
-                        .to_lowercase()
-                        .contains(&query)
-            })
-            .collect();
-        if !query.is_empty() {
-            ui.label(
-                RichText::new(format!("{} matching sections", matching.len()))
-                    .small()
-                    .color(muted),
-            );
-        }
-        if self.call_rows.is_empty() {
-            ui.add_space(18.0);
-            ui.label(
-                RichText::new("Every voice, in one place.")
-                    .size(24.0)
-                    .color(muted),
-            );
-            ui.add_space(8.0);
-            ui.label(RichText::new("Start a capture to see the conversation unfold with speaker labels and timestamps.").color(muted));
-            ui.add_space(18.0);
-        }
-        let following_id = egui::Id::new("call_following");
-        let mut following = ui.ctx().data_mut(|data| {
-            data.get_temp::<bool>(following_id)
-                .unwrap_or(self.call.is_some())
-        });
-        let bounds = ui.available_rect_before_wrap();
-        if ui.rect_contains_pointer(bounds)
-            && ui.ctx().input(|input| input.smooth_scroll_delta.y > 0.0)
+    #[allow(
+        dead_code,
+        reason = "Call status classification retained for renderer status updates"
+    )]
+    fn call_live_label(&self) -> &'static str {
+        if self
+            .call
+            .as_ref()
+            .is_some_and(|control| control.stop_ns.load(Ordering::SeqCst) != 0)
         {
-            following = false;
-        }
-        let has_live = self.call.is_some() && bounds.width() > 1000.0;
-        let mut available = bounds;
-        if has_live {
-            available.max.y -= 40.0;
-            let footer = egui::Rect::from_min_max(
-                egui::pos2(bounds.left(), available.bottom() + 4.0),
-                bounds.max,
-            );
-            ui.scope_builder(egui::UiBuilder::new().max_rect(footer), |ui| {
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(if following {
-                            "Following live"
-                        } else {
-                            "Jump to latest"
-                        })
-                        .clicked()
-                    {
-                        following = !following;
-                    }
-                    if self.call_rows.len() > self.call_committed.len() {
-                        ui.label(
-                            RichText::new("Refining the latest words")
-                                .small()
-                                .color(ACCENT),
-                        );
-                    }
-                });
-            });
-        }
-        ui.ctx()
-            .data_mut(|data| data.insert_temp(following_id, following));
-        let rail = available.width() > 1020.0;
-        if rail {
-            let rail_rect = egui::Rect::from_min_max(
-                egui::pos2(available.right() - 220.0, available.top()),
-                available.max,
-            );
-            ui.scope_builder(egui::UiBuilder::new().max_rect(rail_rect), |ui| {
-                theme::people(ui, &self.call_rows, &self.speaker_names, &self.avatars);
-            });
-        }
-        let width = if rail {
-            available.width() - 260.0
+            "Finishing the transcript…"
+        } else if (0..self.call_rows.len()).any(|index| self.call_row_is_provisional(index)) {
+            "Refining the latest words"
         } else {
-            available.width()
-        };
-        let reader =
-            egui::Rect::from_min_size(available.min, egui::vec2(width, available.height()));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(reader), |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("call_rows")
-                .max_height(ui.available_height())
-                .auto_shrink([false, false])
-                .stick_to_bottom(query.is_empty() && following)
-                .show(ui, |ui| {
-                    ui.set_max_width(840.0_f32.min(width));
-                    ui.add_space(12.0);
-                    for (index, row) in matching.into_iter().enumerate() {
-                        if index > 0 {
-                            ui.add_space(24.0);
-                        }
-                        theme::transcript_row(ui, row, &self.speaker_names, &self.avatars);
-                    }
-                });
-        });
-    }
-}
-
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-        self.receive();
-        if self.poll_pending_install(ctx) {
-            return;
+            "Listening"
         }
-        self.poll_discord_launch();
-        self.overlay(ctx);
-        self.surface(ctx);
-        ctx.request_repaint_after(Duration::from_millis(
-            if self.recording.is_some() || self.busy || self.call.is_some() {
-                50
-            } else {
-                150
-            },
-        ));
     }
 }
 
@@ -2254,6 +1412,7 @@ mod tests {
 
     fn call_row(speaker: i32, start_ms: u64, text: &str) -> calls::Row {
         calls::Row {
+            cues: Vec::new(),
             start_ms,
             end_ms: start_ms + 1000,
             microphone: false,
@@ -2266,6 +1425,64 @@ mod tests {
     fn call_event(app: &mut App, update: calls::Update) {
         app.event_tx.send(Event::Call(update)).unwrap();
         app.receive();
+    }
+
+    #[test]
+    fn sound_cues_survive_preview_revision_and_save_without_replacing_words() {
+        let (mut app, _) = app();
+        app.call = Some(call_capture::Control::new());
+        app.history.call = Some(crate::history::Session::new(crate::history::Kind::Call));
+        let first = call_row(1, 1000, "A draft.");
+        call_event(&mut app, calls::Update::Preview(vec![first.clone()]));
+        let mut annotation = first;
+        annotation.text.clear();
+        annotation.cues.push(crate::sensevoice::Cue {
+            start_ms: 1000,
+            end_ms: 1500,
+            label: "Laughing".into(),
+        });
+        call_event(&mut app, calls::Update::AudioContext(annotation));
+        assert!(app.call_committed.is_empty());
+        assert_eq!(app.call_rows[0].text, "A draft.");
+        call_event(
+            &mut app,
+            calls::Update::Rows(vec![call_row(1, 1000, "Final words.")]),
+        );
+        assert_eq!(app.call_rows.len(), 1);
+        assert_eq!(app.call_rows[0].cues.len(), 1);
+        call_event(&mut app, calls::Update::Preview(Vec::new()));
+        app.history_save_call();
+        let saved = app.history.call.as_ref().unwrap();
+        assert_eq!(saved.rows[0].text, "Final words.");
+        assert_eq!(saved.rows[0].cues[0].label, "Laughing");
+    }
+
+    #[test]
+    fn call_audio_gap_is_cumulative_and_belongs_only_to_the_active_call() {
+        let (mut app, _) = app();
+        app.call = Some(call_capture::Control::new());
+        app.history.call = Some(crate::history::Session::new(crate::history::Kind::Call));
+        app.history.selected = Some(crate::history::Session::new(crate::history::Kind::Call));
+        app.history.dictation = Some(crate::history::Session::new(
+            crate::history::Kind::Dictation,
+        ));
+        call_event(&mut app, calls::Update::AudioGap(3));
+        call_event(&mut app, calls::Update::AudioGap(2));
+        assert_eq!(app.history.call.as_ref().unwrap().audio_packets_lost, 3);
+        assert_eq!(app.history.selected.as_ref().unwrap().audio_packets_lost, 0);
+        assert_eq!(
+            app.history.dictation.as_ref().unwrap().audio_packets_lost,
+            0
+        );
+        assert!(app.history.call_dirty.is_some());
+        app.history.selected = app.history.call.clone();
+        call_event(&mut app, calls::Update::AudioGap(4));
+        assert_eq!(app.history.selected.as_ref().unwrap().audio_packets_lost, 4);
+        app.history.call = Some(crate::history::Session::new(crate::history::Kind::Call));
+        assert_eq!(app.history.call.as_ref().unwrap().audio_packets_lost, 0);
+        app.call = None;
+        call_event(&mut app, calls::Update::AudioGap(9));
+        assert_eq!(app.history.call.as_ref().unwrap().audio_packets_lost, 0);
     }
 
     #[test]
@@ -2310,9 +1527,28 @@ mod tests {
             calls::Update::Preview(vec![call_row(1, 1000, "Temporary wording.")]),
         );
         assert_eq!(app.call_rows[0].text, "Keep this. Temporary wording.");
+        assert!(app.call_row_is_provisional(0));
+        assert_eq!(app.call_live_label(), "Refining the latest words");
         call_event(&mut app, calls::Update::Preview(Vec::new()));
         assert_eq!(app.call_rows[0].text, "Keep this.");
         assert_eq!(app.call_committed[0].text, "Keep this.");
+        assert!(!app.call_row_is_provisional(0));
+        assert_eq!(app.call_live_label(), "Listening");
+    }
+
+    #[test]
+    fn live_call_state_reports_finalization_before_preview() {
+        let (mut app, _) = app();
+        let control = call_capture::Control::new();
+        app.call = Some(control.clone());
+        assert_eq!(app.call_live_label(), "Listening");
+        call_event(
+            &mut app,
+            calls::Update::Preview(vec![call_row(1, 0, "Still speaking.")]),
+        );
+        assert_eq!(app.call_live_label(), "Refining the latest words");
+        control.stop_ns.store(1, Ordering::SeqCst);
+        assert_eq!(app.call_live_label(), "Finishing the transcript…");
     }
 
     #[test]
@@ -2367,6 +1603,7 @@ mod tests {
     fn old_preferences_leave_companion_off_and_update_requires_history() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.hotkey_mode, platform::HotkeyMode::Hold);
+        assert_eq!(settings.quick_note_hotkey.label(), "Ctrl + Alt + N");
         assert!(settings.audio_feedback);
         let explicit: Settings =
             serde_json::from_str(r#"{"hotkey_mode":"Toggle","audio_feedback":false}"#).unwrap();
@@ -2441,60 +1678,6 @@ mod tests {
     }
 
     #[test]
-    fn transcript_layout_keeps_complete_lines_above_the_footer() {
-        for (width, height, transcript) in [
-            (
-                1200.0,
-                840.0,
-                "First complete line.\nSecond complete line.\nThird complete line.\nFourth complete line.",
-            ),
-            (850.0, 620.0, "First complete line.\nSecond complete line."),
-        ] {
-            let (mut app, _) = app();
-            app.text = transcript.into();
-            let ctx = egui::Context::default();
-            theme::configure(&ctx);
-            let mut output = None;
-            for _ in 0..3 {
-                output = Some(ctx.run(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            egui::vec2(width, height),
-                        )),
-                        ..Default::default()
-                    },
-                    |ctx| app.surface(ctx),
-                ));
-            }
-            let output = output.unwrap();
-            let text = output
-                .shapes
-                .iter()
-                .find_map(|shape| {
-                    if let egui::epaint::Shape::Text(text) = &shape.shape
-                        && text.galley.job.text == transcript
-                    {
-                        Some((shape.clip_rect, text))
-                    } else {
-                        None
-                    }
-                })
-                .expect("The editable transcript must be rendered");
-            let painted = text.1.galley.rect.translate(text.1.pos.to_vec2());
-            assert!(
-                text.0.contains_rect(painted),
-                "Transcript clipped at {width}x{height}: {painted:?} outside {:?}",
-                text.0
-            );
-            assert!(
-                painted.bottom() < height - 44.0,
-                "Transcript overlaps the footer"
-            );
-        }
-    }
-
-    #[test]
     fn shortcut_explains_unavailable_dictation_without_starting_audio() {
         let (mut app, _) = app();
         app.loading = true;
@@ -2519,18 +1702,27 @@ mod tests {
         let (event_tx, events) = mpsc::channel();
         let (_, hotkeys) = mpsc::channel();
         let (hotkey_tx, _) = mpsc::channel();
+        let (_, quick_note_hotkeys) = mpsc::channel();
+        let (quick_note_hotkey_tx, _) = mpsc::channel();
         let (integration_tx, _) = mpsc::channel();
         let (_, integration_rx) = mpsc::channel();
         (
             App {
-                assort: Default::default(),
                 polish: Default::default(),
-                updates: Default::default(),
+
                 pending_install: None,
                 history: history_ui::State::default(),
                 insights: Default::default(),
                 saved_search: Default::default(),
                 brain: Default::default(),
+                notetaker: Default::default(),
+                capture_feedback: Default::default(),
+                updater: Default::default(),
+                context_progress: None,
+                context_status: String::new(),
+                call_context: Vec::new(),
+                speakers_downloading: None,
+                speakers_download_status: String::new(),
                 dictation_metrics: Default::default(),
                 settings: Settings::default(),
                 commands,
@@ -2540,11 +1732,13 @@ mod tests {
                 hotkey_tx,
                 hotkey_draft: platform::Hotkey::default(),
                 hotkey_pending: false,
+                quick_note_hotkeys,
+                quick_note_hotkey_tx,
+                quick_note_hotkey_pending: false,
+                quick_note_shortcut_error: None,
                 hold_recording: false,
                 shortcut_gesture: Default::default(),
-                style_app: String::new(),
-                style_draft: crate::writing_style::WritingStyle::Clean,
-                style_message: String::new(),
+
                 call_search: String::new(),
                 call_tab: 0,
                 cancel: CancelToken::new(),
@@ -2556,13 +1750,12 @@ mod tests {
                 downloading: None,
                 status: String::new(),
                 backend: "CPU".into(),
+                speech_languages: vec!["en".into(), "nl".into()],
                 text: String::new(),
                 raw: String::new(),
                 elapsed: None,
                 words_changed: 0,
-                heard: String::new(),
-                wanted: String::new(),
-                wav_path: String::new(),
+
                 page: 0,
                 utterance: 1,
                 preview_inflight: true,
@@ -2575,7 +1768,7 @@ mod tests {
                 chunk_inflight: false,
                 call: None,
                 discord: None,
-                avatars: Default::default(),
+
                 discord_launch: Default::default(),
                 call_rows: Vec::new(),
                 call_committed: Vec::new(),
@@ -2598,16 +1791,65 @@ mod tests {
                 integration_pending: None,
                 dictation_app: None,
                 macro_used: None,
-                correction_editor: Default::default(),
-                macro_editor: Default::default(),
+
                 call_notes: None,
-                library_input: String::new(),
-                meter: [0.0; 32],
-                meter_at: Instant::now(),
+
                 last_seconds: 0,
             },
             receiver,
         )
+    }
+
+    #[test]
+    fn automatic_cleanup_reaches_live_and_final_insertion_without_polish() {
+        let (mut app, _) = app();
+        let (tx, rx) = mpsc::channel();
+        let (ack, events) = mpsc::channel();
+        app.integration_tx = tx;
+        app.integration_rx = events;
+        app.target = Some(platform::test_target());
+        app.settings.insert = true;
+        app.settings.clean_speech = true;
+        app.live_mode = true;
+        app.dictation_app = Some("discord.exe".into());
+        let raw = "So the um invoices are unpaid. Um, when will you pay them?";
+        let expected = "So the invoices are unpaid. When will you pay them?";
+        app.event_tx
+            .send(Event::Text(Ok(raw.into()), 0.1, 1, false))
+            .unwrap();
+        app.receive();
+        assert!(
+            matches!(rx.try_recv().unwrap(), integration::Action::Preview { text, .. } if text == expected)
+        );
+        ack.send(integration::Event::Previewed(1, Ok(()))).unwrap();
+        app.receive();
+        app.event_tx
+            .send(Event::Text(Ok(raw.into()), 0.1, 1, true))
+            .unwrap();
+        app.receive();
+        assert!(
+            matches!(rx.try_recv().unwrap(), integration::Action::Insert { text, .. } if text == expected)
+        );
+        assert_eq!(app.raw, raw);
+        assert_eq!(app.edit_baseline, expected);
+        assert_eq!(app.history.dictation.as_ref().unwrap().text, expected);
+        assert!(app.cleanup_count >= 2);
+        assert!(!app.polish_working());
+    }
+
+    #[test]
+    fn automatic_cleanup_respects_verbatim_and_vocabulary() {
+        let (mut app, _) = app();
+        let raw = "Um, we we should send it.";
+        app.settings.clean_speech = false;
+        app.update_text(raw.into());
+        assert_eq!(app.text, raw);
+        app.settings.clean_speech = true;
+        app.settings
+            .entries
+            .push(dictionary::validate("um", "UM Research").unwrap());
+        app.update_text("Ask um to review it.".into());
+        assert_eq!(app.text, "Ask UM Research to review it.");
     }
 
     #[test]
@@ -2777,7 +2019,80 @@ mod tests {
             .unwrap();
         app.receive();
         assert_eq!(app.text, "New recording");
-        assert!(!app.preview_inflight);
+        assert!(app.preview_inflight);
+    }
+
+    #[test]
+    fn explicit_cancel_does_not_restart_pending_final_or_publish_late_chunks() {
+        let (mut app, commands) = app();
+        let (tx, actions) = mpsc::channel();
+        app.integration_tx = tx;
+        app.busy = true;
+        app.chunk_inflight = true;
+        app.pending_final = Some(vec![0.2; 32000]);
+        app.text = "Visible preview".into();
+        let cancelled_id = app.utterance;
+        app.cancel_dictation();
+        assert!(app.cancel.is_cancelled() && app.insertion_cancel.is_cancelled());
+        assert!(matches!(
+            actions.try_recv().unwrap(),
+            integration::Action::Cancel
+        ));
+        app.event_tx
+            .send(Event::Text(
+                Ok("Late chunk".into()),
+                0.1,
+                cancelled_id,
+                true,
+            ))
+            .unwrap();
+        app.receive();
+        assert_eq!(app.text, "Visible preview");
+        assert!(app.pending_final.is_none());
+        assert!(commands.try_recv().is_err() && actions.try_recv().is_err());
+        assert!(!app.busy && !app.preview_inflight);
+
+        // A new job may already be pending when an old result arrives.
+        app.pending_final = Some(vec![0.1; 16000]);
+        app.preview_inflight = true;
+        app.chunk_inflight = true;
+        app.event_tx
+            .send(Event::Text(
+                Ok("Old preview".into()),
+                0.1,
+                cancelled_id,
+                false,
+            ))
+            .unwrap();
+        app.receive();
+        assert!(app.preview_inflight && app.chunk_inflight && app.pending_final.is_some());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn explicit_cancel_stops_insertion_and_ignores_its_late_acknowledgement() {
+        let (mut app, _) = app();
+        let (ack, events) = mpsc::channel();
+        app.integration_rx = events;
+        let token = app.insertion_cancel.clone();
+        let id = app.utterance;
+        app.busy = true;
+        app.integration_inflight = true;
+        app.integration_pending = Some(integration::Action::Insert {
+            id,
+            target: platform::test_target(),
+            text: "Pending text".into(),
+            learn: false,
+            cancel: token.clone(),
+        });
+        app.cancel_dictation();
+        assert!(token.is_cancelled());
+        assert!(app.integration_pending.is_none());
+        ack.send(integration::Event::Inserted(id, Ok(false)))
+            .unwrap();
+        app.receive();
+        assert!(app.status.starts_with("Transcription cancelled"));
+        assert!(!app.busy);
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub enum Format {
 pub fn export(rows: &[Row], names: &[String; 4], format: Format) -> String {
     let mut rows: Vec<_> = rows
         .iter()
-        .filter(|r| !r.text.trim().is_empty())
+        .filter(|r| !r.text.trim().is_empty() || !r.cues.is_empty())
         .filter(|r| !matches!(format, Format::Srt | Format::WebVtt) || r.end_ms > r.start_ms)
         .collect();
     rows.sort_by_key(|r| r.start_ms);
@@ -32,6 +32,7 @@ pub fn export(rows: &[Row], names: &[String; 4], format: Format) -> String {
         } else {
             single_line(&label)
         };
+        let text = calls::display_text(row);
         match format {
             Format::Text => {
                 let _ = writeln!(
@@ -40,7 +41,7 @@ pub fn export(rows: &[Row], names: &[String; 4], format: Format) -> String {
                     timestamp(row.start_ms, '.'),
                     timestamp(row.end_ms, '.'),
                     label,
-                    row.text.trim()
+                    text.trim()
                 );
             }
             Format::Markdown => {
@@ -50,7 +51,7 @@ pub fn export(rows: &[Row], names: &[String; 4], format: Format) -> String {
                     markdown(&label),
                     timestamp(row.start_ms, '.'),
                     timestamp(row.end_ms, '.'),
-                    markdown(row.text.trim())
+                    markdown(text.trim())
                 );
             }
             Format::Srt | Format::WebVtt => {
@@ -62,7 +63,7 @@ pub fn export(rows: &[Row], names: &[String; 4], format: Format) -> String {
                     timestamp(row.start_ms, separator),
                     timestamp(row.end_ms, separator),
                     subtitle(&label),
-                    subtitle(&single_line(&row.text))
+                    subtitle(&single_line(&text))
                 );
             }
         }
@@ -124,6 +125,7 @@ mod tests {
 
     fn row(start_ms: u64, end_ms: u64, speakers: &[i32], text: &str) -> Row {
         Row {
+            cues: Vec::new(),
             start_ms,
             end_ms,
             speakers: speakers.to_vec(),

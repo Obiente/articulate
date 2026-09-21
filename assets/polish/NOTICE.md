@@ -11,6 +11,7 @@
   The conversion is a separate publisher's artifact, not a Qwen-published GGUF.
 - llama.cpp: MIT. The accompanying license is from release `b10964`, source
   revision `b29c606e28a01b1bc8c1351026a0fa6e616bf6c4`.
+  Both the CPU runtime and optional Vulkan runtime use this release.
 - LLVM OpenMP: the accompanying license is copied unchanged from the verified
   official `llama-b10964-bin-win-cpu-x64.zip` release artifact.
 

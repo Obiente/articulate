@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "dictation-overlay",
+  "description": "Non-interactive local dictation indicator",
+  "windows": ["dictation-overlay"],
+  "permissions": []
+}

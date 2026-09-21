@@ -20,9 +20,12 @@ const MODEL_URL: &str = "https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resol
 const RUNTIME_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b10964/llama-b10964-bin-win-cpu-x64.zip";
 const RUNTIME_SHA: &str = "917f39c076402c421224824607397af20f53625a60defc20e8dd22446bf4c5d7";
 const RUNTIME_BYTES: u64 = 18_427_629;
+const VULKAN_RUNTIME_URL: &str = "https://github.com/ggml-org/llama.cpp/releases/download/b10964/llama-b10964-bin-win-vulkan-x64.zip";
+const VULKAN_RUNTIME_SHA: &str = "1ee3ad952f4ba71f438bd6d7bebef19e1c7af04adcaa35d08b4ddabb27d4c642";
+const VULKAN_RUNTIME_BYTES: u64 = 31_674_542;
 pub const DOWNLOAD_BYTES: u64 = MODEL_BYTES + RUNTIME_BYTES;
 pub const SUMMARY_BYTES: u64 = 3_143_656_608;
-pub const SUMMARY_DOWNLOAD_BYTES: u64 = SUMMARY_BYTES + RUNTIME_BYTES;
+pub const SUMMARY_DOWNLOAD_BYTES: u64 = SUMMARY_BYTES + RUNTIME_BYTES + VULKAN_RUNTIME_BYTES;
 const SUMMARY_NAME: &str = "Qwen3.5-4B-Q5_K_M.gguf";
 const SUMMARY_SHA: &str = "8814232b85594dcd46c50e5b8b29324a7efe9e746edbe8a3d1df3d3fce7aad39";
 const SUMMARY_URL: &str = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/e87f176479d0855a907a41277aca2f8ee7a09523/Qwen3.5-4B-Q5_K_M.gguf";
@@ -44,6 +47,11 @@ struct Artifact {
 fn artifacts() -> Result<Vec<Artifact>> {
     Ok(serde_json::from_str(include_str!("runtime-files.json"))?)
 }
+fn gpu_artifacts() -> Result<Vec<Artifact>> {
+    Ok(serde_json::from_str(include_str!(
+        "runtime-vulkan-files.json"
+    ))?)
+}
 pub(super) fn root() -> PathBuf {
     #[cfg(test)]
     if let Some(root) = std::env::var_os("ARTICULATE_POLISH_TEST_DIR") {
@@ -58,6 +66,40 @@ pub(super) fn model_for(profile: ModelProfile) -> PathBuf {
 }
 pub(super) fn executable() -> PathBuf {
     root().join("runtime").join("llama-server.exe")
+}
+pub(super) fn executable_for_gpu() -> PathBuf {
+    root().join("runtime-vulkan").join("llama-server.exe")
+}
+
+// This indicates a complete downloaded runtime, not a usable graphics device.
+// The caller must verify its hashes before trying it and fall back to the CPU
+// runtime if Vulkan initialization or model loading fails.
+pub(super) fn gpu_available() -> bool {
+    cfg!(all(windows, target_arch = "x86_64"))
+        && fs::read_to_string(root().join("ready-vulkan"))
+            .is_ok_and(|marker| marker == VULKAN_RUNTIME_SHA)
+        && gpu_artifacts().is_ok_and(|files| {
+            files.iter().all(|file| {
+                root()
+                    .join("runtime-vulkan")
+                    .join(&file.name)
+                    .metadata()
+                    .is_ok_and(|m| m.is_file() && m.len() == file.bytes)
+            })
+        })
+}
+
+pub(super) fn verify_gpu(cancel: &AtomicBool) -> Result<()> {
+    ensure!(gpu_available(), "The local GPU tools are not installed.");
+    for file in gpu_artifacts()? {
+        verified(
+            &root().join("runtime-vulkan").join(file.name),
+            file.bytes,
+            &file.sha256,
+            cancel,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn installed() -> bool {
@@ -184,24 +226,89 @@ pub(super) fn download_profile(
             events,
         )?;
     }
-    let archive = root().join("runtime.zip");
-    if verified(&archive, RUNTIME_BYTES, RUNTIME_SHA, cancel).is_err() {
-        fetch(
+    install_runtime(false, cancel, events)?;
+    if profile == ModelProfile::Summary
+        && let Err(error) = install_runtime(true, cancel, events)
+    {
+        // GPU support is optional. Preserve a working CPU installation if the
+        // additional archive is unavailable, but always honor cancellation.
+        check_cancel(cancel)?;
+        progress(
+            events,
+            &format!("Notes are ready on CPU. GPU tools could not be prepared: {error:#}"),
+            None,
+        );
+    }
+    Ok(())
+}
+
+fn install_runtime(gpu: bool, cancel: &Arc<AtomicBool>, events: &Sender<Event>) -> Result<()> {
+    let (url, size, sha, archive_name, directory_name, marker_name) = if gpu {
+        (
+            VULKAN_RUNTIME_URL,
+            VULKAN_RUNTIME_BYTES,
+            VULKAN_RUNTIME_SHA,
+            "runtime-vulkan.zip",
+            "runtime-vulkan",
+            "ready-vulkan",
+        )
+    } else {
+        (
             RUNTIME_URL,
-            &archive,
             RUNTIME_BYTES,
             RUNTIME_SHA,
-            "Downloading local editing tools",
+            "runtime.zip",
+            "runtime",
+            "ready",
+        )
+    };
+    let expected = if gpu { gpu_artifacts()? } else { artifacts()? };
+    let runtime = root().join(directory_name);
+    if fs::read_to_string(root().join(marker_name)).is_ok_and(|marker| marker == sha)
+        && expected.iter().all(|artifact| {
+            verified(
+                &runtime.join(&artifact.name),
+                artifact.bytes,
+                &artifact.sha256,
+                cancel,
+            )
+            .is_ok()
+        })
+    {
+        check_cancel(cancel)?;
+        return Ok(());
+    }
+    check_cancel(cancel)?;
+    let archive = root().join(archive_name);
+    if verified(&archive, size, sha, cancel).is_err() {
+        fetch(
+            url,
+            &archive,
+            size,
+            sha,
+            if gpu {
+                "Downloading GPU tools"
+            } else {
+                "Downloading local editing tools"
+            },
             cancel,
             events,
         )?;
     }
-    progress(events, "Preparing local editing tools", None);
+    progress(
+        events,
+        if gpu {
+            "Preparing GPU tools"
+        } else {
+            "Preparing local editing tools"
+        },
+        None,
+    );
     let stage = root().join(format!("stage-{}", crate::discord::plugin::new_token()?));
     fs::create_dir(&stage)?;
     let result = (|| -> Result<()> {
         let mut zip = zip::ZipArchive::new(File::open(&archive)?)?;
-        let expected = artifacts()?;
+        let expected = if gpu { gpu_artifacts()? } else { artifacts()? };
         ensure!(zip.len() <= 100, "Unexpected editing runtime archive.");
         for artifact in &expected {
             check_cancel(cancel)?;
@@ -244,7 +351,7 @@ pub(super) fn download_profile(
             include_bytes!("../../assets/polish/NOTICE.md"),
         )?;
         check_cancel(cancel)?;
-        let runtime = root().join("runtime");
+        let runtime = root().join(directory_name);
         let healthy = runtime.exists()
             && expected.iter().all(|artifact| {
                 verified(
@@ -269,7 +376,7 @@ pub(super) fn download_profile(
         } else {
             fs::rename(&stage, &runtime)?;
         }
-        fs::write(root().join("ready"), RUNTIME_SHA)?;
+        fs::write(root().join(marker_name), sha)?;
         Ok(())
     })();
     if result.is_err() {
@@ -338,15 +445,30 @@ mod tests {
     use super::*;
     #[test]
     fn pinned_inventory_rejects_paths_and_has_server_without_rpc() {
-        let files = artifacts().unwrap();
+        for files in [artifacts().unwrap(), gpu_artifacts().unwrap()] {
+            assert!(
+                files
+                    .iter()
+                    .all(|f| safe_name(&f.name) && f.sha256.len() == 64 && f.bytes > 0)
+            );
+            assert_eq!(files.iter().filter(|f| f.name.ends_with(".exe")).count(), 1);
+            assert!(files.iter().any(|f| f.name == "llama-server.exe"));
+            assert!(!files.iter().any(|f| f.name.contains("rpc")));
+            let names: std::collections::HashSet<_> = files.iter().map(|f| &f.name).collect();
+            assert_eq!(names.len(), files.len());
+        }
         assert!(
-            files
+            gpu_artifacts()
+                .unwrap()
                 .iter()
-                .all(|f| safe_name(&f.name) && f.sha256.len() == 64 && f.bytes > 0)
+                .any(|f| f.name == "ggml-vulkan.dll")
         );
-        assert_eq!(files.iter().filter(|f| f.name.ends_with(".exe")).count(), 1);
-        assert!(files.iter().any(|f| f.name == "llama-server.exe"));
-        assert!(!files.iter().any(|f| f.name.contains("rpc")));
+        assert!(
+            !artifacts()
+                .unwrap()
+                .iter()
+                .any(|f| f.name.contains("vulkan"))
+        );
         for name in [
             "../server.exe",
             "C:server.exe",

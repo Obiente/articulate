@@ -4,16 +4,16 @@ A Windows dictation app with local speech recognition, written in Rust with a na
 
 ## Run
 
-The native interface uses Inter, Phosphor SVG icons, a path-based Articulate mark and native vertex-color gradients. No raster mockup is used as application UI.
+The Tauri interface uses React, Mantine, Inter, Phosphor icons and Motion animations. Rust owns capture, inference, shortcuts and storage.
 
-Build once with Rust and Visual Studio C++ Build Tools installed:
+Build once with Rust, Node.js 22 LTS or newer, npm and Visual Studio C++ Build Tools installed:
 
 ```powershell
 .\scripts\build-windows.ps1
 .\Start.cmd
 ```
 
-The build script needs GitHub CLI (`gh`) and downloads a pinned, SHA-256 verified CPU/Vulkan runtime. It constructs an MSVC import library from the official DLL's exports and links the matching `transcribe-cpp` 0.2.3 bindings. DLLs must stay beside the executable. The runtime selects a compatible CPU implementation; GPU acceleration uses Vulkan if available.
+The build script installs locked frontend dependencies, builds and embeds the React interface, then compiles the single `articulate` executable. Use `-Debug` for a development build, `-Test` for frontend and Rust tests, or `-Check` for frontend formatting and Rust Clippy. It needs GitHub CLI (`gh`) and downloads a pinned, SHA-256 verified CPU/Vulkan runtime. It constructs an MSVC import library from the official DLL's exports and links the matching `transcribe-cpp` 0.2.3 bindings. DLLs must stay beside the executable. The runtime selects a compatible CPU implementation; GPU acceleration uses Vulkan if available.
 
 In Settings, choose **Download recommended model**, or enter a compatible GGUF model path and choose **Load local model**. Model downloads require internet; the optional Discord connector communicates only with the local Discord client. Once a model is installed, dictation works offline. Models and preferences retain the existing `%LOCALAPPDATA%\TranscribeLocal` location so upgrading to Articulate preserves your local library. The Cargo package and executable are named `articulate`; the installer presents it as Articulate.
 
@@ -48,7 +48,7 @@ The microphone track is labelled **You**. Calls use the same loaded speech model
 
 The pinned native diarizer exposes offline windows, not a usable persistent public streaming API. This app prepends a bounded clean voice reference for each established speaker and remaps each new window by reference overlap. This is best-effort continuity, not guaranteed stable identity. The trailing transcript refreshes after roughly two seconds of new audio plus inference time. A bounded draft stays revisable until both tracks are quiet or the 24-second context cap is reached. A call itself has no duration cap. Slower CPUs combine pending audio into the next revision. Brief diarizer changes are grouped into contiguous speech blocks so ASR receives more context; mixed speaker blocks remain uncertain instead of assigning generated words to guessed timestamps. Short replies are retained. Window boundaries can still affect words and punctuation. No automatic text cleanup is applied to call transcripts. Consecutive sections from the same identified speaker share one label. **Copy transcript** copies the grouped, timestamped transcript, and **History** retains saved sessions locally.
 
-**Create notes** uses the included pretrained Assort classifier to suggest up to six verbatim highlights, with speaker labels and source time ranges. Review suggestions before adding them. These are extractive notes, not a generative summary. An advanced fallback uses local word frequency and English decision/action cues. Notes are saved with their transcript for later review in **History**.
+**Notes** is one editable document, generated locally with the optional Qwen3.5 4B model. During capture, generation considers committed speech after at least 40 new words and 45 seconds since the previous attempt; after capture, remaining speech can trigger a final update after that interval. Generation uses at most four CPU threads. Each job, document and save belongs to its transcript. Updates retain manually typed paragraphs; supporting transcript excerpts are expandable. The old Highlights and Assort meeting-suggestion UI is removed, while Assort vocabulary review remains. Legacy saved excerpts are retained for compatibility. See [local notes](local-summaries.md).
 
 ## Saved sessions
 
@@ -63,8 +63,8 @@ Sources: [native diarizer documentation](https://github.com/handy-computer/trans
 - Default: **Qwen3-ASR 1.7B Q8_0**, a 2.19 GB download. This uses the larger Qwen3-ASR model and conservative 8-bit quantization rather than a smaller or heavily compressed default. It is a starting candidate, not a claim of universal superiority.
 - Automatic language detection, source-language transcription, and the model's native decoding defaults. This native Qwen implementation does not expose language hints, contextual vocabulary prompts, timestamps, or streaming.
 - Live preview starts after 1.2 seconds and requests another pass after at least 0.8 seconds of new audio. There is only one request in flight; slower CPUs naturally update less often. This repeatedly decodes the active window, not the entire growing recording. Stop cancels provisional inference, preserves any in-flight section commit, and checks the tail. Generation IDs prevent discarded or cancelled results from replacing a newer recording.
-- Windows font fallbacks render CJK, Korean, Cyrillic and other scripts missing from egui's default fonts. Fonts are read from the local Windows installation, not downloaded or redistributed. This fixes missing glyph rendering, not incorrect language recognition or hallucinated text.
-- Optional conservative English cleanup runs on each preview and the final text. It handles limited function-word repetitions, fragments such as `pro- product`, and explicit single-token day/month/number corrections such as `Tuesday, sorry, Thursday`. It preserves negation, emphasis, and ambiguous phrases. It does not repair arbitrary homophones, missing words, grammar, or paragraph-level restarts. Original ASR text remains available and changes can be undone. No second generative model is used. The ASR itself can still normalize punctuation, numbers, and wording.
+- WebView2 uses Windows font fallbacks for CJK, Korean, Cyrillic and other scripts. System fonts are not redistributed. This fixes missing glyph rendering, not incorrect language recognition or hallucinated text.
+- Optional conservative English cleanup runs on each preview and the final text. It handles limited function-word repetitions, fragments such as `pro- product`, and explicit single-token day/month/number corrections such as `Tuesday, sorry, Thursday`. It preserves negation, emphasis, and ambiguous phrases. It does not repair arbitrary homophones, missing words, grammar, or paragraph-level restarts. Original ASR text remains available and changes can be undone. No second generative model is used in live cleanup. Optional **Polish** for finished dictation first prepares a safe filler/repetition/explicit-repair baseline, then previews a separate local model edit. If that edit is rejected, the safe baseline remains available for review and Apply. The ASR itself can still normalize punctuation, numbers, and wording.
 - Band-limited conversion to 16 kHz avoids aliasing. Capture uses a preallocated ring buffer without locks, allocation, filesystem access, or inference on the audio callback.
 - The model stays loaded between recordings. Inference runs on a worker thread. Cancelled, failed, or truncated outputs are never automatically inserted.
 - Dictionary corrections are explicit whole-word/phrase replacements, optionally ignoring case. Longest matches win without cascading replacements. Changes can be undone. With **Remember spelling corrections I make** enabled, short stable edits can create local dictionary entries with a visible Undo action. This does not train the speech model.
@@ -109,7 +109,7 @@ This release focuses on Windows dictation and call transcripts.
 - Windows first. This is an initial working dictation application, not feature parity with Wispr Flow.
 - Microphone selection is available. No noise suppression, voice-activity endpointing, or background recording overlay yet.
 - Dictation and call capture have no fixed duration cap. Audio buffers are bounded. If inference or capture cannot keep up, recording stops with an explicit error instead of silently discarding speech. Long WAV imports are held in memory and decoded in windows.
-- Meeting notes select verbatim highlights and possible action excerpts. No generative summaries, automatic meeting detection, mobile keyboard, or automatic dictionary sync yet.
+- Optional local notes generation runs during calls and on saved transcripts. Its section-based summaries need review, especially when later speech changes an earlier decision. Discord call auto-start is available through the connection; general calendar meeting detection, a mobile keyboard and automatic dictionary sync are not implemented.
 - Corrections can be added manually or learned from edits. Model-level vocabulary biasing remains future work.
 - Automatic insertion uses Unicode input packets and checks both native focus and the exact UI Automation element on a dedicated COM worker. It leaves the clipboard alone and never sends Enter. Password, read-only and unsupported fields are excluded. Moving to another field stops tracking. Elevated/protected apps and editors with incomplete accessibility support may require Copy text.
 - **Copy text** deliberately changes the clipboard and requests exclusion from Windows clipboard history/cloud sync. This does not prevent third-party clipboard utilities or the destination app from reading copied text.
@@ -119,7 +119,7 @@ This release focuses on Windows dictation and call transcripts.
 
 ## Layout
 
-`audio.rs` handles capture and resampling; `engine.rs` owns the native model session; `cleanup.rs` handles conservative disfluency rules; `dictionary.rs` applies explicit corrections; `platform.rs` handles Windows hotkeys, insertion and clipboard flags; `model.rs` contains the isolated download path; `app.rs` is the native egui interface and preview/final-pass coordination.
+`audio.rs` handles capture and resampling; `engine.rs` owns the native model session; `cleanup.rs` handles conservative disfluency rules; `dictionary.rs` applies explicit corrections; `platform.rs` handles Windows hotkeys, insertion and clipboard flags; `model.rs` contains the isolated download path; `app.rs` coordinates the Rust controller and preview/final passes; `app/desktop.rs` exposes its IPC bridge; `ui/src` contains the React interface.
 
 Local recordings, diagnostics, builds, models and captures belong in ignored `.local/` or outside the repository. Do not commit real user speech, transcripts or machine-specific paths.
 

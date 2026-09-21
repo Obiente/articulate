@@ -248,6 +248,7 @@ mod tests {
         session.title = "Planning".into();
         session.personal_notes = "Ask about the zephyr launch.".into();
         session.rows.push(crate::calls::Row {
+            cues: Vec::new(),
             start_ms: 1500,
             end_ms: 4500,
             microphone: true,

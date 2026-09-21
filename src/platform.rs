@@ -428,6 +428,9 @@ mod win {
         }
     }
 
+    /// Each service owns a separate Windows thread and message queue. Multiple
+    /// services can use the same thread-local IDs; conflicting chords are still
+    /// rejected globally and replacement keeps the previous chord registered.
     pub fn hotkey(initial: Hotkey, tx: Sender<HotkeyEvent>) -> Sender<Hotkey> {
         let (updates, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || unsafe {
@@ -626,16 +629,6 @@ mod win {
             {
                 bail!("Release the modifier keys. Your transcript is ready to copy.");
             }
-            let current = target();
-            if !same_field()
-                || !current.is_some_and(|t| {
-                    t.window == expected.window
-                        && t.focus == expected.focus
-                        && t.process == expected.process
-                })
-            {
-                bail!("Focus changed. Your transcript is ready to copy.");
-            }
             let mut input = Vec::new();
             if text.is_empty() && delete_empty {
                 for flags in [0, KEYEVENTF_KEYUP] {
@@ -672,6 +665,10 @@ mod win {
             if input.is_empty() {
                 return Ok(());
             }
+            // UIA providers may take hundreds of milliseconds to answer. The
+            // native focus and modifier observations must follow that read,
+            // immediately before emitting the prepared input batch.
+            check_insertion_target(expected, same_field, target, || modifiers_released())?;
             let sent = SendInput(
                 input.len() as u32,
                 input.as_ptr(),
@@ -684,6 +681,21 @@ mod win {
             }
             Ok(())
         }
+    }
+
+    fn check_insertion_target(
+        expected: Target,
+        same_field: impl FnOnce() -> bool,
+        current_target: impl FnOnce() -> Option<Target>,
+        modifiers_up: impl FnOnce() -> bool,
+    ) -> Result<()> {
+        if !same_field() || current_target() != Some(expected) {
+            bail!("Focus changed. Your transcript is ready to copy.");
+        }
+        if !modifiers_up() {
+            bail!("Release the modifier keys. Your transcript is ready to copy.");
+        }
+        Ok(())
     }
 
     pub fn copy(text: &str) -> Result<()> {
@@ -738,6 +750,47 @@ mod win {
     #[cfg(test)]
     mod hotkey_tests {
         use super::*;
+
+        #[test]
+        fn insertion_checks_native_state_after_slow_field_validation() {
+            let expected = Target {
+                window: 1,
+                focus: 2,
+                process: 3,
+            };
+            let changed = Target {
+                window: 4,
+                focus: 5,
+                process: 6,
+            };
+            let current = std::cell::Cell::new(Some(expected));
+            assert!(
+                check_insertion_target(
+                    expected,
+                    || {
+                        current.set(Some(changed));
+                        true
+                    },
+                    || current.get(),
+                    || true,
+                )
+                .is_err()
+            );
+            let modifiers_up = std::cell::Cell::new(true);
+            assert!(
+                check_insertion_target(
+                    expected,
+                    || {
+                        modifiers_up.set(false);
+                        true
+                    },
+                    || Some(expected),
+                    || modifiers_up.get(),
+                )
+                .is_err()
+            );
+            assert!(check_insertion_target(expected, || true, || Some(expected), || true).is_ok());
+        }
 
         #[test]
         fn selection_releases_modifiers_after_every_partial_batch() {

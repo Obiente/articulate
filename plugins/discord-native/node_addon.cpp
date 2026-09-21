@@ -10,7 +10,8 @@
 #define API_LIST(X) \
     X(napi_get_cb_info) X(napi_create_int32) X(napi_create_function) \
     X(napi_set_named_property) X(napi_get_value_bigint_uint64) \
-    X(napi_is_array) X(napi_get_array_length) X(napi_get_element) X(napi_create_buffer_copy)
+    X(napi_is_array) X(napi_get_array_length) X(napi_get_element) X(napi_create_buffer_copy) \
+    X(napi_create_object) X(napi_create_double)
 #define DECLARE(name) decltype(&name) f_##name = nullptr;
 API_LIST(DECLARE)
 #undef DECLARE
@@ -20,6 +21,25 @@ napi_value number(napi_env env, int value) noexcept {
 }
 napi_value start(napi_env env, napi_callback_info) noexcept { return number(env, ArticulateAudioStart()); }
 napi_value stop(napi_env env, napi_callback_info) noexcept { ArticulateAudioStop(); return number(env, 0); }
+napi_value stats(napi_env env, napi_callback_info) noexcept {
+    ArticulateAudioStats counters{}; ArticulateAudioGetStats(&counters);
+    napi_value output = nullptr;
+    if (f_napi_create_object(env, &output) != napi_ok) return nullptr;
+    struct Field { const char* name; uint64_t value; };
+    for (const auto field : {Field{"produced", counters.produced}, Field{"polled", counters.polled},
+        Field{"queue_full", counters.queue_full}, Field{"contention", counters.contention},
+        Field{"configuration_discard", counters.configuration_discard}, Field{"stop_flush", counters.stop_flush},
+        Field{"max_depth", counters.max_depth}, Field{"queue_depth", counters.queue_depth},
+        Field{"queue_capacity", counters.queue_capacity}}) {
+        // JavaScript diagnostics stay exact and bounded even over a long uptime.
+        constexpr uint64_t safe_integer = 9007199254740991ULL;
+        napi_value value = nullptr;
+        const auto count = field.value > safe_integer ? safe_integer : field.value;
+        if (f_napi_create_double(env, static_cast<double>(count), &value) != napi_ok
+            || f_napi_set_named_property(env, output, field.name, value) != napi_ok) return nullptr;
+    }
+    return output;
+}
 napi_value arm(napi_env env, napi_callback_info info) noexcept {
     size_t count = 2; napi_value args[2]{}; uint64_t capture = 0; bool lossless = false, array = false;
     uint32_t length = 0; std::array<uint64_t, 256> users{};
@@ -56,7 +76,7 @@ extern "C" __declspec(dllexport) napi_value napi_register_module_v1(napi_env env
     API_LIST(RESOLVE)
 #undef RESOLVE
     struct Method { const char* name; napi_callback callback; };
-    for (const auto method : {Method{"start", start}, Method{"arm", arm}, Method{"poll", poll}, Method{"stop", stop}}) {
+    for (const auto method : {Method{"start", start}, Method{"arm", arm}, Method{"poll", poll}, Method{"stop", stop}, Method{"stats", stats}}) {
         napi_value function;
         if (f_napi_create_function(env, method.name, NAPI_AUTO_LENGTH, method.callback, nullptr, &function) != napi_ok
             || f_napi_set_named_property(env, exports, method.name, function) != napi_ok) return exports;

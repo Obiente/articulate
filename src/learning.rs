@@ -3,6 +3,7 @@ use crate::dictionary::{self, Entry};
 pub struct Change {
     pub entry: Entry,
     previous: Vec<Entry>,
+    #[allow(dead_code, reason = "Preserve original learned state for the undo API")]
     saved: Vec<Entry>,
 }
 impl Change {
@@ -63,6 +64,10 @@ impl Change {
             saved,
         })
     }
+    #[allow(
+        dead_code,
+        reason = "Preserve reversible correction learning for React controls"
+    )]
     pub fn undo(self, entries: &mut Vec<Entry>) -> bool {
         // Do not roll back unrelated edits made after the notification.
         if *entries != self.saved {

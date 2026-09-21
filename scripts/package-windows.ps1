@@ -44,7 +44,6 @@ Import-Module (Join-Path $vs 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll'
 Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
 $oldFlags = $env:CARGO_ENCODED_RUSTFLAGS
 $oldTarget = $env:CARGO_TARGET_DIR
-$oldResource = $env:ARTICULATE_RESOURCE
 $oldNativeAudio = $env:ARTICULATE_NATIVE_AUDIO_DIR
 $oldAssortModels = $env:ARTICULATE_ASSORT_MODELS_DIR
 $oldPath = $env:PATH
@@ -52,15 +51,7 @@ try {
     $env:CARGO_TARGET_DIR = $build
     $env:ARTICULATE_ASSORT_MODELS_DIR = Join-Path $articulateRoot 'assets/assort'
     $env:CARGO_ENCODED_RUSTFLAGS = (@("--remap-path-prefix=$($env:USERPROFILE)=/build/user", "--remap-path-prefix=$articulateRoot=/src/articulate", '-C', 'strip=symbols') -join [char]31)
-    $rc = Join-Path $articulateRoot '.local/articulate.rc'
-    $resource = Join-Path $articulateRoot '.local/articulate.res'
-    $resourceText = (Get-Content packaging/articulate.rc -Raw).Replace('0,1,0,0', ($version.Replace('.', ',') + ',0')).Replace('0.1.0', $version)
-    # RC resolves asset references relative to the generated .rc file, not Cargo.
-    $resourceText = $resourceText.Replace('assets\\brand\\articulate.ico', (Join-Path $articulateRoot 'assets/brand/articulate.ico').Replace('\', '\\'))
-    [IO.File]::WriteAllText($rc, $resourceText)
-    & rc.exe /nologo "/fo$resource" $rc
-    if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed.' }
-    $env:ARTICULATE_RESOURCE = $resource
+    # Tauri compiles the icon, manifest and version resource in build.rs.
     if ($Validate) {
         & cargo fmt --check
         if ($LASTEXITCODE -ne 0) { throw 'Formatting failed.' }
@@ -91,6 +82,8 @@ try {
     Copy-Item -LiteralPath (Join-Path $native 'licenses') -Destination (Join-Path $licenses 'native') -Recurse
     Copy-Item -LiteralPath LICENSE -Destination (Join-Path $licenses 'Articulate-AGPL-3.0-or-later.txt')
     Copy-Item -LiteralPath NOTICE -Destination (Join-Path $licenses 'Articulate-NOTICE.txt')
+    & node (Join-Path $PSScriptRoot 'collect-ui-license-notices.mjs') (Join-Path $articulateRoot 'ui') (Join-Path $licenses 'javascript')
+    if ($LASTEXITCODE -ne 0) { throw 'UI dependency license collection failed.' }
     if (!$env:ARTICULATE_NATIVE_AUDIO_DIR) { throw 'Native Discord payload path is required for packaging.' }
     $nativeAudioLicenses = Join-Path $env:ARTICULATE_NATIVE_AUDIO_DIR 'licenses'
     Copy-Item -LiteralPath $nativeAudioLicenses -Destination (Join-Path $licenses 'discord-audio') -Recurse
@@ -143,7 +136,6 @@ try {
 } finally {
     $env:CARGO_ENCODED_RUSTFLAGS = $oldFlags
     $env:CARGO_TARGET_DIR = $oldTarget
-    $env:ARTICULATE_RESOURCE = $oldResource
     $env:ARTICULATE_NATIVE_AUDIO_DIR = $oldNativeAudio
     $env:ARTICULATE_ASSORT_MODELS_DIR = $oldAssortModels
     $env:PATH = $oldPath

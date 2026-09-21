@@ -13,3 +13,7 @@ __pycache__/
 *.pdb
 *.ggml
 *.onnx
+/ui/node_modules/
+/ui/dist/
+/ui/design-qa.md
+/gen/

@@ -1,4 +1,5 @@
 fn main() {
+    tauri_build::build();
     println!("cargo:rerun-if-env-changed=ARTICULATE_NATIVE_AUDIO_DIR");
     let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     embed_assort(&output);
@@ -22,15 +23,6 @@ fn main() {
             Vec::new()
         };
         std::fs::write(output.join(name), bytes).unwrap();
-    }
-    println!("cargo:rerun-if-env-changed=ARTICULATE_RESOURCE");
-    if let Ok(resource) = std::env::var("ARTICULATE_RESOURCE") {
-        println!("cargo:rerun-if-changed={resource}");
-        assert!(
-            std::path::Path::new(&resource).is_file(),
-            "The Windows resource file is missing"
-        );
-        println!("cargo:rustc-link-arg={resource}");
     }
 }
 

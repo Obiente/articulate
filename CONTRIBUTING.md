@@ -1,6 +1,6 @@
 # Contributing
 
-Use Windows x86_64, stable Rust, GitHub CLI, and Visual Studio C++ Build Tools.
+Use Windows x86_64, stable Rust, Node.js 22 LTS or newer with npm, GitHub CLI, and Visual Studio C++ Build Tools. The build script builds and embeds the React frontend before compiling the single Tauri application.
 
 ```powershell
 ./scripts/build-windows.ps1
