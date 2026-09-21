@@ -248,6 +248,22 @@ def collect(metadata_file, output, runtime_tree_file=None):
                 + MIT_TERMS
             )
             notices["MIT-declaration-and-terms.txt"] = notice.encode("utf-8")
+        if not notices and label == "selectors-0.36.1" and package.get("license") == "MPL-2.0":
+            # This published crate and pinned source omit a standalone license.
+            # Its source headers explicitly refer to Mozilla's MPL 2.0 terms.
+            root = Path(package["manifest_path"]).parent
+            vcs = json.loads((root / ".cargo_vcs_info.json").read_text(encoding="utf-8"))
+            revision = "635e1a19d02960588a00e189bd4bd5bdb150ec3d"
+            if vcs.get("git", {}).get("sha1") != revision:
+                raise ValueError("Unexpected selectors source revision")
+            terms = Path(__file__).resolve().parent.parent / "packaging" / "rust-licenses" / "MPL-2.0.txt"
+            notices["MPL-2.0.txt"] = terms.read_bytes()
+            notices["SOURCE.txt"] = (
+                "selectors 0.36.1\nPublished authors: The Servo Project Developers\n"
+                "Source code: https://github.com/servo/stylo/tree/" + revision + "/selectors\n"
+                "The source files declare Mozilla Public License, v. 2.0.\n"
+                "The accompanying terms are from https://www.mozilla.org/media/MPL/2.0/index.txt\n"
+            ).encode("utf-8")
         if not notices:
             missing.append(f"{label}: no license text found ({package.get('license')})")
         if package["name"] == "epaint_default_fonts":
