@@ -50,6 +50,10 @@ Articulate ships the matching companion files with every app version. If you opt
 in to keeping it updated, it compares local file hashes and rebuilds the selected
 checkout when its managed companion revision changes. It does not restart or
 reinject Discord automatically. Restart Discord when the update is ready.
+Articulate also checks a configured companion for updates when it opens, even
+when automatic installation is off. An update or restart notice appears in the
+global notification menu and opens the relevant Settings section. Checking does
+not change the running Discord client.
 
 Only Articulate's three files and ownership manifest inside
 `src/userplugins/articulate` are managed. Unknown files, edited managed files,
@@ -104,7 +108,9 @@ capture**. Settings shows pairing, participant audio readiness, and any reason
 automatic capture is waiting.
 
 If participant audio is interrupted and then resumes in the same authorized
-capture, recording continues. Missing local audio packets are counted and the
+capture within 15 seconds, recording continues. The native hook stops copying
+audio during a control outage and rearms only after fresh membership is verified.
+Missing local audio packets and transport interruptions are counted and the
 transcript shows a missing-audio warning; the original timing gap is preserved.
 Packet loss alone does not end the call. A changed voice channel, expired local
 capture permission, invalid audio or exhausted capture buffer still stops it.
@@ -143,8 +149,8 @@ requires its audio connection and never silently switches to mixed output.
 To record other apps, explicitly switch to mixed output capture in Setup.
 Mixed output uses activity-based attribution or acoustic speaker recognition
 and cannot reliably separate overlap.
-It accepts one verified native-module build. Compatibility with other Discord
-voice-module versions is not yet verified.
+It accepts two inspected native-module builds listed in the adapter README.
+Compatibility with other Discord voice-module versions is not yet verified.
 
 ## Local protocol
 

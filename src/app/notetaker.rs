@@ -275,7 +275,7 @@ impl App {
             return Err("Finish the current recording before starting a spoken note.".into());
         }
         self.history_save_personal_notes();
-        if !self.start_stream_capture(true) {
+        if !self.start_stream_capture(true, false, false, None, None) {
             return Err(self.call_status.clone());
         }
         self.history.selected = self.history.call.clone();

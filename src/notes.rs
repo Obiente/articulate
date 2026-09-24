@@ -20,7 +20,7 @@ impl Quote {
         dead_code,
         reason = "Preserve source-attributed note export for React export controls"
     )]
-    pub fn attribution(&self, names: &[String; 4]) -> String {
+    pub fn attribution(&self, names: &[String]) -> String {
         let row = Row {
             cues: Vec::new(),
             start_ms: self.start_ms,
@@ -280,7 +280,7 @@ impl Notes {
         dead_code,
         reason = "Preserve plain-text note export for React export controls"
     )]
-    pub fn text(&self, names: &[String; 4]) -> String {
+    pub fn text(&self, names: &[String]) -> String {
         let mut text = String::from(
             "Meeting notes\nSelected transcript quotes; timestamps refer to source sections.\n",
         );
@@ -339,7 +339,7 @@ mod tests {
             assert_eq!(quote.start_ms, rows[quote.row].start_ms);
             assert_eq!(quote.end_ms, rows[quote.row].end_ms);
         }
-        let mut names: [String; 4] = Default::default();
+        let mut names = calls::empty_speaker_names();
         names[0] = "Morgan".into();
         let exported = notes.text(&names);
         assert!(exported.contains("00:08 to 00:16  Morgan"));

@@ -247,15 +247,15 @@ impl Window {
     fn decode(
         &mut self,
         end: f64,
-        transcribe: impl FnMut(&[f32]) -> Result<String>,
+        mut transcribe: impl FnMut(&[f32]) -> Result<String>,
     ) -> Result<Vec<Row>> {
-        self.decode_context(end, transcribe, &mut None, false)
+        self.decode_context(end, |pcm, _| transcribe(pcm), &mut None, false)
     }
 
     fn decode_context(
         &mut self,
         end: f64,
-        mut transcribe: impl FnMut(&[f32]) -> Result<String>,
+        mut transcribe: impl FnMut(&[f32], bool) -> Result<String>,
         context: &mut Option<crate::sensevoice::Worker>,
         finalizing: bool,
     ) -> Result<Vec<Row>> {
@@ -295,7 +295,10 @@ impl Window {
             let text = if let Some(text) = self.turn_cache.get(&key) {
                 text.clone()
             } else {
-                transcribe(&tracks[turn.track].pcm[turn.audio_start..turn.audio_end])?
+                transcribe(
+                    &tracks[turn.track].pcm[turn.audio_start..turn.audio_end],
+                    turn.complete || finalizing || self.endpoint(end),
+                )?
             };
             if turn.complete && next_cache.len() < 256 {
                 next_cache.insert(key, text.clone());
@@ -515,7 +518,13 @@ pub(super) fn run(
                 window.mic.extend(mic.take_until(end)?);
                 let rows = window.decode_context(
                     end,
-                    |pcm| engine.transcribe(pcm),
+                    |pcm, complete| {
+                        if complete {
+                            engine.transcribe_final(pcm)
+                        } else {
+                            engine.transcribe_preview(pcm)
+                        }
+                    },
                     &mut context,
                     stopping,
                 )?;
@@ -720,7 +729,7 @@ mod tests {
         let mut transcript = Vec::new();
         super::super::append_rows(&mut transcript, rows);
         assert_eq!(transcript.len(), 2);
-        let names = Default::default();
+        let names: Vec<String> = Default::default();
         assert_eq!(super::super::label(&transcript[0], &names), "Casey");
         assert_eq!(super::super::label(&transcript[1], &names), "Jordan");
     }

@@ -150,6 +150,11 @@ impl State {
             session.progress = Some(completed as f32 / total.max(1) as f32);
             return;
         }
+        if let brain::Event::Consolidating = event {
+            session.status = "Checking decisions and later corrections…".into();
+            session.progress = None;
+            return;
+        }
         let active = self.job.take().expect("active owner checked");
         session.progress = None;
         match event {
@@ -181,7 +186,7 @@ impl State {
                 session.retry_pending = true;
                 session.status = "Summary cancelled. Your notes are unchanged.".into()
             }
-            brain::Event::Progress { .. } => unreachable!(),
+            brain::Event::Progress { .. } | brain::Event::Consolidating => unreachable!(),
         }
     }
 
@@ -528,9 +533,6 @@ fn merge_document(session: &mut Session, draft: &brain::Draft) {
     {
         session.title.clone_from(title);
     }
-    if draft.items.is_empty() {
-        return;
-    }
     let previous = session.generated_summary.as_ref();
     let mut blocks: Vec<String> = session
         .personal_notes
@@ -621,13 +623,14 @@ pub(super) fn source(session: &Session) -> Transcript {
             .rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| !row.text.trim().is_empty())
-            .map(|(index, row)| Segment {
-                id: format!("row-{index}"),
-                start_ms: row.start_ms,
-                end_ms: row.end_ms,
-                speaker: Some(crate::calls::label(row, &session.speaker_names)),
-                text: row.text.clone(),
+            .filter(|(_, row)| !row.text.trim().is_empty() || !row.cues.is_empty())
+            .map(|(index, _)| {
+                Segment::from_call_row(
+                    &session.rows,
+                    &session.speaker_names,
+                    index,
+                    format!("row-{index}"),
+                )
             })
             .collect()
     } else if !session.text.trim().is_empty() {
@@ -637,6 +640,7 @@ pub(super) fn source(session: &Session) -> Transcript {
             end_ms: session.metrics.audio_duration_ms.unwrap_or(0),
             speaker: None,
             text: session.text.clone(),
+            context: None,
         }]
     } else {
         Vec::new()
@@ -722,6 +726,7 @@ mod tests {
                 end_ms: 1000,
                 speaker: None,
                 excerpt: "A decision".into(),
+                context: None,
             }],
         }
     }
@@ -826,6 +831,20 @@ mod tests {
         merge_document(&mut session, &first);
         assert_eq!(session.personal_notes, "Ship Friday.\n\nUse blue.");
         assert!(session.protected_note_items.is_empty());
+    }
+
+    #[test]
+    fn empty_new_summary_removes_only_untouched_generated_paragraphs() {
+        let mut session = session();
+        let mut first = draft(&session);
+        first.items = vec![item("Old proposed date.", "row-0")];
+        merge_document(&mut session, &first);
+        session.personal_notes.push_str("\n\nMy own reminder.");
+        let mut corrected = first.clone();
+        corrected.items.clear();
+        merge_document(&mut session, &corrected);
+        assert_eq!(session.personal_notes, "My own reminder.");
+        assert!(session.generated_summary.as_ref().unwrap().items.is_empty());
     }
 
     #[test]
@@ -1025,6 +1044,7 @@ mod tests {
                 end_ms: 0,
                 speaker: None,
                 excerpt: a.text.clone(),
+                context: None,
             }],
         }];
         result.validate(&source(&a)).unwrap();
@@ -1058,6 +1078,54 @@ mod tests {
         let mut session = Session::new(crate::history::Kind::Dictation);
         session.text = "The team approved the release.".into();
         session
+    }
+
+    #[test]
+    fn call_summary_source_retains_overlap_and_bounded_audio_cues() {
+        let mut call = Session::new(crate::history::Kind::Call);
+        call.speaker_names = crate::calls::empty_speaker_names();
+        call.speaker_names[0] = "Alex".into();
+        call.rows = vec![
+            crate::calls::Row {
+                start_ms: 1000,
+                end_ms: 3000,
+                microphone: true,
+                speakers: vec![],
+                discord: None,
+                text: "We can start.".into(),
+                cues: vec![crate::sensevoice::Cue {
+                    start_ms: 500,
+                    end_ms: 1500,
+                    label: "Happy tone".into(),
+                }],
+            },
+            crate::calls::Row {
+                start_ms: 2500,
+                end_ms: 4000,
+                microphone: false,
+                speakers: vec![1],
+                discord: None,
+                text: "One moment.".into(),
+                cues: vec![],
+            },
+        ];
+        let transcript = source(&call);
+        assert_eq!(transcript.segments.len(), 2);
+        assert_eq!(transcript.segments[0].speaker.as_deref(), Some("You"));
+        assert_eq!(transcript.segments[1].speaker.as_deref(), Some("Alex"));
+        let first = transcript.segments[0].context.as_ref().unwrap();
+        assert_eq!(
+            first.speaker_origin,
+            crate::classification::SpeakerOrigin::Microphone
+        );
+        assert!(first.overlapping_speech);
+        assert_eq!((first.cues[0].start_ms, first.cues[0].end_ms), (1000, 1500));
+        let second = transcript.segments[1].context.as_ref().unwrap();
+        assert_eq!(
+            second.speaker_origin,
+            crate::classification::SpeakerOrigin::Diarization
+        );
+        assert!(second.overlapping_speech);
     }
     fn draft(session: &Session) -> brain::Draft {
         brain::Draft {

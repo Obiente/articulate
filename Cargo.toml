@@ -1,7 +1,7 @@
 [package]
 name = "articulate"
 default-run = "articulate"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.92"
 description = "Your words, ready to use. Local dictation and call transcripts."

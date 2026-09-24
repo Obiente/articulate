@@ -177,6 +177,13 @@ impl Connection {
         }
         self.shared.wake.notify_all();
         self.shared.unavailable("Discord speaker names are off.");
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.channel = None;
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        if let Some(last) = state.history.back_mut() {
+            last.generation = generation;
+        }
     }
 }
 
@@ -234,8 +241,9 @@ impl Shared {
             status: Status::Unavailable(message.into()),
             observation: None,
         };
-        state.channel = None;
-        state.generation = state.generation.wrapping_add(1);
+        // A debugger/renderer outage is not evidence that the user left the
+        // voice channel. Preserve its generation until a valid observation
+        // confirms a channel change.
         let generation = state.generation;
         push_history(
             &mut state.history,
@@ -266,7 +274,7 @@ impl Shared {
         if self.stopped() {
             return;
         }
-        if observation.channel_id != state.channel {
+        if observation.valid && observation.channel_id != state.channel {
             state.generation = state.generation.wrapping_add(1);
             state.channel = observation.channel_id.clone();
         }
@@ -1004,6 +1012,6 @@ mod tests {
         assert!(state.snapshot.observation.is_none());
         assert!(!state.history.back().unwrap().valid);
         assert!(state.history.back().unwrap().participants.is_empty());
-        assert!(state.generation > first_generation);
+        assert_eq!(state.generation, first_generation);
     }
 }

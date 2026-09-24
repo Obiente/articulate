@@ -26,12 +26,21 @@ pub fn run(args: &[String]) -> Result<()> {
         println!("Native Discord audio payload and notices are bundled.");
         return Ok(());
     }
+    if args == ["--repair-companion"] {
+        let source = discord::install::detect(None)
+            .source
+            .context("No Articulate Vencord source was found")?;
+        let plan = discord::install::plan(&source)?;
+        discord::install::install(&plan, true, |message| println!("{message}"))?;
+        println!("Companion rebuilt. Restart Discord to load it.");
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--discord-check") {
         return discord_check(args);
     }
     if args.iter().any(|a| a == "--help") {
         println!(
-            "Articulate\n\nNo arguments: open app\n--verify-assort-models: verify bundled classifiers\n--verify-native-audio-payload: verify the Discord audio payload\n--devices: list inference devices\n--transcribe <audio.wav> [--model <model.gguf>] [--cpu] [--repeat <N>] [--live]\n--call-file <audio.wav> [--cpu]: transcribe remote audio with speaker labels\n--capture-check: check microphone and output capture for three seconds\n--discord-check [--seconds <1-60>]: check local Discord speaker metadata without recording audio\n--download-model: download and verify default model\n\nAudio and transcripts never leave this computer. Model download needs internet."
+            "Articulate\n\nNo arguments: open app\n--verify-assort-models: verify bundled classifiers\n--verify-native-audio-payload: verify the Discord audio payload\n--devices: list inference devices\n--transcribe <audio.wav> [--model <model.gguf>] [--language <code>] [--cpu] [--repeat <N>] [--live] [--live-primary] [--verify]\n--call-file <audio.wav> [--cpu]: transcribe remote audio with speaker labels\n--capture-check: check microphone and output capture for three seconds\n--discord-check [--seconds <1-60>]: check local Discord speaker metadata without recording audio\n--download-model: download and verify default model\n--download-verifier: download and verify optional Nemotron ASR model\n\nAudio and transcripts never leave this computer. Model download needs internet."
         );
         return Ok(());
     }
@@ -71,6 +80,7 @@ pub fn run(args: &[String]) -> Result<()> {
                 &vec![0.0; pcm.len()],
                 pcm,
                 window as u64 * 8000,
+                true,
             )?;
             println!("{}", serde_json::to_string(&rows)?);
         }
@@ -79,6 +89,11 @@ pub fn run(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--download-model") {
         model::download(|_| {})?;
         println!("Model downloaded and SHA-256 verified.");
+        return Ok(());
+    }
+    if args == ["--download-verifier"] {
+        model::download_verifier(|_| {})?;
+        println!("Second speech model downloaded and SHA-256 verified.");
         return Ok(());
     }
     if let Some(i) = args.iter().position(|a| a == "--transcribe") {
@@ -95,6 +110,15 @@ pub fn run(args: &[String]) -> Result<()> {
             })
             .transpose()?
             .unwrap_or_else(model::default_path);
+        let language = args
+            .iter()
+            .position(|a| a == "--language")
+            .map(|i| {
+                args.get(i + 1)
+                    .cloned()
+                    .context("Supply a language after --language")
+            })
+            .transpose()?;
         let repeat: usize = args
             .iter()
             .position(|a| a == "--repeat")
@@ -110,13 +134,22 @@ pub fn run(args: &[String]) -> Result<()> {
         let pcm = audio::read_wav(input)?;
         let started = Instant::now();
         let cancel = transcribe_cpp::CancelToken::new();
-        let mut engine = engine::Engine::load(&model, args.iter().any(|a| a == "--cpu"), &cancel)?;
+        let mut engine = engine::Engine::load_with_language(
+            &model,
+            args.iter().any(|a| a == "--cpu"),
+            &cancel,
+            language,
+        )?;
         let load_ms = started.elapsed().as_millis();
         if args.iter().any(|a| a == "--live") {
             let mut end = 19200usize;
             while end < pcm.len() {
                 let started = Instant::now();
-                let raw = engine.transcribe(&pcm[..end])?;
+                let raw = if args.iter().any(|a| a == "--live-primary") {
+                    engine.transcribe(&pcm[..end])?
+                } else {
+                    engine.transcribe_preview(&pcm[..end])?
+                };
                 let (text, corrections) = cleanup::apply(&raw);
                 println!(
                     "{}",
@@ -127,7 +160,11 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         for run in 0..repeat {
             let started = Instant::now();
-            let text = engine.transcribe(&pcm)?;
+            let text = if args.iter().any(|a| a == "--verify") {
+                engine.transcribe_final(&pcm)?
+            } else {
+                engine.transcribe(&pcm)?
+            };
             println!(
                 "{}",
                 serde_json::json!({"text": text, "backend": engine.backend, "audio_ms": pcm.len() * 1000 / 16000, "load_ms": load_ms, "transcribe_ms": started.elapsed().as_millis(), "run": run + 1})

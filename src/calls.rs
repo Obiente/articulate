@@ -61,7 +61,7 @@ pub fn append_rows(transcript: &mut Vec<Row>, mut incoming: Vec<Row>) {
                 .discord
                 .as_ref()
                 .is_some_and(|named| named.speakers.len() == 1)
-            || (row.speakers.len() == 1 && (1..=4).contains(&row.speakers[0]));
+            || (row.speakers.len() == 1 && (1..=8).contains(&row.speakers[0]));
         if let Some(last) = transcript.last_mut()
             && known_single_speaker
             && row.start_ms.saturating_sub(last.end_ms) <= ROW_CONTINUATION_GAP_MS
@@ -96,6 +96,8 @@ pub fn append_rows(transcript: &mut Vec<Row>, mut incoming: Vec<Row>) {
 
 pub enum Update {
     Started,
+    /// Mixed output is still captured, but individual remote speakers cannot be distinguished.
+    SpeakerFallback,
     /// Native capture is armed; true means an authenticated PCM frame arrived.
     NativeAudio(bool),
     /// Cumulative missing native packets, retained with this recording.
@@ -110,6 +112,7 @@ pub enum Update {
 }
 pub struct Request {
     pub audio_context: bool,
+    pub language_preference: Option<String>,
     pub microphone: Option<String>,
     pub output: Option<String>,
     pub cpu: bool,
@@ -159,11 +162,20 @@ pub fn process_window(
     mic: &[f32],
     remote: &[f32],
     offset_ms: u64,
+    final_pass: bool,
 ) -> Result<Vec<Row>> {
-    let mut rows = microphone_rows(engine.transcribe(mic)?, mic.len(), offset_ms);
+    let mut rows = microphone_rows(
+        call_transcribe(engine, mic, final_pass)?,
+        mic.len(),
+        offset_ms,
+    );
     let turns = tracker.identify(remote)?;
     for turn in crate::call_segments::plan(&turns, remote.len()) {
-        let text = engine.transcribe(&remote[turn.audio_start..turn.audio_end])?;
+        let text = call_transcribe(
+            engine,
+            &remote[turn.audio_start..turn.audio_end],
+            final_pass,
+        )?;
         if text.is_empty() {
             continue;
         }
@@ -181,16 +193,52 @@ pub fn process_window(
     Ok(rows)
 }
 
+fn process_unattributed_window(
+    engine: &mut Engine,
+    mic: &[f32],
+    remote: &[f32],
+    offset_ms: u64,
+    final_pass: bool,
+) -> Result<Vec<Row>> {
+    let mut rows = microphone_rows(
+        call_transcribe(engine, mic, final_pass)?,
+        mic.len(),
+        offset_ms,
+    );
+    let text = call_transcribe(engine, remote, final_pass)?;
+    if !text.is_empty() {
+        rows.push(Row {
+            cues: Vec::new(),
+            start_ms: offset_ms,
+            end_ms: offset_ms + remote.len() as u64 / 16,
+            microphone: false,
+            speakers: vec![0],
+            discord: None,
+            text,
+        });
+    }
+    Ok(rows)
+}
+
 fn process_activity_window(
     engine: &mut Engine,
     mic: &[f32],
     remote: &[f32],
     offset_ms: u64,
     segments: &[crate::discord_attribution::ActivitySegment],
+    final_pass: bool,
 ) -> Result<Vec<Row>> {
-    let mut rows = microphone_rows(engine.transcribe(mic)?, mic.len(), offset_ms);
+    let mut rows = microphone_rows(
+        call_transcribe(engine, mic, final_pass)?,
+        mic.len(),
+        offset_ms,
+    );
     for segment in activity::plan(segments, remote.len()) {
-        let text = engine.transcribe(&remote[segment.audio_start..segment.audio_end])?;
+        let text = call_transcribe(
+            engine,
+            &remote[segment.audio_start..segment.audio_end],
+            final_pass,
+        )?;
         if !text.is_empty() {
             rows.push(Row {
                 cues: Vec::new(),
@@ -209,6 +257,14 @@ fn process_activity_window(
     }
     rows.sort_by_key(|row| row.start_ms);
     Ok(rows)
+}
+
+fn call_transcribe(engine: &mut Engine, pcm: &[f32], final_pass: bool) -> Result<String> {
+    if final_pass {
+        engine.transcribe_final(pcm)
+    } else {
+        engine.transcribe_preview(pcm)
+    }
 }
 
 // Native ASR has no word timestamps. Revisions replace an entire bounded draft
@@ -258,6 +314,7 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
     }
     let microphone_only = source == Source::Microphone;
     let mut tracker: Option<Tracker> = None;
+    let mut tracker_unavailable = false;
     if request.control.abort.load(Ordering::Relaxed)
         || request.control.stop_ns.load(Ordering::SeqCst) != 0
     {
@@ -310,6 +367,7 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                 if let Some(output) = &mut output {
                     draft.remote.extend(output.take_until(end)?);
                 }
+                let final_pass = draft.endpoint(microphone_only) || (stopping && end >= now);
                 let offset_ms = (draft_start * 1000.0) as u64;
                 let discord = if microphone_only {
                     None
@@ -333,7 +391,11 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                     )
                 });
                 let rows = if microphone_only {
-                    microphone_rows(engine.transcribe(&draft.mic)?, draft.mic.len(), offset_ms)
+                    microphone_rows(
+                        call_transcribe(engine, &draft.mic, final_pass)?,
+                        draft.mic.len(),
+                        offset_ms,
+                    )
                 } else if let Some(segments) = activity {
                     process_activity_window(
                         engine,
@@ -341,21 +403,47 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                         &draft.remote,
                         offset_ms,
                         &segments,
+                        final_pass,
                     )?
                 } else {
-                    if tracker.is_none() {
-                        let fallback=Tracker::new(request.cpu).map_err(|error|anyhow::anyhow!("Speaker activity is unavailable and acoustic speaker recognition could not load: {error}. Prepare speaker recognition in call Setup for offline fallback."))?;
-                        checkpoint = Some(fallback.checkpoint());
-                        tracker = Some(fallback);
+                    if tracker.is_none() && !tracker_unavailable {
+                        match Tracker::new(request.cpu) {
+                            Ok(fallback) => {
+                                checkpoint = Some(fallback.checkpoint());
+                                tracker = Some(fallback);
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "Speaker recognition unavailable; using mixed call audio: {error}"
+                                );
+                                tracker_unavailable = true;
+                                update(Update::SpeakerFallback);
+                            }
+                        }
                     }
-                    let fallback = tracker.as_mut().expect("fallback was initialized");
-                    fallback.restore(
-                        checkpoint
-                            .as_ref()
-                            .expect("fallback checkpoint initialized"),
-                    );
-                    let mut rows =
-                        process_window(engine, fallback, &draft.mic, &draft.remote, offset_ms)?;
+                    let mut rows = if let Some(fallback) = tracker.as_mut() {
+                        fallback.restore(
+                            checkpoint
+                                .as_ref()
+                                .expect("fallback checkpoint initialized"),
+                        );
+                        process_window(
+                            engine,
+                            fallback,
+                            &draft.mic,
+                            &draft.remote,
+                            offset_ms,
+                            final_pass,
+                        )?
+                    } else {
+                        process_unattributed_window(
+                            engine,
+                            &draft.mic,
+                            &draft.remote,
+                            offset_ms,
+                            final_pass,
+                        )?
+                    };
                     if let Some((origin, history)) = &discord_context {
                         for row in &mut rows {
                             row.discord =
@@ -366,7 +454,7 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                 };
                 draft.rows = rows;
                 cursor = end;
-                if draft.endpoint(microphone_only) || (stopping && cursor >= now) {
+                if final_pass {
                     if let Some(context) = &mut context {
                         for row in &draft.rows {
                             if !row.microphone
@@ -424,36 +512,8 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
     result
 }
 
-pub fn label(row: &Row, names: &[String; 4]) -> String {
-    if row.microphone {
-        return "You".into();
-    }
-    if let Some(attribution) = &row.discord {
-        let names: Vec<_> = attribution
-            .speakers
-            .iter()
-            .map(|speaker| speaker.name.as_str())
-            .collect();
-        if names.len() == 1 {
-            return names[0].to_owned();
-        }
-        if names.len() > 1 {
-            return format!("Overlap: {}", names.join(" + "));
-        }
-    }
-    let labels: Vec<_> = row
-        .speakers
-        .iter()
-        .map(|&id| {
-            if !(1..=4).contains(&id) {
-                "Uncertain speaker".into()
-            } else if names[id as usize - 1].trim().is_empty() {
-                format!("Speaker {id}")
-            } else {
-                names[id as usize - 1].clone()
-            }
-        })
-        .collect();
+pub fn label(row: &Row, names: &[String]) -> String {
+    let labels = speaker_labels(row, names);
     if labels.len() > 1 {
         format!("Overlap: {}", labels.join(" + "))
     } else {
@@ -461,7 +521,45 @@ pub fn label(row: &Row, names: &[String; 4]) -> String {
     }
 }
 
-pub fn text(rows: &[Row], names: &[String; 4]) -> String {
+pub fn empty_speaker_names() -> Vec<String> {
+    vec![String::new(); 8]
+}
+
+pub fn speaker_labels(row: &Row, names: &[String]) -> Vec<String> {
+    if row.microphone {
+        return vec!["You".into()];
+    }
+    if let Some(attribution) = &row.discord {
+        let names: Vec<_> = attribution
+            .speakers
+            .iter()
+            .map(|speaker| speaker.name.clone())
+            .collect();
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    let labels: Vec<_> = row
+        .speakers
+        .iter()
+        .map(|&id| {
+            if id == 0 {
+                "Other audio".into()
+            } else if !(1..=8).contains(&id) {
+                "Uncertain speaker".into()
+            } else {
+                names
+                    .get(id as usize - 1)
+                    .filter(|name| !name.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| format!("Speaker {id}"))
+            }
+        })
+        .collect();
+    labels
+}
+
+pub fn text(rows: &[Row], names: &[String]) -> String {
     rows.iter()
         .map(|r| {
             format!(
@@ -502,6 +600,7 @@ mod tests {
     fn spoken_note_source_excludes_native_and_mixed_audio() {
         let mut request = Request {
             audio_context: false,
+            language_preference: None,
             microphone: None,
             output: Some("Unused output".into()),
             cpu: false,
@@ -567,6 +666,7 @@ mod tests {
                 &vec![0.0; samples],
                 &pcm[..samples],
                 0,
+                samples == pcm.len(),
             )?;
             assert!(rows.iter().all(|row| row.end_ms <= samples as u64 / 16));
             println!(
@@ -667,13 +767,29 @@ mod tests {
     }
 
     #[test]
+    fn eight_speaker_labels_and_overlap_remain_distinct() {
+        let mut names = empty_speaker_names();
+        names[7] = "Morgan".into();
+        let overlapping = row(0, &[2, 8], false, "Both spoke.");
+        assert_eq!(
+            speaker_labels(&overlapping, &names),
+            ["Speaker 2", "Morgan"]
+        );
+        assert_eq!(label(&overlapping, &names), "Overlap: Speaker 2 + Morgan");
+        assert_eq!(
+            label(&row(0, &[9], false, "Unknown."), &names),
+            "Uncertain speaker"
+        );
+    }
+
+    #[test]
     fn consecutive_windows_share_one_label_and_keep_all_text() {
         let mut rows = vec![row(0, &[1], false, "First sentence.")];
         append_rows(&mut rows, vec![row(8000, &[1], false, "Second sentence.")]);
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].start_ms, rows[0].end_ms), (0, 16000));
         assert_eq!(
-            text(&rows, &Default::default()),
+            text(&rows, &[]),
             "[00:00] Speaker 1: First sentence. Second sentence."
         );
     }
@@ -765,7 +881,7 @@ mod tests {
             vec![row(64000, &[], true, "My second sentence.")],
         );
         assert_eq!(rows.len(), 8);
-        assert_eq!(label(rows.last().unwrap(), &Default::default()), "You");
+        assert_eq!(label(rows.last().unwrap(), &[]), "You");
         assert_eq!(
             rows.last().unwrap().text,
             "My first sentence. My second sentence."
@@ -800,7 +916,7 @@ mod tests {
         append_rows(&mut rows, vec![remapped]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].speakers, [1, 2]);
-        assert_eq!(label(&rows[0], &Default::default()), "Zoë 李");
+        assert_eq!(label(&rows[0], &[]), "Zoë 李");
         // Identical display names and acoustic clusters cannot merge people.
         append_rows(
             &mut rows,

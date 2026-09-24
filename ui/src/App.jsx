@@ -10,9 +10,9 @@ import {
   Kbd,
   Menu,
   Modal,
-  SegmentedControl,
   Select,
   Skeleton,
+  Switch,
   Tabs,
   Textarea,
   TextInput,
@@ -22,6 +22,7 @@ import { notifications } from "@mantine/notifications";
 import {
   ArrowLeft,
   ArrowUpRight,
+  Bell,
   BookOpen,
   ChartBar,
   Check,
@@ -51,9 +52,11 @@ import {
   onCloseRequested,
   closeDesktop,
   sourceMoveAction,
+  native,
 } from "./bridge";
 import { NavHighlight } from "./motion.jsx";
 import { createCaptureFeedbackTracker } from "./capture-feedback.js";
+import { createUpdateNoticeTracker, updateNotices } from "./update-notices.js";
 import { TranscriptEditor } from "./TranscriptEditor.jsx";
 import {
   VocabularyPage,
@@ -64,6 +67,7 @@ import {
 const navigation = [
   ["dictation", "Dictation", Microphone],
   ["notetaker", "Notetaker", Notebook],
+  ["conversations", "Conversations", Headphones],
   ["insights", "Insights", ChartBar],
   ["vocabulary", "Vocabulary", BookOpen],
   ["snippets", "Snippets", Lightning],
@@ -103,7 +107,13 @@ export function App() {
     [error, setError] = useState(""),
     [edits, setEdits] = useState({}),
     [savingNow, setSavingNow] = useState(false),
-    [documentLocked, setDocumentLocked] = useState(false);
+    [documentLocked, setDocumentLocked] = useState(false),
+    [callSetup, setCallSetup] = useState(false),
+    [callSource, setCallSource] = useState("system"),
+    [callLanguage, setCallLanguage] = useState("auto"),
+    [callAudioCues, setCallAudioCues] = useState(true),
+    [callStarting, setCallStarting] = useState(false),
+    [settingsTarget, setSettingsTarget] = useState(null);
   const pending = useRef(new Map()),
     timer = useRef(null),
     saving = useRef(null),
@@ -112,8 +122,13 @@ export function App() {
     transition = useRef(false),
     openedCapture = useRef(null),
     captureFeedback = useRef(createCaptureFeedbackTracker()),
+    updateNoticeTracker = useRef(createUpdateNoticeTracker()),
+    checkedUpdates = useRef(false),
+    updaterState = useRef("idle"),
     openCapture = useRef(null),
     contentScroll = useRef(null);
+  updaterState.current = state?.updater?.state || "idle";
+  const notices = updateNotices(state);
   useEffect(() => {
     contentScroll.current?.scrollTo({ top: 0 });
   }, [page, workspace, state?.selected?.id]);
@@ -321,13 +336,77 @@ export function App() {
     try {
       await flush();
       setPage(next);
+      setWorkspace("library");
     } catch (e) {
       report(e);
     }
   }
+  function showSettingsSection(section) {
+    setSettingsTarget(section);
+    void navigate("settings");
+  }
+  useEffect(() => {
+    if (page !== "settings" || !settingsTarget) return;
+    const frame = requestAnimationFrame(() => {
+      document
+        .getElementById(`settings-${settingsTarget}`)
+        ?.scrollIntoView({ block: "start", behavior: "smooth" });
+      setSettingsTarget(null);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [page, settingsTarget]);
+  useEffect(() => {
+    if (!native || !state?.settings || checkedUpdates.current) return;
+    checkedUpdates.current = true;
+    if (updaterState.current === "idle")
+      void act({ type: "update_check" }).catch(() => {});
+  }, [Boolean(state?.settings), act]);
+  useEffect(() => {
+    if (!native) return;
+    const interval = setInterval(
+      () => {
+        if (["idle", "latest", "error"].includes(updaterState.current))
+          void act({ type: "update_check" }).catch(() => {});
+      },
+      24 * 60 * 60 * 1000,
+    );
+    return () => clearInterval(interval);
+  }, [act]);
+  useEffect(() => {
+    for (const notice of updateNoticeTracker.current(notices)) {
+      notifications.show({
+        id: `update-${notice.id}`,
+        title: notice.title,
+        message: (
+          <div>
+            <span>{notice.message}</span>
+            <Button
+              variant="subtle"
+              size="compact-sm"
+              mt="sm"
+              onClick={() => showSettingsSection(notice.section)}
+            >
+              Open settings
+            </Button>
+          </div>
+        ),
+        color: notice.color,
+        autoClose: notice.color === "red" ? 12000 : 9000,
+        role: "status",
+        "aria-live": "polite",
+      });
+    }
+  }, [state]);
   async function open(id) {
     try {
       await act({ type: "history_open", id });
+      const kind =
+        state?.history.find((item) => item.id === id)?.kind ||
+        (state?.call_session?.id === id
+          ? "call"
+          : state?.dictation_session?.id === id
+            ? "dictation"
+            : "note");
       setWorkspace(
         state?.note_recording && state.note_session?.id === id
           ? "live-note"
@@ -335,7 +414,13 @@ export function App() {
             ? "live"
             : "saved",
       );
-      setPage("notetaker");
+      setPage(
+        kind === "call"
+          ? "conversations"
+          : kind === "dictation"
+            ? "dictation"
+            : "notetaker",
+      );
     } catch {}
   }
   async function newNote() {
@@ -364,7 +449,7 @@ export function App() {
               mt="sm"
               onClick={() => void openCapture.current?.(feedback.sessionId)}
             >
-              Open in Notetaker
+              Open recording
             </Button>
           )}
         </div>
@@ -478,13 +563,56 @@ export function App() {
       <main className="main-shell">
         <header className="app-topbar">
           <span>
-            {page === "notetaker" && workspace !== "library"
+            {(page === "notetaker" ||
+              page === "conversations" ||
+              page === "dictation") &&
+            workspace !== "library"
               ? workspace === "live-note"
                 ? "Notetaker / Spoken note"
-                : "Notetaker / Your notes"
+                : page === "conversations"
+                  ? `Conversations / ${workspace === "live" ? "Recording" : "Saved"}`
+                  : page === "dictation"
+                    ? "Dictation / Saved"
+                    : "Notetaker / Your notes"
               : navigation.find((n) => n[0] === page)?.[1] || "Settings"}
           </span>
           <div className="topbar-right">
+            <Menu withinPortal position="bottom-end">
+              <Menu.Target>
+                <ActionIcon
+                  className="update-notification-button"
+                  variant="subtle"
+                  color={notices.length ? "mint" : "gray"}
+                  size={34}
+                  aria-label={`${notices.length} update ${notices.length === 1 ? "notification" : "notifications"}`}
+                >
+                  <Bell size={19} />
+                  {notices.length > 0 && (
+                    <span className="update-notification-count">
+                      {notices.length}
+                    </span>
+                  )}
+                </ActionIcon>
+              </Menu.Target>
+              <Menu.Dropdown>
+                <Menu.Label>Updates</Menu.Label>
+                {notices.length ? (
+                  notices.map((notice) => (
+                    <Menu.Item
+                      key={notice.id}
+                      onClick={() => showSettingsSection(notice.section)}
+                    >
+                      <strong>{notice.title}</strong>
+                      <span className="update-notification-detail">
+                        {notice.message}
+                      </span>
+                    </Menu.Item>
+                  ))
+                ) : (
+                  <Menu.Item disabled>No update alerts</Menu.Item>
+                )}
+              </Menu.Dropdown>
+            </Menu>
             <LockSimple size={14} />
             <span>Your words stay yours</span>
             <Avatar size={29} radius="xl" color="mint">
@@ -493,11 +621,11 @@ export function App() {
           </div>
         </header>
         {state?.call_recording &&
-          !(page === "notetaker" && workspace === "live") && (
+          !(page === "conversations" && workspace === "live") && (
             <button
               className="recording-banner"
               onClick={() => {
-                setPage("notetaker");
+                setPage("conversations");
                 setWorkspace("live");
               }}
             >
@@ -526,7 +654,7 @@ export function App() {
           )}
         <div
           ref={contentScroll}
-          className={`main-content ${page === "notetaker" && workspace !== "library" ? "reader-mode" : ""}`}
+          className={`main-content ${["notetaker", "conversations", "dictation"].includes(page) && workspace !== "library" ? "reader-mode" : ""}`}
         >
           {error && (
             <Alert color="red" title="Connection unavailable" mb="md">
@@ -558,9 +686,12 @@ export function App() {
                 <Skeleton key={i} height={120} mb="md" />
               ))}
             </div>
-          ) : page === "notetaker" ? (
+          ) : page === "notetaker" ||
+            page === "conversations" ||
+            (page === "dictation" && workspace !== "library") ? (
             workspace === "library" ? (
               <Library
+                mode={page === "conversations" ? "call" : "note"}
                 state={state}
                 open={open}
                 newNote={newNote}
@@ -569,11 +700,14 @@ export function App() {
                     .then(() => setWorkspace("live-note"))
                     .catch(() => {})
                 }
-                start={() =>
-                  void act({ type: "call_start" })
-                    .then(() => setWorkspace("live"))
-                    .catch(() => {})
-                }
+                start={() => {
+                  setCallSource("system");
+                  setCallLanguage(
+                    state?.settings?.transcription_language || "auto",
+                  );
+                  setCallAudioCues(Boolean(state?.settings?.audio_context));
+                  setCallSetup(true);
+                }}
               />
             ) : (
               <Reader
@@ -599,6 +733,8 @@ export function App() {
                     ? state.note_status
                     : state.call_status
                 }
+                cueEnabled={workspace === "live" && state.call_cues_enabled}
+                cueStatus={workspace === "live" ? state.call_cues_status : ""}
                 seconds={
                   workspace === "live-note"
                     ? (state.note_seconds ?? state.seconds)
@@ -657,17 +793,155 @@ export function App() {
           )}
         </div>
       </main>
+      <Modal
+        opened={callSetup}
+        onClose={() => !callStarting && setCallSetup(false)}
+        title="Record a conversation"
+        centered
+        radius="lg"
+        size="md"
+      >
+        {state?.preview && (
+          <Alert color="mint" variant="light" mb="md">
+            Recording is available in the Articulate desktop app. You can
+            explore the audio options here.
+          </Alert>
+        )}
+        <p className="call-setup-intro">
+          Choose the audio source for this recording. Your meeting can be in any
+          app.
+        </p>
+        <div
+          className="call-source-options"
+          role="radiogroup"
+          aria-label="Conversation audio source"
+        >
+          <button
+            type="button"
+            role="radio"
+            aria-checked={callSource === "system"}
+            className={`call-source-option ${callSource === "system" ? "selected" : ""}`}
+            onClick={() => setCallSource("system")}
+          >
+            <Headphones size={23} />
+            <span>
+              <strong>Any meeting app</strong>
+              <small>
+                Microphone and system output. Speakers are identified from audio
+                when available.
+              </small>
+            </span>
+            <span className="call-source-radio" />
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={callSource === "discord"}
+            disabled={!state?.discord?.audio_ready}
+            className={`call-source-option ${callSource === "discord" ? "selected" : ""}`}
+            onClick={() => setCallSource("discord")}
+          >
+            <Users size={23} />
+            <span>
+              <strong>Separate Discord audio</strong>
+              <small>
+                {state?.discord?.audio_ready
+                  ? "Individual participant tracks with Discord names."
+                  : "Connect the Discord companion to use participant tracks."}
+              </small>
+            </span>
+            <span className="call-source-radio" />
+          </button>
+        </div>
+        <Select
+          mt="md"
+          label="Language preference for this call"
+          description="Helps settle ambiguous short words. Other languages can still be recognized."
+          searchable
+          allowDeselect={false}
+          value={callLanguage}
+          onChange={(value) => setCallLanguage(value || "auto")}
+          data={[
+            { value: "auto", label: "Auto-detect" },
+            ...(state?.model_status?.speech_languages || []).map((code) => {
+              let label = code;
+              try {
+                label =
+                  new Intl.DisplayNames(["en"], { type: "language" }).of(
+                    code,
+                  ) || code;
+              } catch {
+                // Show the model's locale code when it has no display name.
+              }
+              return { value: code, label };
+            }),
+          ]}
+        />
+        {state?.model_status?.context_installed && (
+          <Switch
+            mt="md"
+            label="Sound and tone cues"
+            description="Mark sounds and possible vocal emotions in the transcript."
+            checked={callAudioCues}
+            onChange={(event) => setCallAudioCues(event.currentTarget.checked)}
+          />
+        )}
+        <p className="call-setup-device">
+          Output: {state?.settings?.output || "System default"} · Microphone:{" "}
+          {state?.settings?.microphone || "System default"}
+        </p>
+        <Group justify="flex-end" mt="lg">
+          <Button
+            variant="subtle"
+            color="gray"
+            onClick={() => setCallSetup(false)}
+            disabled={callStarting}
+          >
+            Cancel
+          </Button>
+          <Button
+            loading={callStarting}
+            disabled={
+              state?.preview ||
+              !state?.ready ||
+              (callSource === "discord" && !state?.discord?.audio_ready)
+            }
+            onClick={async () => {
+              setCallStarting(true);
+              try {
+                await act({
+                  type: "call_start",
+                  source: callSource,
+                  language_preference:
+                    callLanguage === "auto" ? null : callLanguage,
+                  audio_context: state?.model_status?.context_installed
+                    ? callAudioCues
+                    : false,
+                });
+                setCallSetup(false);
+                setPage("conversations");
+                setWorkspace("live");
+              } catch {
+                // The action displays the error.
+              } finally {
+                setCallStarting(false);
+              }
+            }}
+          >
+            Start recording
+          </Button>
+        </Group>
+      </Modal>
     </div>
   );
 }
-function Library({ state, open, newNote, start, speak }) {
+function Library({ mode, state, open, newNote, start, speak }) {
   const [query, setQuery] = useState(""),
-    [kind, setKind] = useState("all"),
     [preview, setPreview] = useState(null);
   const filtered = state.history.filter(
     (s) =>
-      (kind === "all" || s.kind === kind) &&
-      (query || kind === "dictation" || !s.topic_id) &&
+      s.kind === mode &&
+      (query || !s.topic_id) &&
       `${s.title} ${s.preview}`.toLowerCase().includes(query.toLowerCase()),
   );
   const selected = filtered.find((s) => s.id === preview) || filtered[0];
@@ -675,91 +949,114 @@ function Library({ state, open, newNote, start, speak }) {
     <div className="page-content library-page">
       <div className="page-header">
         <div>
-          <div className="eyebrow">SPACE TO THINK</div>
-          <h1 className="page-heading">Notetaker</h1>
+          <div className="eyebrow">
+            {mode === "call" ? "EVERY VOICE IN CONTEXT" : "SPACE TO THINK"}
+          </div>
+          <h1 className="page-heading">
+            {mode === "call" ? "Conversations" : "Notetaker"}
+          </h1>
           <p className="page-subtitle">
-            Every conversation. A little more clarity.
+            {mode === "call"
+              ? "Meetings and calls, wherever they happen."
+              : "A home for your notes and thoughts."}
           </p>
         </div>
         <Group gap={10}>
-          <Button
-            variant="default"
-            leftSection={<Plus size={17} />}
-            onClick={newNote}
-          >
-            New note
-          </Button>
-          <Button
-            variant="default"
-            leftSection={<Headphones size={17} />}
-            onClick={start}
-            disabled={
-              state.recording ||
-              state.call_recording ||
-              state.note_recording ||
-              state.busy
-            }
-          >
-            Record a conversation
-          </Button>
+          {mode === "note" && (
+            <Button
+              variant="default"
+              leftSection={<Plus size={17} />}
+              onClick={newNote}
+            >
+              New note
+            </Button>
+          )}
         </Group>
       </div>
-      <section
-        className="thought-capture"
-        aria-labelledby="thought-capture-title"
-      >
-        <div className="thought-capture-icon">
-          <Microphone size={27} weight="duotone" />
-        </div>
-        <div className="thought-capture-copy">
-          <h2 id="thought-capture-title">Speak your thoughts</h2>
-          <p>
-            Talk through an idea. Watch it become a note, with your original
-            words kept alongside.
-          </p>
-        </div>
-        <div className="thought-capture-action">
-          <Button
-            leftSection={<Microphone size={17} />}
-            onClick={speak}
-            disabled={
-              state.recording ||
-              state.call_recording ||
-              state.note_recording ||
-              state.busy ||
-              state.loading
-            }
-          >
-            Start a spoken note
-          </Button>
-          {state.settings.quick_note_hotkey && (
-            <span>
-              <Kbd>{shortcutLabel(state.settings.quick_note_hotkey)}</Kbd> from
-              any app
-            </span>
-          )}
-        </div>
-      </section>
-      {state.filing_status && (
+      {mode === "note" && (
+        <section
+          className="thought-capture"
+          aria-labelledby="thought-capture-title"
+        >
+          <div className="thought-capture-icon">
+            <Microphone size={27} weight="duotone" />
+          </div>
+          <div className="thought-capture-copy">
+            <h2 id="thought-capture-title">Speak your thoughts</h2>
+            <p>
+              Talk through an idea. Watch it become a note, with your original
+              words kept alongside.
+            </p>
+          </div>
+          <div className="thought-capture-action">
+            <Button
+              leftSection={<Microphone size={17} />}
+              onClick={speak}
+              disabled={
+                state.recording ||
+                state.call_recording ||
+                state.note_recording ||
+                state.busy ||
+                state.loading
+              }
+            >
+              Start a spoken note
+            </Button>
+            {state.settings.quick_note_hotkey && (
+              <span>
+                <Kbd>{shortcutLabel(state.settings.quick_note_hotkey)}</Kbd>{" "}
+                from any app
+              </span>
+            )}
+          </div>
+        </section>
+      )}
+      {mode === "call" && (
+        <section className="thought-capture conversation-capture">
+          <div className="thought-capture-icon">
+            <Headphones size={27} weight="duotone" />
+          </div>
+          <div className="thought-capture-copy">
+            <h2>Capture a conversation</h2>
+            <p>
+              Record your microphone and meeting audio from any app. Choose
+              separate Discord tracks when connected.
+            </p>
+          </div>
+          <div className="thought-capture-action">
+            <Button
+              leftSection={<Record size={17} />}
+              onClick={start}
+              disabled={
+                state.recording ||
+                state.call_recording ||
+                state.note_recording ||
+                state.busy ||
+                state.loading
+              }
+            >
+              Record a conversation
+            </Button>
+          </div>
+        </section>
+      )}
+      {mode === "note" && state.filing_status && (
         <div className="filing-state" role="status">
           <Sparkle size={17} />
           <span>{state.filing_status}</span>
         </div>
       )}
       <div className="library-tools">
-        <SegmentedControl
-          value={kind}
-          onChange={setKind}
-          data={[
-            { label: "Everything", value: "all" },
-            { label: "Conversations", value: "call" },
-            { label: "Notes", value: "note" },
-            { label: "Dictations", value: "dictation" },
-          ]}
-        />
+        <span className="section-heading">
+          {mode === "call" ? "SAVED CONVERSATIONS" : "SAVED NOTES"}
+        </span>
         <TextInput
-          aria-label="Search your notes"
-          placeholder="Search your notes"
+          aria-label={
+            mode === "call" ? "Search conversations" : "Search your notes"
+          }
+          placeholder={
+            mode === "call" ? "Search conversations" : "Search your notes"
+          }
           value={query}
           onChange={(e) => setQuery(e.currentTarget.value)}
           leftSection={<MagnifyingGlass size={18} />}
@@ -779,7 +1076,13 @@ function Library({ state, open, newNote, start, speak }) {
       <div className="library-layout">
         <div className="session-list">
           <div className="section-heading">
-            <span>{query ? "SEARCH RESULTS" : "YOUR RECENT NOTES"}</span>
+            <span>
+              {query
+                ? "SEARCH RESULTS"
+                : mode === "call"
+                  ? "RECENT CONVERSATIONS"
+                  : "YOUR RECENT NOTES"}
+            </span>
             <span>
               {filtered.length} {filtered.length === 1 ? "item" : "items"}
             </span>
@@ -842,18 +1145,30 @@ function Library({ state, open, newNote, start, speak }) {
             <div className="empty-state">
               <Notebook size={40} weight="duotone" />
               <h2>
-                {query ? "No matching notes" : "A place for your next idea"}
+                {query
+                  ? "No matching results"
+                  : mode === "call"
+                    ? "Your conversations start here"
+                    : "A place for your next idea"}
               </h2>
               <p>
                 {query
                   ? "Try a different word or clear your search."
-                  : "Record a conversation or start a note. It will be waiting here when you need it."}
+                  : mode === "call"
+                    ? "Record a meeting or call in any app. Its transcript will appear here."
+                    : "Write or speak a note. It will be waiting here when you need it."}
               </p>
               <Button
                 variant="light"
-                onClick={query ? () => setQuery("") : newNote}
+                onClick={
+                  query ? () => setQuery("") : mode === "call" ? start : newNote
+                }
               >
-                {query ? "Clear search" : "Write your first note"}
+                {query
+                  ? "Clear search"
+                  : mode === "call"
+                    ? "Record a conversation"
+                    : "Write your first note"}
               </Button>
             </div>
           )}
@@ -898,15 +1213,26 @@ function Library({ state, open, newNote, start, speak }) {
             </>
           ) : (
             <p className="muted">
-              Your notes and conversations will appear here.
+              {mode === "call"
+                ? "Your conversations will appear here."
+                : "Your notes will appear here."}
             </p>
           )}
           <div className="quiet-tip">
-            <Notebook size={22} />
-            <strong>Leave room for a thought.</strong>
+            {mode === "call" ? (
+              <Headphones size={22} />
+            ) : (
+              <Notebook size={22} />
+            )}
+            <strong>
+              {mode === "call"
+                ? "Keep every voice in view."
+                : "Leave room for a thought."}
+            </strong>
             <p>
-              Your own notes and the important parts of a conversation belong
-              together.
+              {mode === "call"
+                ? "Return to a conversation, its speakers, and the moments that mattered."
+                : "Your ideas and spoken notes stay together here."}
             </p>
           </div>
         </aside>
@@ -919,6 +1245,8 @@ function Reader({
   rows = [],
   live,
   status,
+  cueEnabled,
+  cueStatus,
   seconds,
   saveState,
   onEdit,
@@ -937,16 +1265,24 @@ function Reader({
 }) {
   const [tab, setTab] = useState("notes"),
     [search, setSearch] = useState(""),
+    [speakerFilter, setSpeakerFilter] = useState(null),
     [deleting, setDeleting] = useState(false),
     [renaming, setRenaming] = useState(false),
     [follow, setFollow] = useState(true),
     [moving, setMoving] = useState(null),
     [moveTarget, setMoveTarget] = useState("__separate__"),
     [movePending, setMovePending] = useState(false);
+  const documentNoun =
+    session?.kind === "call"
+      ? "conversation"
+      : session?.kind === "dictation"
+        ? "dictation"
+        : "note";
   const end = useRef(null);
   useEffect(() => {
     setTab(session?.kind === "dictation" ? "transcript" : "notes");
     setSearch("");
+    setSpeakerFilter(null);
     setRenaming(false);
     setMoving(null);
   }, [session?.id]);
@@ -958,7 +1294,35 @@ function Reader({
     content = tab === "notes" ? session?.personal_notes || "" : source,
     speakers = session?.is_collection
       ? []
-      : [...new Set((rows || []).map((r) => r.speaker))];
+      : [
+          ...new Set(
+            (rows || [])
+              .flatMap((r) =>
+                r.speaker_labels?.length ? r.speaker_labels : [r.speaker],
+              )
+              .filter(Boolean),
+          ),
+        ];
+  const speakerColors = [
+    "mint",
+    "blue",
+    "grape",
+    "orange",
+    "pink",
+    "teal",
+    "yellow",
+    "indigo",
+  ];
+  const speakerTone = (speaker) =>
+    speakerColors[
+      Math.max(0, speakers.indexOf(speaker)) % speakerColors.length
+    ];
+  const timelineEnd = rows.reduce(
+    (end, row) => Math.max(end, row.end_ms || 0),
+    Math.max(seconds * 1000 || 0, 1),
+  );
+  const timelineStart = live ? Math.max(0, timelineEnd - 90000) : 0;
+  const timelineRange = Math.max(1, timelineEnd - timelineStart);
   const lastRow = rows?.at(-1);
   const tail = `${rows?.length || 0}:${lastRow?.start_ms}:${lastRow?.speaker}:${lastRow?.text}`;
   useEffect(() => {
@@ -979,7 +1343,11 @@ function Reader({
           leftSection={<ArrowLeft size={16} />}
           onClick={back}
         >
-          All notes
+          {session?.kind === "call"
+            ? "All conversations"
+            : session?.kind === "dictation"
+              ? "All dictations"
+              : "All notes"}
         </Button>
         <span className="save-indicator" data-saving={saveState === "Saving…"}>
           <Check size={14} />
@@ -1086,7 +1454,7 @@ function Reader({
               <ActionIcon
                 variant="default"
                 size={38}
-                aria-label="More note actions"
+                aria-label="More document actions"
               >
                 <DotsThree size={23} />
               </ActionIcon>
@@ -1135,7 +1503,7 @@ function Reader({
                 disabled={live || !session}
                 onClick={() => setDeleting(true)}
               >
-                Delete note
+                Delete {documentNoun}
               </Menu.Item>
             </Menu.Dropdown>
           </Menu>
@@ -1269,6 +1637,69 @@ function Reader({
               </p>
             </Tabs.Panel>
             <Tabs.Panel value="transcript" className="transcript-panel">
+              {speakers.length > 1 && (
+                <section
+                  className="speaker-timeline"
+                  aria-label="Speaker turns"
+                >
+                  <div className="speaker-timeline-heading">
+                    <strong>Speaker turns</strong>
+                    <span>
+                      {live ? "Recent 90 seconds" : "Conversation overview"}
+                    </span>
+                  </div>
+                  {speakers.map((speaker) => (
+                    <button
+                      className={`speaker-track ${speakerFilter === speaker ? "selected" : ""}`}
+                      key={speaker}
+                      type="button"
+                      onClick={() =>
+                        setSpeakerFilter(
+                          speakerFilter === speaker ? null : speaker,
+                        )
+                      }
+                      aria-pressed={speakerFilter === speaker}
+                      title={`Show ${speaker}'s turns`}
+                    >
+                      <span
+                        className={`speaker-track-name speaker-tone-${speakerTone(speaker)}`}
+                      >
+                        {speaker}
+                      </span>
+                      <span className="speaker-track-line">
+                        {rows
+                          .filter((row) =>
+                            (row.speaker_labels?.length
+                              ? row.speaker_labels
+                              : [row.speaker]
+                            ).includes(speaker),
+                          )
+                          .map((row, index) => {
+                            const start = Math.max(
+                              timelineStart,
+                              row.start_ms || 0,
+                            );
+                            const end = Math.min(
+                              timelineEnd,
+                              row.end_ms || start,
+                            );
+                            if (end <= start) return null;
+                            return (
+                              <span
+                                className={`speaker-track-bar speaker-tone-bg-${speakerTone(speaker)}`}
+                                key={`${row.start_ms}-${index}`}
+                                style={{
+                                  left: `${((start - timelineStart) / timelineRange) * 100}%`,
+                                  width: `${Math.max(0.6, ((end - start) / timelineRange) * 100)}%`,
+                                }}
+                              />
+                            );
+                          })}
+                      </span>
+                    </button>
+                  ))}
+                </section>
+              )}
               <div className="transcript-tools">
                 <TextInput
                   aria-label="Find in transcript"
@@ -1288,12 +1719,28 @@ function Reader({
                   </Button>
                 )}
               </div>
+              {cueEnabled && (
+                <p className="muted" role="status">
+                  {cueStatus ||
+                    (live
+                      ? "Sound and tone cues are on. Labels appear when a distinct cue is detected."
+                      : rows.some((row) => row.cues?.length)
+                        ? "Sound and tone cues were on for this call."
+                        : "No distinct sound or non-neutral tone was reported for this call.")}
+                </p>
+              )}
               {rows?.length ? (
                 rows
-                  .filter((r) =>
-                    `${r.speaker} ${r.text}`
-                      .toLowerCase()
-                      .includes(search.toLowerCase()),
+                  .filter(
+                    (r) =>
+                      (!speakerFilter ||
+                        (r.speaker_labels?.length
+                          ? r.speaker_labels
+                          : [r.speaker]
+                        ).includes(speakerFilter)) &&
+                      `${r.speaker} ${r.text}`
+                        .toLowerCase()
+                        .includes(search.toLowerCase()),
                   )
                   .map((row, index) => (
                     <article
@@ -1303,11 +1750,9 @@ function Reader({
                       <Avatar
                         radius="xl"
                         size={32}
-                        color={
-                          ["mint", "blue", "grape"][
-                            Math.max(0, speakers.indexOf(row.speaker)) % 3
-                          ]
-                        }
+                        color={speakerTone(
+                          row.speaker_labels?.[0] || row.speaker,
+                        )}
                       >
                         {row.speaker?.slice(0, 1) || "?"}
                       </Avatar>
@@ -1319,13 +1764,21 @@ function Reader({
                         </div>
                         <p>{row.text}</p>
                         {row.cues?.length > 0 && (
-                          <Group gap="xs" mt="xs" aria-label="Sound cues">
+                          <Group
+                            gap="xs"
+                            mt="xs"
+                            aria-label="Sound and tone cues"
+                          >
                             {row.cues.map((cue) => (
                               <Badge
                                 key={`${cue.start_ms}-${cue.label}`}
                                 variant="light"
-                                color="mint"
-                                title={`Detected within ${time(cue.start_ms)} to ${time(cue.end_ms)}`}
+                                color={
+                                  cue.label.endsWith(" tone")
+                                    ? "yellow"
+                                    : "mint"
+                                }
+                                title={`${cue.label.endsWith(" tone") ? "Possible vocal tone" : "Sound cue"} within ${time(cue.start_ms)} to ${time(cue.end_ms)}`}
                               >
                                 {cue.label} · {time(cue.start_ms)}
                               </Badge>
@@ -1394,7 +1847,7 @@ function Reader({
           <aside className="people-pane">
             <div className="section-heading">
               <span>
-                {session?.kind === "note" ? "DETAILS" : "IN THIS CONVERSATION"}
+                {session?.kind === "call" ? "IN THIS CONVERSATION" : "DETAILS"}
               </span>
             </div>
             {speakers.map((speaker, index) => (
@@ -1402,7 +1855,7 @@ function Reader({
                 <Avatar
                   size={34}
                   radius="xl"
-                  color={["mint", "blue", "grape"][index % 3]}
+                  color={speakerColors[index % speakerColors.length]}
                 >
                   {speaker.slice(0, 1)}
                 </Avatar>
@@ -1493,13 +1946,13 @@ function Reader({
       <Modal
         opened={deleting}
         onClose={() => setDeleting(false)}
-        title="Delete this note?"
+        title={`Delete this ${documentNoun}?`}
         size="sm"
       >
         <p>The saved transcript and notes will be removed from this device.</p>
         <Group justify="flex-end" mt="xl">
           <Button variant="default" onClick={() => setDeleting(false)}>
-            Keep note
+            Keep {documentNoun}
           </Button>
           <Button
             color="red"
@@ -1512,7 +1965,7 @@ function Reader({
                 .catch(() => {})
             }
           >
-            Delete note
+            Delete {documentNoun}
           </Button>
         </Group>
       </Modal>

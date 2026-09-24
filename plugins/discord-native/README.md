@@ -24,11 +24,12 @@ The desktop callback's extra integer and float are deliberately passed unchanged
 they are not treated as a timestamp or an identity. Actual desktop callback values
 and behavior still require controlled-call validation.
 
-The adapter accepts only the module whose SHA-256 is
-`2bf2290dff75933c6728bbd8d80c4876d131a808f8cea9e1103e40a12e64b014`,
-the exact decorated export and its checked entry bytes. A different Discord build
-fails without modifying it. No account tokens, messages or network voice packets
-are inspected.
+The adapter accepts only these inspected module SHA-256 values:
+`2bf2290dff75933c6728bbd8d80c4876d131a808f8cea9e1103e40a12e64b014`
+and `69e9b852c253487c7eafa8f62f12895a00c3559c57037eb2fa103e43760fd16d`.
+Both expose the same decorated `Discord::Connect` callback signature and checked
+entry bytes. A different Discord build fails without modifying it. No account
+tokens, messages or network voice packets are inspected.
 
 ## Build and isolated tests
 

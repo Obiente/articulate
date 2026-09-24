@@ -939,6 +939,7 @@ export function SettingsPage({ state, act }) {
     state.filing_working ||
     models.cleanup_working ||
     models.speakers_working ||
+    models.verifier_working ||
     models.context_progress != null ||
     notes.downloading ||
     state.downloading != null;
@@ -1228,7 +1229,7 @@ export function SettingsPage({ state, act }) {
         <Paper withBorder radius="lg" className="secondary-settings-card">
           <SettingRow
             title="Transcription language"
-            description="Choose the language spoken in dictation, calls and spoken notes. Use Auto-detect for multilingual conversations."
+            description="Set the recognition language for dictation and spoken notes. Calls have their own language preference and keep automatic detection."
           >
             <Select
               aria-label="Transcription language"
@@ -1249,6 +1250,33 @@ export function SettingsPage({ state, act }) {
               }}
             />
           </SettingRow>
+          <SettingRow
+            title="Fast live transcription"
+            description="Nemotron gives you fast live previews and checks short finished dictations. Qwen prepares the final text. Previews may change as you speak."
+          >
+            {models.verifier_installed ? (
+              <Badge variant="light" leftSection={<Check size={14} />}>
+                Installed
+              </Badge>
+            ) : (
+              <Button
+                variant="default"
+                leftSection={<DownloadSimple size={17} />}
+                loading={
+                  models.verifier_working || pending === "verifier_download"
+                }
+                disabled={Boolean(pending) || modelBusy || capturing}
+                onClick={() => action("verifier_download")}
+              >
+                Download · 751 MB
+              </Button>
+            )}
+          </SettingRow>
+          <SetupStatus
+            busy={models.verifier_working}
+            message={models.verifier_status}
+            progress={models.verifier_progress}
+          />
           <SettingRow
             title="Microphone"
             description="Choose the input for dictation and your voice in calls."
@@ -1788,8 +1816,8 @@ export function SettingsPage({ state, act }) {
         </div>
         <Paper withBorder radius="lg" className="secondary-settings-card">
           <SettingRow
-            title="SenseVoice sound cues"
-            description="Add laughter, crying and other sound cues beside the speaker in calls and spoken notes. Runs locally in the background."
+            title="SenseVoice audio cues"
+            description="Show laughter, crying and possible vocal tone beside the speaker. Runs locally in the background."
           >
             <Button
               variant="default"
@@ -1817,11 +1845,11 @@ export function SettingsPage({ state, act }) {
             progress={models.context_progress}
           />
           <SettingRow
-            title="Include sound cues"
-            description="Applies to new recordings. Your spoken words stay unchanged."
+            title="Include sound and tone cues"
+            description="New recordings are checked for sound events and non-neutral vocal tone. Some passages have no cue; spoken words stay unchanged."
           >
             <Switch
-              aria-label="Include sound cues"
+              aria-label="Include sound and tone cues"
               size="md"
               checked={Boolean(settings.audio_context)}
               disabled={

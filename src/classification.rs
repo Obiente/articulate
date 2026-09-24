@@ -64,6 +64,77 @@ pub struct Segment {
     pub end_ms: u64,
     pub speaker: Option<String>,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<SegmentContext>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerOrigin {
+    Microphone,
+    DiscordContext,
+    Diarization,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentContext {
+    pub speaker_origin: SpeakerOrigin,
+    pub overlapping_speech: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cues: Vec<crate::sensevoice::Cue>,
+}
+
+impl Segment {
+    pub fn from_call_row(
+        rows: &[crate::calls::Row],
+        names: &[String],
+        index: usize,
+        id: String,
+    ) -> Self {
+        let row = &rows[index];
+        let overlapping_speech = rows.iter().enumerate().any(|(other_index, other)| {
+            index != other_index
+                && !other.text.trim().is_empty()
+                && row.start_ms < other.end_ms
+                && other.start_ms < row.end_ms
+                && crate::calls::label(row, names) != crate::calls::label(other, names)
+        });
+        let cues = row
+            .cues
+            .iter()
+            .filter_map(|cue| {
+                let start_ms = cue.start_ms.max(row.start_ms);
+                let end_ms = cue.end_ms.min(row.end_ms);
+                (start_ms < end_ms).then(|| crate::sensevoice::Cue {
+                    start_ms,
+                    end_ms,
+                    label: cue.label.clone(),
+                })
+            })
+            .collect();
+        Self {
+            id,
+            start_ms: row.start_ms,
+            end_ms: row.end_ms,
+            speaker: Some(crate::calls::label(row, names)),
+            text: row.text.clone(),
+            context: Some(SegmentContext {
+                speaker_origin: if row.microphone {
+                    SpeakerOrigin::Microphone
+                } else if row.discord.is_some() {
+                    SpeakerOrigin::DiscordContext
+                } else if row.speakers.iter().any(|speaker| *speaker > 0) {
+                    SpeakerOrigin::Diarization
+                } else {
+                    SpeakerOrigin::Uncertain
+                },
+                overlapping_speech,
+                cues,
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -933,6 +1004,7 @@ mod tests {
                 end_ms: 2000,
                 speaker: Some("Speaker 1".into()),
                 text: "We decided to postpone.".into(),
+                context: None,
             }],
         }
     }

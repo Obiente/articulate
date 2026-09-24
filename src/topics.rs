@@ -19,7 +19,7 @@ pub struct Source {
     pub text: String,
     pub original: String,
     pub rows: Vec<crate::calls::Row>,
-    pub speaker_names: [String; 4],
+    pub speaker_names: Vec<String>,
 }
 impl From<Session> for Source {
     fn from(session: Session) -> Self {
@@ -75,19 +75,21 @@ pub fn transcript(session: &Session) -> Transcript {
                     end_ms: 0,
                     speaker: None,
                     text: source.text.clone(),
+                    context: None,
                 }]
             } else {
                 source
                     .rows
                     .iter()
                     .enumerate()
-                    .filter(|(_, row)| !row.text.trim().is_empty())
-                    .map(|(index, row)| Segment {
-                        id: format!("{}:row-{index}", source.id),
-                        start_ms: row.start_ms,
-                        end_ms: row.end_ms,
-                        speaker: Some(crate::calls::label(row, &source.speaker_names)),
-                        text: row.text.clone(),
+                    .filter(|(_, row)| !row.text.trim().is_empty() || !row.cues.is_empty())
+                    .map(|(index, _)| {
+                        Segment::from_call_row(
+                            &source.rows,
+                            &source.speaker_names,
+                            index,
+                            format!("{}:row-{index}", source.id),
+                        )
                     })
                     .collect()
             }

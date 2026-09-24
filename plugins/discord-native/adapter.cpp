@@ -23,9 +23,13 @@ using Connect = void* (__fastcall*)(void*, void*, const std::string*, const void
     void*, void*, Received*, void*);
 constexpr char connect_symbol[] =
     "?Connect@Discord@@QEAA?AV?$shared_ptr@VConnection@voice@discord@@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@3@AEBUBridgeConnectionOptions@discord@@V?$function@$$A6AXAEBUConnectionInfo@discord@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z@3@V?$function@$$A6AXI@Z@3@V?$function@$$A6AXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@PEBF_KH2IAEA_NM@Z@3@V?$function@$$A6AXPEAF_KH1@Z@3@@Z";
-constexpr uint8_t module_sha[32] = {
-    0x2b,0xf2,0x29,0x0d,0xff,0x75,0x93,0x3c,0x67,0x28,0xbb,0xd8,0xd8,0x0c,0x48,0x76,
-    0xd1,0x31,0xa8,0x08,0xf8,0xce,0xa9,0xe1,0x10,0x3e,0x40,0xa1,0x2e,0x64,0xb0,0x14 };
+// Exact Discord voice builds whose Connect export and callback ABI were checked.
+constexpr std::array<std::array<uint8_t, 32>, 2> module_shas{{
+    {0x2b,0xf2,0x29,0x0d,0xff,0x75,0x93,0x3c,0x67,0x28,0xbb,0xd8,0xd8,0x0c,0x48,0x76,
+     0xd1,0x31,0xa8,0x08,0xf8,0xce,0xa9,0xe1,0x10,0x3e,0x40,0xa1,0x2e,0x64,0xb0,0x14},
+    {0x69,0xe9,0xb8,0x52,0xc2,0x53,0x48,0x7c,0x7e,0xaf,0xa8,0xf6,0x2f,0x12,0x89,0x5a,
+     0x00,0xc3,0x55,0x9c,0x57,0x03,0x7e,0xb2,0xfa,0x10,0x3e,0x43,0x76,0x0f,0xd1,0x6d}
+}};
 constexpr uint32_t max_samples = 5760 * 2;
 constexpr uint32_t max_packet = 64 + max_samples * 2;
 // A bounded multi-producer/single-consumer ring. Only a slot's owner touches
@@ -195,8 +199,13 @@ bool matching_module(HMODULE module) noexcept {
         if (total > 128 * 1024 * 1024 || BCryptHashData(hash, buffer.data(), read, 0) < 0) { ok = false; break; }
     }
     std::array<uint8_t, 32> digest{};
-    ok = ok && BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0
-        && std::memcmp(digest.data(), module_sha, 32) == 0;
+    ok = ok && BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) >= 0;
+    if (ok) {
+        ok = false;
+        for (const auto& approved_hash : module_shas) {
+            if (std::memcmp(digest.data(), approved_hash.data(), digest.size()) == 0) { ok = true; break; }
+        }
+    }
     if (hash) BCryptDestroyHash(hash);
     if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
     CloseHandle(file);

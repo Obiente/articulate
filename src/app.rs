@@ -129,6 +129,9 @@ enum Event {
     SpeakersDownloaded,
     SpeakersProgress(f32),
     SpeakersDownloadFailed(String),
+    VerifierDownloaded,
+    VerifierProgress(f32),
+    VerifierDownloadFailed(String),
 }
 
 pub struct App {
@@ -146,6 +149,8 @@ pub struct App {
     call_context: Vec<calls::Row>,
     speakers_downloading: Option<f32>,
     speakers_download_status: String,
+    verifier_downloading: Option<f32>,
+    verifier_download_status: String,
     dictation_metrics: crate::insights::DictationMetrics,
     settings: Settings,
     commands: Sender<Command>,
@@ -195,12 +200,13 @@ pub struct App {
     discord_launch: discord_ui::LaunchState,
     call_rows: Vec<calls::Row>,
     call_committed: Vec<calls::Row>,
-    speaker_names: [String; 4],
+    speaker_names: Vec<String>,
     outputs: Vec<String>,
     call_levels: (f32, f32),
     call_status: String,
     call_native_audio: bool,
     call_native_received: bool,
+    call_cues_enabled: bool,
     integration_tx: Sender<integration::Action>,
     integration_rx: Receiver<integration::Event>,
     edit_baseline: String,
@@ -280,10 +286,14 @@ impl App {
                     Command::Call(request, token) => {
                         let result = if let Some(engine) = engine.as_mut() {
                             engine.set_cancel_token(&token);
-                            calls::run(engine, request, |update| {
-                                let _ = worker_tx.send(Event::Call(update));
-                            })
-                            .map_err(|e| format!("{e:#}"))
+                            let preference = request.language_preference.clone();
+                            engine
+                                .with_call_preference(preference, |engine| {
+                                    calls::run(engine, request, |update| {
+                                        let _ = worker_tx.send(Event::Call(update));
+                                    })
+                                })
+                                .map_err(|e| format!("{e:#}"))
                         } else {
                             Err("Load a speech model first".into())
                         };
@@ -306,7 +316,12 @@ impl App {
                         let result = match engine.as_mut() {
                             Some(e) => {
                                 e.set_cancel_token(&token);
-                                e.transcribe(&pcm).map_err(|e| format!("{e:#}"))
+                                (if final_pass {
+                                    e.transcribe_final(&pcm)
+                                } else {
+                                    e.transcribe_preview(&pcm)
+                                })
+                                .map_err(|e| format!("{e:#}"))
                             }
                             None => Err("Load a model first".into()),
                         };
@@ -340,6 +355,8 @@ impl App {
             call_context: Vec::new(),
             speakers_downloading: None,
             speakers_download_status: String::new(),
+            verifier_downloading: None,
+            verifier_download_status: String::new(),
             dictation_metrics: Default::default(),
             settings,
             commands,
@@ -389,12 +406,13 @@ impl App {
             discord_launch: Default::default(),
             call_rows: Vec::new(),
             call_committed: Vec::new(),
-            speaker_names: Default::default(),
+            speaker_names: calls::empty_speaker_names(),
             outputs: call_capture::outputs(),
             call_levels: (0.0, 0.0),
             call_status: "Ready to capture a call".into(),
             call_native_audio: false,
             call_native_received: false,
+            call_cues_enabled: false,
             integration_tx,
             integration_rx,
             edit_baseline: String::new(),
@@ -815,6 +833,9 @@ impl App {
                             self.call_status = "Listening to your microphone and call audio".into();
                         }
                     }
+                    calls::Update::SpeakerFallback => {
+                        self.call_status = "Recording call audio. Individual speaker identification is unavailable.".into();
+                    }
                     calls::Update::NativeAudio(received) => {
                         self.call_native_received = received;
                         self.call_status = if received {
@@ -915,6 +936,22 @@ impl App {
                 Event::SpeakersDownloadFailed(error) => {
                     self.speakers_downloading = None;
                     self.speakers_download_status = error;
+                }
+                Event::VerifierDownloaded => {
+                    self.verifier_downloading = None;
+                    self.verifier_download_status = "Second speech model is ready".into();
+                    if self.recording.is_none()
+                        && self.call.is_none()
+                        && !self.busy
+                        && PathBuf::from(&self.settings.model_path).is_file()
+                    {
+                        self.load();
+                    }
+                }
+                Event::VerifierProgress(progress) => self.verifier_downloading = Some(progress),
+                Event::VerifierDownloadFailed(error) => {
+                    self.verifier_downloading = None;
+                    self.verifier_download_status = error;
                 }
                 Event::Loaded(backend, languages) => {
                     self.speech_languages = languages;
@@ -1284,12 +1321,42 @@ impl App {
     }
 
     fn start_call_capture(&mut self) -> bool {
-        self.start_stream_capture(false)
+        let preference = (!self.settings.transcription_language.is_empty())
+            .then(|| self.settings.transcription_language.clone());
+        self.start_stream_capture(
+            false,
+            self.settings.discord_companion,
+            true,
+            preference,
+            None,
+        )
     }
 
-    fn start_stream_capture(&mut self, microphone_only: bool) -> bool {
+    fn start_manual_call_capture(
+        &mut self,
+        separate_discord_audio: bool,
+        language_preference: Option<String>,
+        audio_context: Option<bool>,
+    ) -> bool {
+        self.start_stream_capture(
+            false,
+            separate_discord_audio,
+            separate_discord_audio,
+            language_preference,
+            audio_context,
+        )
+    }
+
+    fn start_stream_capture(
+        &mut self,
+        microphone_only: bool,
+        separate_discord_audio: bool,
+        discord_attribution: bool,
+        language_preference: Option<String>,
+        audio_context: Option<bool>,
+    ) -> bool {
         let native_audio = match calls::select_native_source(
-            !microphone_only && self.settings.discord_companion,
+            !microphone_only && separate_discord_audio,
             self.discord
                 .as_ref()
                 .is_some_and(|connection| connection.native_audio_ready()),
@@ -1316,17 +1383,19 @@ impl App {
         self.call_committed.clear();
         self.call_search.clear();
         self.call_notes = None;
-        self.speaker_names = Default::default();
+        self.speaker_names = calls::empty_speaker_names();
         let control = call_capture::Control::new();
-        if !microphone_only {
+        if !microphone_only && discord_attribution {
             control.set_discord(self.discord.clone());
         }
         self.cancel = CancelToken::new();
         self.call_native_audio = native_audio;
         self.call_native_received = false;
+        self.context_status.clear();
         self.call_context.clear();
         let request = calls::Request {
-            audio_context: self.settings.audio_context,
+            audio_context: audio_context.unwrap_or(self.settings.audio_context),
+            language_preference,
             microphone: self.settings.microphone.clone(),
             output: if microphone_only {
                 None
@@ -1338,12 +1407,14 @@ impl App {
             microphone_only,
             control: control.clone(),
         };
+        let call_cues_enabled = request.audio_context;
         match self
             .commands
             .send(Command::Call(request, self.cancel.clone()))
         {
             Ok(()) => {
                 self.call = Some(control);
+                self.call_cues_enabled = call_cues_enabled;
                 let kind = if microphone_only {
                     crate::history::Kind::Note
                 } else {
@@ -1743,6 +1814,34 @@ mod tests {
     }
 
     #[test]
+    fn manual_system_call_starts_without_discord_audio_even_when_companion_is_selected() {
+        let (mut app, commands) = app();
+        app.settings.discord_companion = true;
+        assert!(app.start_manual_call_capture(false, Some("en".into()), Some(true)));
+        assert!(!app.call_native_audio);
+        assert!(app.call.is_some());
+        assert!(app.call.as_ref().unwrap().discord().is_none());
+        assert!(
+            matches!(commands.try_recv(), Ok(Command::Call(request, _)) if !request.native_audio && request.audio_context && request.language_preference.as_deref() == Some("en"))
+        );
+    }
+
+    #[test]
+    fn automatic_call_inherits_saved_language_preference_and_audio_cues() {
+        let (mut app, commands) = app();
+        app.settings.transcription_language = "en".into();
+        app.settings.audio_context = true;
+        assert!(app.start_call_capture());
+        assert!(app.call_cues_enabled);
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Call(request, _))
+                if request.language_preference.as_deref() == Some("en")
+                    && request.audio_context
+        ));
+    }
+
+    #[test]
     fn shortcut_explains_unavailable_dictation_without_starting_audio() {
         let (mut app, _) = app();
         app.loading = true;
@@ -1788,6 +1887,8 @@ mod tests {
                 call_context: Vec::new(),
                 speakers_downloading: None,
                 speakers_download_status: String::new(),
+                verifier_downloading: None,
+                verifier_download_status: String::new(),
                 dictation_metrics: Default::default(),
                 settings: Settings::default(),
                 commands,
@@ -1837,12 +1938,13 @@ mod tests {
                 discord_launch: Default::default(),
                 call_rows: Vec::new(),
                 call_committed: Vec::new(),
-                speaker_names: Default::default(),
+                speaker_names: calls::empty_speaker_names(),
                 outputs: Vec::new(),
                 call_levels: (0.0, 0.0),
                 call_status: String::new(),
                 call_native_audio: false,
                 call_native_received: false,
+                call_cues_enabled: false,
                 integration_tx,
                 integration_rx,
                 edit_baseline: String::new(),

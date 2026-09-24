@@ -42,9 +42,7 @@ const rows = [
     start_ms: 33000,
     end_ms: 55000,
     speaker: "Jordan",
-    cues: [
-      { start_ms: 33000, end_ms: 38000, label: "Laughing" },
-    ],
+    cues: [{ start_ms: 33000, end_ms: 38000, label: "Laughing" }],
     text: "Agreed. Once someone finishes their first recording, we can show them where their transcript is saved.",
     provisional: false,
   },

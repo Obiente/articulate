@@ -40,8 +40,11 @@ if (!(Test-Path -LiteralPath $Makensis)) { throw 'Install NSIS 3.11 or pass -Mak
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
 $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
 if (!$vs) { throw 'Visual Studio C++ Build Tools are required to package.' }
+$node = Get-Command node.exe -ErrorAction Stop
+$nodeBin = Split-Path $node.Source -Parent
 Import-Module (Join-Path $vs 'Common7/Tools/Microsoft.VisualStudio.DevShell.dll')
 Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+$env:PATH = "$nodeBin;$env:PATH"
 $oldFlags = $env:CARGO_ENCODED_RUSTFLAGS
 $oldTarget = $env:CARGO_TARGET_DIR
 $oldNativeAudio = $env:ARTICULATE_NATIVE_AUDIO_DIR

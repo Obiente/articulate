@@ -11,6 +11,10 @@ pub const NAME: &str = "Qwen3-ASR-1.7B-Q8_0.gguf";
 pub const SIZE: u64 = 2_185_030_624;
 pub const SHA256: &str = "9a0d81792dfea2d5f278b8a63deb3ea6e02139ce42c2301f32ea19c4f77526b7";
 const URL: &str = "https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf/resolve/3555bd238a8572bbace3ebf60d23b036dc0a5dbe/Qwen3-ASR-1.7B-Q8_0.gguf";
+pub const VERIFIER_NAME: &str = "nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf";
+const VERIFIER_SIZE: u64 = 751_094_240;
+const VERIFIER_SHA256: &str = "b94545b313b3223fda7b2857a52681da813935c2127643d1e9ff0c23d988089c";
+const VERIFIER_URL: &str = "https://huggingface.co/handy-computer/nemotron-3.5-asr-streaming-0.6b-gguf/resolve/8139c4ec14bdc45c361adf8d57c27c28e7478272/nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf";
 
 pub fn data_dir() -> PathBuf {
     // Controller tests can save preferences. Never let those writes touch a real profile.
@@ -32,6 +36,18 @@ pub fn data_dir() -> PathBuf {
 }
 pub fn default_path() -> PathBuf {
     data_dir().join("models").join(NAME)
+}
+pub fn verifier_path() -> PathBuf {
+    data_dir().join("models").join(VERIFIER_NAME)
+}
+pub fn download_verifier(mut progress: impl FnMut(f32)) -> Result<PathBuf> {
+    download_file(
+        VERIFIER_NAME,
+        VERIFIER_SIZE,
+        VERIFIER_SHA256,
+        VERIFIER_URL,
+        &mut progress,
+    )
 }
 
 // No audio, text, IDs, settings or dictionary data are included in this request.

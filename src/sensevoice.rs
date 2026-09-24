@@ -96,7 +96,7 @@ pub struct Cue {
     pub end_ms: u64,
     pub label: String,
 }
-// Discard retired tone labels when reading old recordings, including exports.
+// Accept only labels emitted by our bounded audio-tag parser.
 pub fn deserialize_cues<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<Cue>, D::Error> {
@@ -104,7 +104,17 @@ pub fn deserialize_cues<'de, D: serde::Deserializer<'de>>(
     cues.retain(|cue| {
         matches!(
             cue.label.as_str(),
-            "Laughing" | "Crying" | "Coughing" | "Sneezing" | "Applause"
+            "Laughing"
+                | "Crying"
+                | "Coughing"
+                | "Sneezing"
+                | "Applause"
+                | "Happy tone"
+                | "Sad tone"
+                | "Angry tone"
+                | "Fearful tone"
+                | "Disgusted tone"
+                | "Surprised tone"
         )
     });
     Ok(cues)
@@ -123,6 +133,12 @@ fn tags(raw: &str, start_ms: u64, end_ms: u64) -> Vec<Cue> {
         };
         rest = next;
         let label = match tag {
+            "HAPPY" => "Happy tone",
+            "SAD" => "Sad tone",
+            "ANGRY" => "Angry tone",
+            "FEARFUL" => "Fearful tone",
+            "DISGUSTED" => "Disgusted tone",
+            "SURPRISED" => "Surprised tone",
             "Laughter" => "Laughing",
             "Cry" => "Crying",
             "Cough" => "Coughing",
@@ -357,21 +373,21 @@ pub fn apply(rows: &mut Vec<Row>, annotation: &Row) {
 mod tests {
     use super::*;
     #[test]
-    fn saved_tone_labels_are_discarded_but_sound_cues_survive() {
+    fn supported_tone_and_sound_labels_survive_loading() {
         let mut row: crate::calls::Row = serde_json::from_value(serde_json::json!({
             "start_ms": 0, "end_ms": 1000, "microphone": false,
             "speakers": [], "discord": null, "text": "Hello",
             "cues": [
-                {"start_ms": 0, "end_ms": 1000, "label": "Possibly happy tone", "tentative": true},
+                {"start_ms": 0, "end_ms": 1000, "label": "Happy tone"},
                 {"start_ms": 0, "end_ms": 1000, "label": "Laughing", "tentative": false}
             ]
         }))
         .unwrap();
-        assert_eq!(row.cues.len(), 1);
-        assert_eq!(row.cues[0].label, "Laughing");
+        assert_eq!(row.cues.len(), 2);
+        assert_eq!(row.cues[0].label, "Happy tone");
         assert_eq!(row.text, "Hello");
         let saved = serde_json::to_string(&row).unwrap();
-        assert!(!saved.contains("tone"));
+        assert!(saved.contains("Happy tone"));
         assert!(!saved.contains("tentative"));
         row.cues.clear();
         let legacy = serde_json::to_value(&row).unwrap();
@@ -387,10 +403,18 @@ mod tests {
     fn only_protocol_tags_become_cues() {
         let raw = "<|en|><|HAPPY|><|Laughter|><|withitn|>Hello <|Cry|>";
         let cues = tags(raw, 100, 900);
-        assert_eq!(cues.len(), 1);
-        assert_eq!(cues[0].label, "Laughing");
-        assert!(tags("<|en|><|HAPPY|><|Speech|>Hello", 100, 900).is_empty());
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].label, "Happy tone");
+        assert_eq!(cues[1].label, "Laughing");
+        assert_eq!(
+            tags("<|en|><|HAPPY|><|Speech|>Hello", 100, 900)[0].label,
+            "Happy tone"
+        );
         assert!(tags("<|en|><|NEUTRAL|><|Speech|>Hello", 0, 10).is_empty());
+        assert_eq!(
+            tags("<|en|><|EMO_UNKNOWN|><|Laughter|><|withitn|>Hi", 0, 10)[0].label,
+            "Laughing"
+        );
         assert!(tags("Words <|Laughter|>", 0, 10).is_empty());
     }
     #[test]

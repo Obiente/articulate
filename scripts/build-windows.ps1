@@ -12,9 +12,12 @@ try {
 try {
 
     # Cargo embeds this output. Always rebuild it so the executable cannot ship stale UI.
-    if (!(Get-Command node -ErrorAction SilentlyContinue) -or !(Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
+    $node = Get-Command node.exe -ErrorAction SilentlyContinue
+    if (!$node -or !(Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
         throw 'Install Node.js 22 LTS or newer (including npm), then reopen your terminal.'
     }
+    $nodeBin = Split-Path $node.Source -Parent
+    $env:PATH = "$nodeBin;$env:PATH"
     & npm.cmd --prefix ui ci --no-audit --no-fund
     if ($LASTEXITCODE -ne 0) { throw 'Frontend dependency installation failed. Close the Vite preview server if Windows reports a file in use, then retry.' }
     if ($Check) {
@@ -57,6 +60,7 @@ try {
     if (!$vs) { throw 'Install Visual Studio Build Tools with Desktop development with C++' }
     Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
     Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+    $env:PATH = "$nodeBin;$env:PATH"
     & (Join-Path $PSScriptRoot 'build-discord-native.ps1')
     if ($LASTEXITCODE -ne 0 -or !$env:ARTICULATE_NATIVE_AUDIO_DIR) { throw 'Native Discord adapter build failed' }
 

@@ -40,7 +40,14 @@ pub(crate) enum Action {
         text: String,
         correction: Option<super::transcript_editor::Spelling>,
     },
-    CallStart,
+    CallStart {
+        #[serde(default)]
+        source: CallSource,
+        #[serde(default)]
+        language_preference: Option<String>,
+        #[serde(default)]
+        audio_context: Option<bool>,
+    },
     CallStop,
     Copy {
         text: String,
@@ -107,6 +114,7 @@ pub(crate) enum Action {
     CleanupDownloadCancel,
     ContextDownload,
     SpeakersDownload,
+    VerifierDownload,
     DiscordConnect {
         companion: bool,
     },
@@ -119,6 +127,14 @@ pub(crate) enum Action {
     UpdateCheck,
     UpdateDownload,
     UpdateInstall,
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CallSource {
+    #[default]
+    System,
+    Discord,
 }
 
 enum Request {
@@ -285,11 +301,12 @@ fn export_text(text: &str, extension: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn rows(rows: &[calls::Row], names: &[String; 4]) -> Vec<Value> {
+fn rows(rows: &[calls::Row], names: &[String]) -> Vec<Value> {
     rows.iter()
         .map(|row| {
             json!({"start_ms": row.start_ms, "end_ms": row.end_ms,
-        "speaker": calls::label(row, names), "text": row.text, "cues": row.cues, "provisional": false})
+        "speaker": calls::label(row, names), "speaker_labels": calls::speaker_labels(row, names),
+        "text": row.text, "cues": row.cues, "provisional": false})
         })
         .collect()
 }
@@ -375,6 +392,8 @@ impl App {
             "ready":self.ready,"loading":self.loading,"busy":self.busy,"status":self.status,
             "overlay":{"visible":overlay_visible,"recording":overlay_recording,"finishing":overlay_finishing,"message":overlay_message},
             "recording":self.recording.is_some(),"call_recording":self.call.is_some() && !note_capture,"call_status":self.call_status,
+            "call_cues_enabled":self.call_cues_enabled && self.history.call.as_ref().is_some_and(|session| session.kind == crate::history::Kind::Call),
+            "call_cues_status":if self.call_cues_enabled && self.history.call.as_ref().is_some_and(|session| session.kind == crate::history::Kind::Call) {self.context_status.as_str()} else {""},
             "seconds":self.recording.as_ref().map(|r|r.seconds() as u64).or_else(||self.call.as_ref().map(|c|c.end_seconds() as u64)).unwrap_or(self.last_seconds),
             "text":self.text,"original":self.raw,"call_rows":if note_capture {Vec::new()}else{call_rows},
             "history":self.history.items.iter().map(|s|json!({"id":s.id,"title":s.title,"kind":s.kind,"created_ms":s.created_ms,"updated_ms":s.updated_ms,"preview":s.preview,"duration_ms":s.duration_ms,"topic_id":s.topic_id,"is_collection":s.is_collection,"can_receive_sources":s.can_receive_sources})).collect::<Vec<_>>(),
@@ -410,6 +429,8 @@ impl App {
             "speakers_installed":crate::speakers::path().is_file(),"speakers_working":self.speakers_downloading.is_some(),
             "context_installed":crate::sensevoice::installed(),"context_progress":self.context_progress,"context_status":self.context_status,"context_supported":cfg!(all(windows, target_arch="x86_64")),
             "speakers_progress":self.speakers_downloading,"speakers_status":self.speakers_download_status,
+            "verifier_installed":model::verifier_path().is_file(),"verifier_working":self.verifier_downloading.is_some(),
+            "verifier_progress":self.verifier_downloading,"verifier_status":self.verifier_download_status,
             "cleanup_installed":cleanup["installed"],"cleanup_working":cleanup["working"],"cleanup_status":cleanup["status"],"cleanup_progress":cleanup["progress"]});
         snapshot["discord"] = self.desktop_discord_status();
         snapshot["capture_feedback"] = json!(self.capture_feedback);
@@ -615,9 +636,28 @@ impl App {
                 }
                 self.cancel_dictation();
             }
-            CallStart => {
+            CallStart {
+                source,
+                language_preference,
+                audio_context,
+            } => {
                 self.desktop_capture_idle()?;
-                if !self.start_call_capture() {
+                if language_preference.as_ref().is_some_and(|language| {
+                    !self
+                        .speech_languages
+                        .iter()
+                        .any(|supported| supported == language)
+                }) {
+                    return Err("Choose a supported call language preference.".into());
+                }
+                if audio_context == Some(true) && !crate::sensevoice::installed() {
+                    return Err("Install sound and tone cues in Settings first.".into());
+                }
+                if !self.start_manual_call_capture(
+                    matches!(source, CallSource::Discord),
+                    language_preference,
+                    audio_context,
+                ) {
                     return Err(self.call_status.clone());
                 }
             }
@@ -937,6 +977,7 @@ impl App {
             CleanupDownloadCancel => self.desktop_cleanup_cancel(),
             ContextDownload => self.desktop_context_download()?,
             SpeakersDownload => self.desktop_speakers_download()?,
+            VerifierDownload => self.desktop_verifier_download()?,
             DiscordConnect { companion } => self.desktop_discord_connect(companion)?,
             DiscordDisconnect => self.desktop_discord_disconnect()?,
             DiscordRetry => self.desktop_discord_retry()?,
@@ -1032,6 +1073,40 @@ impl App {
         Ok(())
     }
 
+    fn desktop_verifier_download(&mut self) -> Result<(), String> {
+        if self.verifier_downloading.is_some()
+            || self.call.is_some()
+            || self.recording.is_some()
+            || self.busy
+            || self.loading
+        {
+            return Err("Finish the current recording or model download first.".into());
+        }
+        self.verifier_downloading = Some(0.0);
+        self.verifier_download_status = "Downloading second speech model…".into();
+        let sender = self.event_tx.clone();
+        std::thread::Builder::new()
+            .name("verifier-model-download".into())
+            .spawn(move || {
+                let mut last = Instant::now() - Duration::from_secs(1);
+                let result = model::download_verifier(|progress| {
+                    if last.elapsed() >= Duration::from_millis(100) {
+                        let _ = sender.send(Event::VerifierProgress(progress));
+                        last = Instant::now();
+                    }
+                });
+                let _ = sender.send(match result {
+                    Ok(_) => Event::VerifierDownloaded,
+                    Err(error) => Event::VerifierDownloadFailed(error.to_string()),
+                });
+            })
+            .map_err(|error| {
+                self.verifier_downloading = None;
+                error.to_string()
+            })?;
+        Ok(())
+    }
+
     fn desktop_capture_idle(&self) -> Result<(), String> {
         if !self.ready
             || self.loading
@@ -1039,6 +1114,7 @@ impl App {
             || self.recording.is_some()
             || self.call.is_some()
             || self.downloading.is_some()
+            || self.verifier_downloading.is_some()
             || self.preview_inflight
         {
             Err("Wait for the speech model and finish the current recording first.".into())

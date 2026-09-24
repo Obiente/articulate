@@ -11,6 +11,9 @@ use std::{
 pub const MAX_PACKET: usize = 64 + 5760 * 2 * 2;
 const MAX_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const LEASE: Duration = Duration::from_secs(2);
+// Allow a stalled renderer or local transport to resume without ending the
+// microphone recording. Audio remains disarmed until fresh controls arrive.
+const RECOVERY: Duration = Duration::from_secs(15);
 const MAX_RETIRED_PARTICIPANTS: usize = 512;
 
 pub struct Frame {
@@ -45,6 +48,9 @@ struct Active {
     queue: VecDeque<Frame>,
     bytes: usize,
     error: Option<&'static str>,
+    authorized: Option<Instant>,
+    armed: bool,
+    interrupted: bool,
 }
 #[derive(Default)]
 struct State {
@@ -163,6 +169,9 @@ impl Hub {
             queue: VecDeque::new(),
             bytes: 0,
             error: None,
+            authorized: Some(Instant::now()),
+            armed: true,
+            interrupted: false,
         });
         Ok(Capture {
             hub: self.clone(),
@@ -172,19 +181,35 @@ impl Hub {
     /// Only the loaded native adapter polls this authenticated control route.
     pub fn control(&self, observation: Option<&Observation>) -> serde_json::Value {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_poll = state.polled;
         state.polled = Some(Instant::now());
         let inactive = serde_json::json!({"version":1,"pcm_batch":true,"active":false,"capture_id":"0","channel_id":null,"participants":[]});
         let Some(active) = state.active.as_mut() else {
             return inactive;
         };
+        if active.authorized.is_none_or(|at| at.elapsed() > RECOVERY) {
+            active.error = Some("The native Discord audio adapter disconnected");
+            active.armed = false;
+            return inactive;
+        }
         let valid = observation.filter(|o| {
             usable(o)
                 && o.generation == active.observation_generation
                 && o.channel_id.as_deref() == Some(active.channel.as_str())
         });
         let Some(observation) = valid else {
-            active.error =
-                Some("Discord voice connection changed. Finish this capture and start a new one.");
+            // Missing or stale metadata is temporary. A verified different
+            // channel is permanent and must never inherit this capture.
+            if observation.is_some_and(usable) {
+                active.error = Some(
+                    "Discord voice connection changed. Finish this capture and start a new one.",
+                );
+            }
+            active.armed = false;
+            if !active.interrupted {
+                active.lost_packets = active.lost_packets.saturating_add(1);
+                active.interrupted = true;
+            }
             return inactive;
         };
         if active.error.is_some() {
@@ -222,6 +247,12 @@ impl Hub {
             .native_generations
             .retain(|id, _| names.contains_key(id) || active.retired.contains_key(id));
         active.participants = names;
+        if previous_poll.is_some_and(|at| at.elapsed() > LEASE) && !active.interrupted {
+            active.lost_packets = active.lost_packets.saturating_add(1);
+        }
+        active.authorized = Some(Instant::now());
+        active.armed = true;
+        active.interrupted = false;
         let mut ids: Vec<_> = active.participants.keys().map(u64::to_string).collect();
         ids.sort();
         serde_json::json!({"version":1,"pcm_batch":true,"active":true,"capture_id":active.id.to_string(),
@@ -246,6 +277,10 @@ impl Hub {
         ensure!(
             active.id == packet.capture,
             "Packet belongs to a different capture"
+        );
+        ensure!(
+            active.armed && active.authorized.is_some_and(|at| at.elapsed() <= LEASE),
+            "Native capture is awaiting fresh Discord membership"
         );
         ensure!(active.error.is_none(), "Native capture has stopped");
         let captured_at = received
@@ -345,10 +380,7 @@ impl Capture {
     }
     pub fn drain(&self) -> Result<Vec<Frame>> {
         let mut state = self.hub.0.lock().unwrap_or_else(|e| e.into_inner());
-        ensure!(
-            state.polled.is_some_and(|at| at.elapsed() <= LEASE),
-            "The native Discord audio adapter disconnected"
-        );
+        let polled = state.polled;
         let active = state
             .active
             .as_mut()
@@ -356,6 +388,19 @@ impl Capture {
         ensure!(active.id == self.id, "Native audio capture changed");
         if let Some(error) = active.error {
             anyhow::bail!(error);
+        }
+        ensure!(
+            active.authorized.is_some_and(|at| at.elapsed() <= RECOVERY)
+                && polled.is_some_and(|at| at.elapsed() <= RECOVERY),
+            "The native Discord audio adapter disconnected"
+        );
+        if (!polled.is_some_and(|at| at.elapsed() <= LEASE)
+            || !active.armed
+            || !active.authorized.is_some_and(|at| at.elapsed() <= LEASE))
+            && !active.interrupted
+        {
+            active.lost_packets = active.lost_packets.saturating_add(1);
+            active.interrupted = true;
         }
         active.bytes = 0;
         Ok(active.queue.drain(..).collect())
@@ -708,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn native_lease_expiry_still_stops_capture() {
+    fn native_lease_expiry_disarms_packets_but_allows_recovery() {
         let hub = Hub::default();
         let observation = observation();
         hub.control(Some(&observation));
@@ -719,6 +764,48 @@ mod tests {
             hub.receive(&packet(capture.id, 456, 1), 1000, Instant::now())
                 .is_err()
         );
+        assert!(capture.drain().unwrap().is_empty());
+        assert_eq!(capture.lost_packets(), 1);
+        hub.control(Some(&observation));
+        assert!(
+            hub.receive(&packet(capture.id, 456, 1), 1000, Instant::now())
+                .is_ok()
+        );
+        assert_eq!(capture.drain().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn missing_metadata_recovers_only_for_the_same_voice_session() {
+        let hub = Hub::default();
+        let observation = observation();
+        hub.control(Some(&observation));
+        let capture = hub.begin(&observation).unwrap();
+        assert!(!hub.control(None)["active"].as_bool().unwrap());
+        assert!(
+            hub.receive(&packet(capture.id, 456, 1), 1000, Instant::now())
+                .is_err()
+        );
+        assert!(capture.drain().unwrap().is_empty());
+        assert!(hub.control(Some(&observation))["active"].as_bool().unwrap());
+        assert!(
+            hub.receive(&packet(capture.id, 456, 1), 1000, Instant::now())
+                .is_ok()
+        );
+        let mut changed = observation.clone();
+        changed.generation += 1;
+        assert!(!hub.control(Some(&changed))["active"].as_bool().unwrap());
+        assert!(capture.drain().is_err());
+    }
+
+    #[test]
+    fn prolonged_adapter_outage_stops_capture() {
+        let hub = Hub::default();
+        let observation = observation();
+        hub.control(Some(&observation));
+        let capture = hub.begin(&observation).unwrap();
+        hub.0.lock().unwrap().active.as_mut().unwrap().authorized =
+            Instant::now().checked_sub(RECOVERY + Duration::from_millis(1));
+        assert!(!hub.control(Some(&observation))["active"].as_bool().unwrap());
         assert!(capture.drain().is_err());
     }
 

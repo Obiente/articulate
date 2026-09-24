@@ -87,6 +87,7 @@ pub(super) fn prepare(
                 end_ms: source.end_ms,
                 speaker: source.speaker.clone(),
                 text: source.text[range].to_owned(),
+                context: source.context.clone(),
             });
             ensure!(
                 prepared.segments.len() <= super::MAX_SEGMENTS,
@@ -124,7 +125,8 @@ pub(crate) fn locate(input: &Transcript, source: &Segment) -> Result<(usize, Ran
             && (range == (0..parent.text.len()) || sentences(&parent.text).contains(&range))
             && parent.start_ms == source.start_ms
             && parent.end_ms == source.end_ms
-            && parent.speaker == source.speaker,
+            && parent.speaker == source.speaker
+            && parent.context == source.context,
         "The source passage changed"
     );
     Ok((index, range))
@@ -146,6 +148,7 @@ mod tests {
                 end_ms: 9000,
                 speaker: Some("Alex".into()),
                 text: text.into(),
+                context: None,
             }],
         }
     }

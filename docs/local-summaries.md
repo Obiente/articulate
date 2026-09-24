@@ -76,6 +76,15 @@ or changes of plan can be missed.
 The application supplies each quotation directly from the transcript rather
 than trusting the model to reproduce it. Times always refer to the original
 speaker turn. A sentence excerpt does not receive an invented word-level time.
+For calls, the summary input also includes each turn's time span, speaker label,
+how that speaker was attributed (microphone, Discord context, diarization, or
+uncertain), whether another speaker overlapped, and any detected vocal tone or
+sound event with its bounded time span. A detected cue can also be supplied when
+the same turn has no recognized words. These cues are uncertain observations;
+the model is instructed to qualify relevant cues and not infer feelings,
+intent, decisions, or commitments from them. Source citations retain this
+context for validation. Older saved summaries remain readable against their
+original text and speaker sources until regenerated.
 Each generated result is checked against the transcript snapshot used for that
 request. The live transcript can continue growing while notes are prepared, so
 the current document may lag behind the latest speech. Sources describe that
@@ -88,9 +97,13 @@ they fit; longer turns are split at sentence boundaries. No words are silently
 discarded to fit a model window. Very long sentences or conversations that exceed
 the total limit produce a clear error and leave the source unchanged.
 
-Later sections can amend or withdraw earlier proposals. The model processes
-sections separately, so a document can contain earlier proposals that need review
-against later speech. It does not establish a final consensus across a meeting.
+After generating section notes, the model reviews the cited points together and
+selects a shorter set. This pass favors explicit final decisions, commitments,
+conditions, and later corrections. It can only keep or omit complete points with
+their existing citations; it cannot write new claims or sources. For very long
+conversations, selection is repeated in bounded batches. If consolidation fails,
+the original source-linked section notes are retained. The model can still miss
+a correction, so review consequential points against the later transcript.
 
 Text, source excerpts, and generated drafts are processed locally. The only
 network requests needed for this feature download the fixed public model and

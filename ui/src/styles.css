@@ -200,6 +200,33 @@ p {
 .topbar-right .mantine-Avatar-root {
   margin-left: 12px;
 }
+.update-notification-button {
+  position: relative;
+  margin-right: 10px;
+}
+.update-notification-count {
+  position: absolute;
+  top: -3px;
+  right: -5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #aee7d0;
+  color: #12231b;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+.update-notification-detail {
+  display: block;
+  max-width: 300px;
+  white-space: normal;
+  color: #a9b8ae;
+  font-size: 12px;
+  line-height: 1.45;
+}
 .main-content {
   flex: 1;
   overflow: auto;
@@ -640,6 +667,121 @@ p {
   align-items: center;
   margin-bottom: 30px;
 }
+.speaker-timeline {
+  padding: 16px 18px;
+  margin-bottom: 24px;
+  border: 1px solid #2a3e30;
+  border-radius: 14px;
+  background: #142019;
+}
+.speaker-timeline-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  color: #b3c9ba;
+  font-size: 11px;
+}
+.speaker-timeline-heading strong {
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.speaker-timeline-heading span {
+  color: #8eaa99;
+}
+.speaker-track {
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(66px, 100px) 1fr;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 4px;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.speaker-track:hover,
+.speaker-track.selected {
+  background: #203126;
+}
+.speaker-track:focus-visible {
+  outline: 2px solid #8cd69b;
+  outline-offset: 2px;
+}
+.speaker-track-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+}
+.speaker-track-line {
+  position: relative;
+  display: block;
+  height: 8px;
+  border-radius: 9px;
+  background: #2b3830;
+  overflow: hidden;
+}
+.speaker-track-bar {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  min-width: 2px;
+  border-radius: inherit;
+}
+.speaker-tone-mint {
+  color: #80d796;
+}
+.speaker-tone-bg-mint {
+  background: #80d796;
+}
+.speaker-tone-blue {
+  color: #6cb9ec;
+}
+.speaker-tone-bg-blue {
+  background: #6cb9ec;
+}
+.speaker-tone-grape {
+  color: #bd92eb;
+}
+.speaker-tone-bg-grape {
+  background: #bd92eb;
+}
+.speaker-tone-orange {
+  color: #edb66c;
+}
+.speaker-tone-bg-orange {
+  background: #edb66c;
+}
+.speaker-tone-pink {
+  color: #ed91b7;
+}
+.speaker-tone-bg-pink {
+  background: #ed91b7;
+}
+.speaker-tone-teal {
+  color: #73d4c0;
+}
+.speaker-tone-bg-teal {
+  background: #73d4c0;
+}
+.speaker-tone-yellow {
+  color: #dbd17a;
+}
+.speaker-tone-bg-yellow {
+  background: #dbd17a;
+}
+.speaker-tone-indigo {
+  color: #9ba7ec;
+}
+.speaker-tone-bg-indigo {
+  background: #9ba7ec;
+}
 .transcript-tools > .mantine-TextInput-root {
   flex: 1;
   max-width: 360px;
@@ -1051,6 +1193,84 @@ p {
   border: 1px solid #355343;
   border-radius: 16px;
   background: linear-gradient(115deg, #20382c, #17251e);
+}
+.conversation-capture {
+  background: linear-gradient(115deg, #20382c, #1b2823 70%, #222c30);
+}
+.call-setup-intro {
+  color: #bac7ba;
+  font-size: 14px;
+  line-height: 1.6;
+  margin: 0 0 18px;
+}
+.call-source-options {
+  display: grid;
+  gap: 10px;
+}
+.call-source-option {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  padding: 16px;
+  text-align: left;
+  color: #d9e5da;
+  background: #17221b;
+  border: 1px solid #304238;
+  border-radius: 13px;
+  cursor: pointer;
+  transition:
+    border-color 180ms ease,
+    background 180ms ease,
+    transform 180ms ease;
+}
+.call-source-option:hover:not(:disabled),
+.call-source-option:focus-visible {
+  border-color: #76b389;
+  transform: translateY(-1px);
+}
+.call-source-option.selected {
+  border-color: #8cc79b;
+  background: #20382b;
+}
+.call-source-option:disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
+}
+.call-source-option > svg {
+  flex: 0 0 auto;
+  color: #a4d5ad;
+}
+.call-source-option > span:nth-child(2) {
+  display: grid;
+  gap: 5px;
+  flex: 1;
+}
+.call-source-option strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+.call-source-option small {
+  color: #aab8aa;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.call-source-radio {
+  width: 17px;
+  height: 17px;
+  border: 1px solid #6c8173;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.call-source-option.selected .call-source-radio {
+  border: 5px solid #a4d5ad;
+  background: #20382b;
+}
+.call-setup-device {
+  color: #aab8aa;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 15px 0 0;
 }
 .thought-capture-icon {
   display: grid;

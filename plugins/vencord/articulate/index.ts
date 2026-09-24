@@ -19,21 +19,25 @@ function audioStatus(): string {
     } catch { return "preload-unavailable"; }
 }
 
-interface Store { addChangeListener(callback: () => void): void; removeChangeListener(callback: () => void): void; }
 interface VoiceState { userId: string; }
-const selected = findStoreLazy("SelectedChannelStore") as Store & { getVoiceChannelId(): string | null; };
-const voices = findStoreLazy("VoiceStateStore") as Store & { getVoiceStatesForChannel(id: string): Record<string, VoiceState>; };
-const speaking = findStoreLazy("SpeakingStore") as Store & { isSpeaking(id: string): boolean; };
-const users = findStoreLazy("UserStore") as Store & { getCurrentUser(): { id: string; }; getUser(id: string): { globalName?: string; username: string; avatar?: string | null; } | undefined; };
-const members = findStoreLazy("GuildMemberStore") as Store & { getMember(guild: string, id: string): { nick?: string; } | undefined; };
-const channels = findStoreLazy("ChannelStore") as Store & { getChannel(id: string): { guild_id?: string; } | undefined; };
+const selected = findStoreLazy("SelectedChannelStore") as { getVoiceChannelId(): string | null; };
+const voices = findStoreLazy("VoiceStateStore") as { getVoiceStatesForChannel(id: string): Record<string, VoiceState>; };
+const speaking = findStoreLazy("SpeakingStore") as { isSpeaking(id: string): boolean; };
+const users = findStoreLazy("UserStore") as { getCurrentUser(): { id: string; }; getUser(id: string): { globalName?: string; username: string; avatar?: string | null; } | undefined; };
+const members = findStoreLazy("GuildMemberStore") as { getMember(guild: string, id: string): { nick?: string; } | undefined; };
+const channels = findStoreLazy("ChannelStore") as { getChannel(id: string): { guild_id?: string; } | undefined; };
 let timer: ReturnType<typeof setInterval> | undefined;
 let active = false;
 let pending = false;
 let last = 0;
 let pairingKey = "";
 let nextPairingCheck = 0;
-const subscribed: Store[] = [];
+let lastHealth = "";
+function health(state: string) {
+    if (state === lastHealth) return;
+    lastHealth = state;
+    if (state !== "connected") console.warn(`[Articulate companion] ${state}`);
+}
 
 async function sample() {
     if (!active) { nativeAudio()?.disable(); return; }
@@ -45,7 +49,11 @@ async function sample() {
             nextPairingCheck = Date.now() + 3000;
             pairingKey = await Native.getPairingKey();
         }
-        if (!active || !/^[a-f0-9]{64}$/i.test(pairingKey)) { nativeAudio()?.disable(); return; }
+        if (!active || !/^[a-f0-9]{64}$/i.test(pairingKey)) {
+            health("Pairing key unavailable");
+            nativeAudio()?.disable();
+            return;
+        }
         nativeAudio()?.enable(pairingKey);
         let snapshot;
         try {
@@ -65,11 +73,17 @@ async function sample() {
             });
             snapshot = { version: 1, observed_ms: Date.now(), channel_id: channelId, participants, valid: true };
         } catch {
+            health("Discord voice stores unavailable");
             snapshot = { version: 1, observed_ms: Date.now(), channel_id: null, participants: [], valid: false };
         }
-        await Native.publish(pairingKey, JSON.stringify({ ...snapshot, ...revisionFields, audio_status: audioStatus() }));
+        if (await Native.publish(pairingKey, JSON.stringify({ ...snapshot, ...revisionFields, audio_status: audioStatus() }))) {
+            if (snapshot.valid) health("connected");
+        } else {
+            health("Local connection unavailable");
+        }
     }
     catch {
+        health("Companion bridge unavailable");
         pairingKey = "";
         nativeAudio()?.disable();
         // Articulate may be closed. Never log keys or voice metadata.
@@ -84,17 +98,10 @@ export default definePlugin({
     start() {
         active = true;
         nextPairingCheck = 0;
-        try {
-            for (const store of [selected, voices, speaking]) {
-                store.addChangeListener(sample);
-                subscribed.push(store);
-            }
-            timer = setInterval(sample, 150);
-            void sample();
-        } catch {
-            active = false;
-            for (const store of subscribed.splice(0)) store.removeChangeListener(sample);
-        }
+        // Store listener APIs change between Discord builds. Sampling already
+        // runs frequently, so a missing listener must never disable pairing.
+        timer = setInterval(sample, 150);
+        void sample();
     },
     stop() {
         active = false;
@@ -102,6 +109,5 @@ export default definePlugin({
         nativeAudio()?.disable();
         clearInterval(timer);
         timer = undefined;
-        for (const store of subscribed.splice(0)) store.removeChangeListener(sample);
     }
 });

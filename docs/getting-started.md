@@ -16,11 +16,11 @@ your words become a notes document and are filed by topic. Each recording stays
 separate and can be moved between notes from the **Dictations** tab. Topic notes
 combine their recordings while preserving handwritten text.
 
-Use headphones. In Notetaker, choose **Record a conversation** to open audio setup and select your microphone. With the Vencord companion selected, wait for its separate-audio connection before starting. Each received participant stream carries its own identity, including when people speak at the same time. The native adapter remains experimental; live behavior still needs validation on supported Discord builds. If the audio connection is unavailable, Articulate asks you to connect it instead of silently switching to mixed capture.
+Use headphones. In **Conversations**, choose **Record a conversation** to open audio setup. The default captures your microphone and the system output used by a meeting in any app. For separate Discord participant tracks, select the Vencord companion and wait for its audio connection before starting. Each received participant stream carries its own identity, including when people speak at the same time. The native adapter remains experimental; live behavior still needs validation on supported Discord builds. If its audio connection is unavailable, Articulate asks you to connect it before using that source.
 
-The trailing transcript revises as more context arrives. Finish capture to process remaining audio. Open **Notes** for one editable document. Download the optional local notes model to have important information added during the call; use **Live updates** to pause and **Transcript sources** to review excerpts. Updates use committed speech, require 40 new words during capture, and wait at least 45 seconds between attempts. Remaining speech can update the document after finishing. The Notetaker hub lets you revisit saved conversations. Its active-conversation card returns to a capture without restarting it.
+The trailing transcript revises as more context arrives. Finish capture to process remaining audio. Open **Notes** for one editable document. Download the optional local notes model to have important information added during the call; use **Live updates** to pause and **Transcript sources** to review excerpts. Updates use committed speech, require 40 new words during capture, and wait at least 45 seconds between attempts. Remaining speech can update the document after finishing. **Conversations** lets you revisit saved calls and return to an active capture without restarting it.
 
-For other calls, use mixed output capture and choose the output device used by your call. Download the speaker model when activity-based names are unavailable. This output includes every app playing on that device and cannot reliably separate simultaneous voices. The optional [debugger connection](discord-integration.md) provides activity-based names only. See the [Vencord companion setup](vencord.md) for separate Discord audio. Relaunching Discord disconnects an active voice call, so rejoin afterward.
+System output capture includes every app playing on that device and cannot reliably separate simultaneous voices. Download the speaker model when activity-based names are unavailable. The optional [debugger connection](discord-integration.md) provides activity-based names only. See the [Vencord companion setup](vencord.md) for separate Discord audio. Relaunching Discord disconnects an active voice call, so rejoin afterward.
 
 ## Corrections and shortcuts
 
@@ -54,18 +54,19 @@ editor does not change the automatic cleanup into model-based rewriting.
 ## Transcription language
 
 In **Settings > Audio > Transcription language**, choose **English** for English
-dictation and calls. The choice is passed to the speech model for every passage,
-including live revisions and spoken notes. **Auto-detect** remains available for
-multilingual recordings. Changing language reloads the speech model and applies
-to new audio, not old transcripts. Language selection reduces unintended language
-switching; it does not guarantee that quiet sounds will never be misrecognized.
+dictation and spoken notes, or **Auto-detect** for multilingual speech. Calls
+keep automatic language detection so speakers can switch languages. Choose a
+preference in the setup for an individual call to help resolve ambiguous short
+words; automatic call capture inherits the saved preference. Language selection
+does not guarantee that quiet sounds will never be misrecognized.
 
 ## Sound cues
 
 Under **Settings > Audio context**, download SenseVoice (259 MB), then enable
-**Include sound cues** for new calls and spoken notes. Qwen continues to supply
-the transcript words; SenseVoice adds separate speaker-linked labels for laughter,
-crying, coughing, sneezing and applause. The current runtime supports 64-bit Windows.
+**Include sound and tone cues** for new calls and spoken notes. Qwen continues to
+supply the transcript words; SenseVoice adds separate speaker-linked labels for
+laughter, crying, coughing, sneezing, applause, and possible non-neutral vocal
+tone. Some passages have no cue. The current runtime supports 64-bit Windows.
 
 The times shown cover the analyzed passage (up to eight seconds), not an exact
 event onset. Detection can miss reactions or label them incorrectly.
@@ -78,6 +79,6 @@ analysis. Downloaded model and runtime files are checksum verified.
 
 ## Updates and removal
 
-Settings > Updates & about checks GitHub only when requested. Finish recording before installing. Pending history saves must complete before the installer opens. Retry failed saves before updating.
+Articulate checks GitHub on launch and once a day while open, with update notices throughout the workspace. Downloads and installation remain explicit. Finish recording before installing. Pending history saves must complete before the installer opens. Retry failed saves before updating.
 
 Updates preserve models, vocabulary, settings and History. Uninstall removes the application but keeps `%LOCALAPPDATA%\TranscribeLocal`. Remove that folder separately only if you intend to delete all local Articulate data.

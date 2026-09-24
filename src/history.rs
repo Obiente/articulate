@@ -49,7 +49,7 @@ pub struct Session {
     /// Recoverable audio interruptions reported by this call's capture worker.
     #[serde(default)]
     pub audio_packets_lost: u64,
-    pub speaker_names: [String; 4],
+    pub speaker_names: Vec<String>,
     pub notes: Option<Notes>,
     /// Personal writing is independent of source-quoted highlights.
     #[serde(default)]
@@ -104,7 +104,7 @@ impl Session {
             original: String::new(),
             rows: Vec::new(),
             audio_packets_lost: 0,
-            speaker_names: Default::default(),
+            speaker_names: crate::calls::empty_speaker_names(),
             notes: None,
             personal_notes: String::new(),
             metrics: Default::default(),
@@ -760,7 +760,8 @@ fn validate(session: &Session) -> Result<()> {
         "Transcript exceeds history size limit"
     );
     ensure!(
-        session.speaker_names.iter().all(|name| name.len() <= 512),
+        session.speaker_names.len() <= 8
+            && session.speaker_names.iter().all(|name| name.len() <= 512),
         "Speaker name exceeds size limit"
     );
     let mut text_bytes = session
@@ -1593,6 +1594,7 @@ mod tests {
                     end_ms: 0,
                     speaker: None,
                     excerpt: source.text.clone(),
+                    context: None,
                 }],
             })
             .collect();
@@ -1646,6 +1648,30 @@ mod tests {
         session.speaker_names[0] = "Élodie".into();
         session.notes = Some(Notes::build(&session.rows));
         session
+    }
+
+    #[test]
+    fn four_name_sessions_load_without_losing_speaker_identity() {
+        let session = meeting();
+        let mut saved = serde_json::to_value(&session).unwrap();
+        saved["speaker_names"] = serde_json::json!(["Élodie", "", "", ""]);
+        let restored: Session = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.speaker_names.len(), 4);
+        assert_eq!(
+            crate::calls::label(&restored.rows[0], &restored.speaker_names),
+            "Élodie"
+        );
+        assert_eq!(
+            crate::calls::label(
+                &crate::calls::Row {
+                    speakers: vec![8],
+                    discord: None,
+                    ..restored.rows[0].clone()
+                },
+                &restored.speaker_names
+            ),
+            "Speaker 8"
+        );
     }
 
     #[test]

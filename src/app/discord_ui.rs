@@ -743,19 +743,23 @@ impl App {
     }
 
     fn companion_auto_update(&mut self) {
-        if !self.settings.vencord_auto_update
-            || self.settings.vencord_source.trim().is_empty()
-            || self.discord_launch.companion.pending.is_some()
+        if self.discord_launch.companion.pending.is_some()
             || self.discord_launch.companion.error.is_some()
         {
             return;
         }
         if !self.discord_launch.companion.checked {
+            let source = self.settings.vencord_source.trim();
+            if source.is_empty() && !self.settings.discord_companion {
+                return;
+            }
             self.discord_launch.companion.checked = true;
-            self.companion_work(CompanionAction::Detect(Some(PathBuf::from(
-                self.settings.vencord_source.trim(),
-            ))));
-        } else if let Some(plan) = &self.discord_launch.companion.plan
+            self.companion_work(CompanionAction::Detect(
+                (!source.is_empty()).then(|| PathBuf::from(source)),
+            ));
+        } else if self.settings.vencord_auto_update
+            && !self.settings.vencord_source.trim().is_empty()
+            && let Some(plan) = &self.discord_launch.companion.plan
             && plan.status == PluginStatus::UpdateAvailable
             && plan.can_build
         {
@@ -1324,6 +1328,17 @@ mod tests {
                 "Unapproved or unready update must not start"
             );
         }
+    }
+
+    #[test]
+    fn companion_update_is_detected_without_enabling_automatic_installation() {
+        let (mut app, _) = super::super::tests::app();
+        app.settings.discord_companion = true;
+        app.settings.vencord_source = "synthetic-source".into();
+        app.settings.vencord_auto_update = false;
+        app.companion_auto_update();
+        assert!(app.discord_launch.companion.checked);
+        assert!(app.discord_launch.companion.pending.is_some());
     }
 
     #[test]

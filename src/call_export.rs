@@ -13,7 +13,7 @@ pub enum Format {
 
 /// Export a snapshot. Empty rows are omitted; subtitle formats additionally
 /// omit invalid/zero-duration ranges because they cannot form valid cues.
-pub fn export(rows: &[Row], names: &[String; 4], format: Format) -> String {
+pub fn export(rows: &[Row], names: &[String], format: Format) -> String {
     let mut rows: Vec<_> = rows
         .iter()
         .filter(|r| !r.text.trim().is_empty() || !r.cues.is_empty())
@@ -141,7 +141,7 @@ mod tests {
             row(3_601_234, 3_605_678, &[2], "Second"),
             row(3_600_123, 3_604_567, &[1], "First"),
         ];
-        let output = export(&rows, &Default::default(), Format::Srt);
+        let output = export(&rows, &[], Format::Srt);
         assert_eq!(
             output,
             "1\n01:00:00,123 --> 01:00:04,567\nSpeaker 1: First\n\n2\n01:00:01,234 --> 01:00:05,678\nSpeaker 2: Second\n\n"
@@ -188,16 +188,13 @@ mod tests {
             row(20, 30, &[1], "  "),
             row(40, 50, &[1], "Valid"),
         ];
-        let output = export(&rows, &Default::default(), Format::Srt);
+        let output = export(&rows, &[], Format::Srt);
         assert_eq!(
             output,
             "1\n00:00:00,040 --> 00:00:00,050\nSpeaker 1: Valid\n\n"
         );
-        assert!(export(&rows, &Default::default(), Format::Text).contains("No duration"));
-        assert_eq!(
-            export(&[], &Default::default(), Format::WebVtt),
-            "WEBVTT\n\n"
-        );
+        assert!(export(&rows, &[], Format::Text).contains("No duration"));
+        assert_eq!(export(&[], &[], Format::WebVtt), "WEBVTT\n\n");
     }
 
     #[test]

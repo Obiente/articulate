@@ -555,6 +555,7 @@ mod tests {
                 end_ms: 30000,
                 speaker: None,
                 text: input.into(),
+                context: None,
             }],
         };
         let started = Instant::now();
