@@ -1,4 +1,16 @@
 fn main() {
+    println!("cargo:rerun-if-changed=assets/update-signing.pub");
+    let key =
+        std::fs::read_to_string("assets/update-signing.pub").expect("Missing update public key");
+    if std::env::var_os("CARGO_FEATURE_SIGNED_UPDATES").is_some()
+        && std::env::var("PROFILE").as_deref() == Ok("release")
+    {
+        assert!(
+            key.trim().len() == 64 && key.trim().bytes().all(|b| b.is_ascii_hexdigit()),
+            "Provision assets/update-signing.pub before building a release"
+        );
+    }
+
     tauri_build::build();
     println!("cargo:rerun-if-env-changed=ARTICULATE_NATIVE_AUDIO_DIR");
     let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());

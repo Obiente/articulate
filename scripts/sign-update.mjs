@@ -1,0 +1,14 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+const version = process.argv[2];
+if (!/^\d+\.\d+\.\d+$/.test(version)) throw Error('Expected stable release version');
+const key = crypto.createPrivateKey(process.env.UPDATE_SIGNING_KEY || '');
+if (key.asymmetricKeyType !== 'ed25519') throw Error('Expected Ed25519 private key');
+const publicHex = crypto.createPublicKey(key).export({format:'der',type:'spki'}).subarray(-32).toString('hex');
+if (fs.readFileSync('assets/update-signing.pub','utf8').trim() !== publicHex) throw Error('Signing key differs from embedded public key');
+const asset = `Articulate-${version}-windows-x86_64-setup.exe`;
+const bytes = fs.readFileSync(path.join('dist',asset));
+const manifest = Buffer.from(JSON.stringify({version,asset,size:bytes.length,sha256:crypto.createHash('sha256').update(bytes).digest('hex')}));
+fs.writeFileSync('dist/update-manifest.json',manifest);
+fs.writeFileSync('dist/update-manifest.sig',crypto.sign(null,manifest,key).toString('hex')+'\n');

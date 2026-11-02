@@ -46,12 +46,25 @@ pub struct InstallRequest {
     path: PathBuf,
     size: u64,
     digest: [u8; 32],
+    manifest: Vec<u8>,
+    signature: Vec<u8>,
 }
 
 impl InstallRequest {
     /// Call only after capture has stopped and durable application state is saved.
     /// Recheck the downloaded bytes immediately before running the installer.
     pub fn launch(&self) -> Result<()> {
+        verify_manifest(
+            &self.manifest,
+            &self.signature,
+            &self.version,
+            self.path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .context("Invalid installer name")?,
+            self.size,
+            &self.digest,
+        )?;
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -355,6 +368,23 @@ fn permitted_redirect(url: &str, original: &str) -> bool {
 }
 
 fn download_release(release: &Release, mut progress: impl FnMut(f32)) -> Result<InstallRequest> {
+    let base = format!("{RELEASES}/download/v{}", release.version);
+    let (manifest, signature) = if cfg!(feature = "signed-updates") {
+        (
+            fetch_metadata(&format!("{base}/update-manifest.json"))?,
+            fetch_metadata(&format!("{base}/update-manifest.sig"))?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    verify_manifest(
+        &manifest,
+        &signature,
+        &release.version,
+        &release.name,
+        release.size,
+        &release.digest,
+    )?;
     let root = crate::model::data_dir().join("updates");
     fs::create_dir_all(&root).context("Could not create the update folder.")?;
     let unique = format!(
@@ -437,6 +467,8 @@ fn download_release(release: &Release, mut progress: impl FnMut(f32)) -> Result<
             path,
             size: release.size,
             digest: release.digest,
+            manifest,
+            signature,
         })
     })();
     if result.is_err() {
@@ -444,6 +476,92 @@ fn download_release(release: &Release, mut progress: impl FnMut(f32)) -> Result<
         let _ = fs::remove_dir(&directory);
     }
     result
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedManifest {
+    version: String,
+    asset: String,
+    size: u64,
+    sha256: String,
+}
+fn decode_hex<const N: usize>(value: &str) -> Result<[u8; N]> {
+    ensure!(
+        value.len() == N * 2 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid signing key or signature encoding"
+    );
+    let mut output = [0; N];
+    for (i, byte) in output.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)?;
+    }
+    Ok(output)
+}
+fn verify_signature(manifest: &[u8], signature: &[u8], public_key: &str) -> Result<()> {
+    ensure!(
+        manifest.len() <= 16384 && signature.len() <= 256,
+        "Update signing metadata is too large"
+    );
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&decode_hex::<32>(public_key.trim())?)?;
+    let signature = ed25519_dalek::Signature::from_bytes(&decode_hex::<64>(
+        std::str::from_utf8(signature)?.trim(),
+    )?);
+    key.verify_strict(manifest, &signature)
+        .context("The update signature is invalid")
+}
+fn verify_manifest(
+    manifest: &[u8],
+    signature: &[u8],
+    version: &str,
+    asset: &str,
+    size: u64,
+    digest: &[u8; 32],
+) -> Result<()> {
+    if !cfg!(feature = "signed-updates") {
+        return Ok(());
+    }
+    verify_signature(
+        manifest,
+        signature,
+        include_str!("../assets/update-signing.pub"),
+    )?;
+    let signed: SignedManifest = serde_json::from_slice(manifest)?;
+    ensure!(
+        signed.version == version
+            && signed.asset == asset
+            && signed.size == size
+            && decode_hex::<32>(&signed.sha256)? == *digest,
+        "The signed release manifest does not match the installer"
+    );
+    Ok(())
+}
+fn fetch_metadata(original: &str) -> Result<Vec<u8>> {
+    let mut url = original.to_owned();
+    for _ in 0..5 {
+        ensure!(
+            permitted_redirect(&url, original),
+            "Invalid signing metadata redirect"
+        );
+        let mut response = agent(30)
+            .get(&url)
+            .header("User-Agent", "Articulate")
+            .call()?;
+        if response.status().is_redirection() {
+            url = response
+                .headers()
+                .get("location")
+                .context("Missing signing metadata redirect")?
+                .to_str()?
+                .to_owned();
+        } else {
+            ensure!(
+                response.status().as_u16() == 200,
+                "Release signing metadata is missing"
+            );
+            return read_limited(response.body_mut().as_reader(), 16384);
+        }
+    }
+    anyhow::bail!("Too many signing metadata redirects")
 }
 
 fn verify_reader(reader: &mut impl Read, size: u64, digest: &[u8; 32]) -> Result<()> {
@@ -476,6 +594,24 @@ fn verify_reader(reader: &mut impl Read, size: u64, digest: &[u8; 32]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn signature_switch_preserves_legacy_updates_by_default() {
+        let result = verify_manifest(b"", b"", "1.0.0", "setup.exe", 42, &[0; 32]);
+        assert_eq!(result.is_err(), cfg!(feature = "signed-updates"));
+    }
+    #[test]
+    fn signatures_reject_tampering_missing_values_and_placeholder() {
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let manifest = b"synthetic release";
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let signature = hex(&key.sign(manifest).to_bytes());
+        let public = hex(&key.verifying_key().to_bytes());
+        assert!(verify_signature(manifest, signature.as_bytes(), &public).is_ok());
+        assert!(verify_signature(b"changed", signature.as_bytes(), &public).is_err());
+        assert!(verify_signature(manifest, b"", &public).is_err());
+        assert!(verify_signature(manifest, signature.as_bytes(), "PLACEHOLDER").is_err());
+    }
     #[test]
     #[ignore = "Downloads the latest public installer from GitHub; never launches it"]
     fn published_installer_download_passes_the_real_update_path() {
