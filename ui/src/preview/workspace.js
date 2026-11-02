@@ -5,11 +5,56 @@ import { previewSupports, savedPatchValue } from "../actions.js";
 import {
   sampleDictionary,
   sampleMacros,
+  samplePeople,
   sampleRecords,
   sampleSettings,
 } from "./fixtures.js";
 
 const storageKey = "articulate-ui-sample-workspace-v1";
+
+// Speaker labels the way the desktop app derives them.
+function defaultLabel(key, names = {}) {
+  if (names[key]) return names[key];
+  if (key === "you") return "You";
+  if (key === "other") return "Other audio";
+  if (key === "uncertain") return "Uncertain speaker";
+  const voice = /^s([1-8])$/.exec(key);
+  return voice ? `Speaker ${voice[1]}` : key;
+}
+
+function rowKeys(row) {
+  return row.speaker_keys?.length ? row.speaker_keys : [row.speaker];
+}
+
+function labelRows(record) {
+  const names = record.speaker_names || {};
+  return (record.rows || []).map((row) => {
+    const keys = rowKeys(row);
+    const labels = keys.map((key) => defaultLabel(key, names));
+    return {
+      cues: [],
+      provisional: false,
+      ...row,
+      speaker_keys: keys,
+      speaker_labels: labels,
+      speaker: labels.length > 1 ? `Overlap: ${labels.join(" + ")}` : labels[0],
+    };
+  });
+}
+
+function presented(record) {
+  if (!record) return record;
+  return {
+    ...record,
+    rows: labelRows(record),
+    speaker_undo: record.speaker_history?.at(-1)?.summary ?? null,
+    interruptions: record.interruptions ?? [],
+    transcript_versions: (record.transcript_versions ?? []).map(
+      (version, index) => ({ ...version, index }),
+    ),
+    audio: record.audio ?? null,
+  };
+}
 
 function sameRecord(left, right) {
   if (left === right) return true;
@@ -83,6 +128,25 @@ export function createPreviewWorkspace(storage) {
     microphones: ["Default microphone"],
     outputs: ["Default speakers"],
     insights: null,
+    people: saved?.people ?? structuredClone(samplePeople),
+    people_error: null,
+    audio_import: {
+      state: "idle",
+      dragging: false,
+      file_name: null,
+      progress: null,
+      stage: "",
+      message: "",
+      session_id: null,
+      rebuilding: null,
+      speakers_available: true,
+    },
+    playback: {
+      session_id: null,
+      playing: false,
+      position_ms: 0,
+      error: null,
+    },
     notes: {
       ready: false,
       working: false,
@@ -103,6 +167,7 @@ export function createPreviewWorkspace(storage) {
         dictionary: sample.dictionary,
         macros: sample.macros,
         settings: sample.settings,
+        people: sample.people,
         topic_examples_added: true,
       }),
     );
@@ -140,7 +205,8 @@ export function createPreviewWorkspace(storage) {
       history: records
         .map((item) => summary(withSources(item)))
         .sort((a, b) => b.created_ms - a.created_ms),
-      selected: withSources(records.find((s) => s.id === selected)) ?? null,
+      selected:
+        presented(withSources(records.find((s) => s.id === selected))) ?? null,
     });
   }
 
@@ -152,6 +218,51 @@ export function createPreviewWorkspace(storage) {
   }
 
   const record = (id) => records.find((s) => s.id === id);
+
+  // Speaker corrections on a sample conversation, with an undo stack.
+  function correct(action, summary, change) {
+    const document = record(action.id);
+    if (!document || document.kind !== "call" || !document.rows?.length)
+      throw Error("Only conversation transcripts have speakers to correct.");
+    const before = {
+      summary,
+      rows: structuredClone(document.rows),
+      speaker_names: { ...document.speaker_names },
+    };
+    change(document);
+    document.speaker_history = [
+      ...(document.speaker_history || []),
+      before,
+    ].slice(-20);
+    document.updated_ms = Date.now();
+  }
+  const labelOf = (document, key) =>
+    defaultLabel(key, document.speaker_names || {});
+  const rememberName = (name) => {
+    if (
+      !sample.people.some(
+        (person) => person.name.toLowerCase() === name.toLowerCase(),
+      )
+    )
+      sample.people = [
+        {
+          id: crypto.randomUUID(),
+          name,
+          source: "name",
+          discord_name: null,
+          avatar: null,
+          used_ms: Date.now(),
+        },
+        ...sample.people,
+      ];
+  };
+  let playbackTimer = null;
+  let importTimer = null;
+  const stopPlayback = () => {
+    clearInterval(playbackTimer);
+    playbackTimer = null;
+    sample.playback = { ...sample.playback, playing: false, session_id: null };
+  };
 
   const handlers = {
     history_open(action) {
@@ -359,6 +470,229 @@ export function createPreviewWorkspace(storage) {
     settings_patch(action) {
       const { type, ...patch } = action;
       sample.settings = { ...sample.settings, ...patch };
+    },
+    speaker_rename(action) {
+      const document = record(action.id);
+      const key = action.speaker;
+      if (["you", "other", "uncertain"].includes(key))
+        throw Error("This speaker cannot be renamed.");
+      const name = action.name.trim();
+      correct(
+        action,
+        `Renamed ${labelOf(document, key)} to ${name}`,
+        (target) => {
+          target.speaker_names = { ...target.speaker_names, [key]: name };
+        },
+      );
+      rememberName(name);
+    },
+    speaker_merge(action) {
+      const document = record(action.id);
+      if (action.from === action.into)
+        throw Error("Choose two different speakers to merge.");
+      correct(
+        action,
+        `Merged ${labelOf(document, action.from)} into ${labelOf(document, action.into)}`,
+        (target) => {
+          for (const row of target.rows)
+            row.speaker_keys = [
+              ...new Set(
+                rowKeys(row).map((key) =>
+                  key === action.from ? action.into : key,
+                ),
+              ),
+            ];
+        },
+      );
+    },
+    speaker_reassign(action) {
+      const document = record(action.id);
+      for (const { index, start_ms } of action.rows)
+        if (document?.rows?.[index]?.start_ms !== start_ms)
+          throw Error("The transcript changed. Select the turns again.");
+      let key = action.speaker;
+      if (action.name !== undefined) {
+        const name = action.name.trim();
+        const names = document.speaker_names || {};
+        key =
+          Object.keys(names).find(
+            (existing) => names[existing].toLowerCase() === name.toLowerCase(),
+          ) ?? `n:${crypto.randomUUID().slice(0, 8)}`;
+        document.speaker_names = { ...names, [key]: name };
+        rememberName(name);
+      }
+      const count = action.rows.length;
+      correct(
+        action,
+        `Assigned ${count} ${count === 1 ? "turn" : "turns"} to ${labelOf(document, key)}`,
+        (target) => {
+          for (const { index } of action.rows)
+            target.rows[index].speaker_keys = [key];
+        },
+      );
+    },
+    speaker_undo(action) {
+      const document = record(action.id);
+      const last = document?.speaker_history?.pop();
+      if (!last) throw Error("There is nothing to undo.");
+      document.rows = last.rows;
+      document.speaker_names = last.speaker_names;
+    },
+    person_save(action) {
+      const name = action.name.trim();
+      if (action.id) {
+        const person = sample.people.find((p) => p.id === action.id);
+        if (!person) throw Error("This person is no longer in the list.");
+        person.name = name;
+      } else {
+        if (
+          sample.people.some((p) => p.name.toLowerCase() === name.toLowerCase())
+        )
+          throw Error("That name is already in the list.");
+        rememberName(name);
+      }
+    },
+    person_delete(action) {
+      sample.people = sample.people.filter((p) => p.id !== action.id);
+    },
+    people_clear() {
+      sample.people = [];
+    },
+    audio_import_choose() {
+      sample.audio_import = {
+        ...sample.audio_import,
+        state: "ready",
+        file_name: "Team sync.m4a",
+        message: "",
+        session_id: null,
+      };
+    },
+    audio_import_start(action) {
+      if (sample.audio_import.state !== "ready")
+        throw Error("Choose an audio file to import.");
+      // Simulate the desktop import: progress, then a new saved document.
+      const id = crypto.randomUUID();
+      const name = sample.audio_import.file_name.replace(/\.[^.]+$/, "");
+      sample.audio_import = {
+        ...sample.audio_import,
+        state: "working",
+        stage: "Transcribing",
+        progress: 0,
+      };
+      clearInterval(importTimer);
+      importTimer = setInterval(() => {
+        const progress = Math.min(1, sample.audio_import.progress + 0.2);
+        if (progress < 1) {
+          sample.audio_import = { ...sample.audio_import, progress };
+        } else {
+          clearInterval(importTimer);
+          const call = action.kind === "call";
+          records = [
+            {
+              id,
+              title: name,
+              kind: action.kind,
+              created_ms: Date.now(),
+              updated_ms: Date.now(),
+              duration_ms: 118000,
+              text: call
+                ? ""
+                : "An imported thought about the release checklist.",
+              original: "",
+              personal_notes: "",
+              rows: call
+                ? structuredClone(
+                    sampleRecords.find((r) => r.id === "sample-call-1")?.rows ??
+                      [],
+                  )
+                : [],
+              speaker_names: {},
+              audio: action.keep_audio
+                ? {
+                    duration_ms: 118000,
+                    bytes: 1_900_000,
+                    channels: ["recording"],
+                    incomplete: false,
+                  }
+                : null,
+            },
+            ...records,
+          ];
+          persist();
+          sample.audio_import = {
+            ...sample.audio_import,
+            state: "done",
+            progress: null,
+            session_id: id,
+            message: "Import finished",
+          };
+        }
+        publish();
+      }, 400);
+    },
+    audio_import_cancel() {
+      clearInterval(importTimer);
+      sample.audio_import = {
+        ...sample.audio_import,
+        state: "failed",
+        progress: null,
+        message: "Import cancelled",
+      };
+    },
+    audio_import_dismiss() {
+      sample.audio_import = {
+        ...sample.audio_import,
+        state: "idle",
+        file_name: null,
+        message: "",
+        session_id: null,
+      };
+    },
+    audio_play(action) {
+      const document = record(action.id);
+      if (!document?.audio) throw Error("This recording has no kept audio.");
+      clearInterval(playbackTimer);
+      sample.playback = {
+        session_id: action.id,
+        playing: true,
+        position_ms: action.from_ms ?? 0,
+        error: null,
+      };
+      // Advance the sample position like a playing recording.
+      playbackTimer = setInterval(() => {
+        sample.playback = {
+          ...sample.playback,
+          position_ms: sample.playback.position_ms + 500,
+        };
+        if (sample.playback.position_ms >= document.audio.duration_ms)
+          stopPlayback();
+        publish();
+      }, 500);
+    },
+    audio_stop() {
+      stopPlayback();
+    },
+    audio_delete(action) {
+      const document = record(action.id);
+      if (sample.playback.session_id === action.id) stopPlayback();
+      if (document) document.audio = null;
+    },
+    transcript_rebuild() {
+      throw Error("Re-transcription runs in the desktop app.");
+    },
+    transcript_restore(action) {
+      const document = record(action.id);
+      const version = document?.transcript_versions?.[action.index];
+      if (!version) throw Error("That version is no longer available.");
+      document.transcript_versions.splice(action.index, 1, {
+        replaced_ms: Date.now(),
+        model: "",
+        text: document.text,
+        rows: document.rows,
+        preview: document.text.slice(0, 160),
+      });
+      document.text = version.text;
+      document.rows = version.rows;
     },
   };
 

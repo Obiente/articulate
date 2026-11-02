@@ -1,18 +1,20 @@
 // Synthetic documents for the browser preview. Never real user data.
 const now = Date.now();
 
+// Rows carry speaker keys; the workspace derives labels from the record's
+// `speaker_names`, as the desktop app does from session speaker names.
 export const sampleRows = [
   {
     start_ms: 12000,
     end_ms: 32000,
-    speaker: "Casey",
+    speaker_keys: ["s1"],
     text: "The new onboarding feels much clearer. I think we should keep the first step focused on getting a good microphone level.",
     provisional: false,
   },
   {
     start_ms: 33000,
     end_ms: 55000,
-    speaker: "Jordan",
+    speaker_keys: ["s2"],
     cues: [{ start_ms: 33000, end_ms: 38000, label: "Laughing" }],
     text: "Agreed. Once someone finishes their first recording, we can show them where their transcript is saved.",
     provisional: false,
@@ -20,16 +22,52 @@ export const sampleRows = [
   {
     start_ms: 56000,
     end_ms: 84000,
-    speaker: "You",
+    speaker_keys: ["you"],
     text: "I will update the checklist and share it before tomorrow. Let us keep the download step short and explain what happens next.",
     provisional: false,
   },
   {
     start_ms: 87000,
     end_ms: 104000,
-    speaker: "Casey",
+    speaker_keys: ["s1"],
     text: "Sounds good. We will try the revised flow with the team on Friday and use their feedback to decide what to change.",
     provisional: false,
+  },
+  {
+    start_ms: 106000,
+    end_ms: 118000,
+    speaker_keys: ["s3"],
+    text: "One more thing for Friday: let us bring the notes from today so nobody has to repeat the setup questions.",
+    provisional: false,
+  },
+];
+
+export const sampleSpeakerNames = { s1: "Casey", s2: "Jordan" };
+
+export const samplePeople = [
+  {
+    id: "sample-person-casey",
+    name: "Casey",
+    source: "name",
+    discord_name: null,
+    avatar: null,
+    used_ms: now - 3600000,
+  },
+  {
+    id: "sample-person-zoe",
+    name: "Zoë",
+    source: "discord",
+    discord_name: "zoe_designs",
+    avatar: null,
+    used_ms: now - 86400000,
+  },
+  {
+    id: "sample-person-morgan",
+    name: "Morgan",
+    source: "name",
+    discord_name: null,
+    avatar: null,
+    used_ms: now - 172800000,
   },
 ];
 
@@ -90,6 +128,24 @@ export const sampleRecords = [
     original: "",
     personal_notes: notes,
     rows: sampleRows,
+    speaker_names: sampleSpeakerNames,
+    interruptions: [
+      {
+        start_ms: 84500,
+        end_ms: 86500,
+        source: "microphone",
+        cause: "device_lost",
+        ongoing: false,
+        message: "Audio interrupted 01:24–01:26: microphone disconnected",
+      },
+    ],
+    audio: {
+      duration_ms: 384000,
+      bytes: 6_412_000,
+      channels: ["microphone", "call"],
+      incomplete: false,
+    },
+    transcript_versions: [],
   },
   {
     id: "sample-call-2",
@@ -178,5 +234,6 @@ export const sampleSettings = {
   discord_auto_transcribe: false,
   discord_companion: true,
   vencord_auto_update: false,
+  keep_call_audio: false,
   cpu: false,
 };

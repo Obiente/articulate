@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Alert, Button, Group, Modal, Text } from "@mantine/core";
 import { ShieldCheck } from "@phosphor-icons/react";
 import { Heading } from "../../components/Page.jsx";
+import { ConversationSettings } from "../calls/ConversationSettings.jsx";
 import { DiscordSettings } from "../discord/DiscordSettings.jsx";
 import { ModelSettings } from "../models/ModelSettings.jsx";
 import { UpdateSettings } from "../updates/UpdateSettings.jsx";
@@ -14,6 +15,7 @@ import { settingsControls } from "./controls.jsx";
 const sections = [
   ["dictation", "Dictation"],
   ["audio", "Audio"],
+  ["conversations", "Conversations"],
   ["discord", "Discord"],
   ["models", "Models"],
   ["updates", "Updates"],
@@ -81,6 +83,7 @@ export function SettingsPage({ state, act }) {
       </Group>
       <DictationSettings controls={controls} />
       <AudioSettings controls={controls} />
+      <ConversationSettings controls={controls} />
       <DiscordSettings controls={controls} />
       <ModelSettings controls={controls} />
       <UpdateSettings controls={controls} />

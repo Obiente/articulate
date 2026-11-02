@@ -35,6 +35,10 @@ import { useCloseHandshake } from "./hooks/useCloseHandshake.jsx";
 import { dictationShortcut } from "./lib/format.js";
 import { useCaptureNotices } from "./features/capture/useCaptureNotices.jsx";
 import { CallSetupDialog } from "./features/calls/CallSetupDialog.jsx";
+import {
+  DropOverlay,
+  ImportAudioDialog,
+} from "./features/calls/ImportAudio.jsx";
 import { DictationPage } from "./features/dictation/DictationPage.jsx";
 import { InsightsPage } from "./features/insights/InsightsPage.jsx";
 import { LibraryPage } from "./features/library/LibraryPage.jsx";
@@ -433,6 +437,7 @@ export function App() {
                     .catch(() => {})
                 }
                 start={() => setCallSetup(true)}
+                act={act}
               />
             ) : (
               <Reader
@@ -499,6 +504,9 @@ export function App() {
                       ? state.call_notes
                       : state.selected_notes
                 }
+                people={state.people}
+                playback={state.playback}
+                importState={state.audio_import}
               />
             )
           ) : page === "dictation" ? (
@@ -535,6 +543,8 @@ export function App() {
           setWorkspace("live");
         }}
       />
+      <ImportAudioDialog state={state} act={act} openSession={open} />
+      <DropOverlay dragging={state?.audio_import?.dragging} />
       {close.dialog}
     </div>
   );

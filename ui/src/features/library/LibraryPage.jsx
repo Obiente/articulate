@@ -23,6 +23,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { formatDate, formatDuration, shortcutLabel } from "../../lib/format.js";
+import { ImportAudioButton } from "../calls/ImportAudio.jsx";
 
 const iconFor = (kind) =>
   kind === "call" ? Headphones : kind === "note" ? Notebook : Microphone;
@@ -98,6 +99,7 @@ export function LibraryPage({
   newNote,
   start,
   speak,
+  act,
 }) {
   const [query, setQuery] = useState(""),
     [preview, setPreview] = useState(null);
@@ -128,6 +130,9 @@ export function LibraryPage({
           </p>
         </div>
         <Group gap={10}>
+          {mode === "call" && act && (
+            <ImportAudioButton act={act} disabled={captureBlocked} />
+          )}
           {mode === "note" && (
             <Button
               variant="default"

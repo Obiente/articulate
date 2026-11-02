@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActionIcon,
   Alert,
-  Avatar,
   Badge,
   Button,
   Divider,
@@ -32,9 +31,11 @@ import {
 import { countWords, formatDate, formatTime } from "../../lib/format.js";
 import { TranscriptEditor } from "../dictation/TranscriptEditor.jsx";
 import { SpeakerTimeline } from "../calls/SpeakerTimeline.jsx";
-import { TranscriptRows } from "../calls/TranscriptRows.jsx";
+import { CallTranscript } from "../calls/CallTranscript.jsx";
+import { RecordingPanel } from "../calls/RecordingPanel.jsx";
+import { SpeakerPanel } from "../calls/SpeakerPanel.jsx";
 import {
-  speakerColors,
+  rosterOf,
   speakersOf,
   speakerToneFor,
   transcriptText,
@@ -66,6 +67,9 @@ export function Reader({
   filingStatus,
   filingWorking,
   notesBusy,
+  people = NO_ROWS,
+  playback,
+  importState,
 }) {
   rows ??= NO_ROWS;
   const [tab, setTab] = useState("notes"),
@@ -94,13 +98,19 @@ export function Reader({
     [rows, session?.is_collection],
   );
   const speakerTone = useMemo(() => speakerToneFor(speakers), [speakers]);
+  const roster = useMemo(
+    () => (session?.is_collection ? NO_ROWS : rosterOf(rows)),
+    [rows, session?.is_collection],
+  );
   // The joined transcript is built only when copying or exporting.
   const hasTranscript = rows.length > 0 || Boolean(session?.text);
   const transcriptVisible = rows.length > 0 || Boolean(session?.text?.trim());
   const notes = session?.personal_notes || "";
   const hasContent = tab === "notes" ? Boolean(notes) : hasTranscript;
   const content = () =>
-    tab === "notes" ? notes : transcriptText(rows, session?.text || "");
+    tab === "notes"
+      ? notes
+      : transcriptText(rows, session?.text || "", session?.interruptions);
   const lastRow = rows.at(-1);
   const tail = `${rows.length}:${lastRow?.start_ms}:${lastRow?.speaker}:${lastRow?.text}`;
   useEffect(() => {
@@ -288,7 +298,7 @@ export function Reader({
           </Menu>
         </Group>
       </header>
-      {session?.audio_packets_lost > 0 && (
+      {session?.audio_packets_lost > 0 && !session?.interruptions?.length && (
         <Alert color="yellow" variant="light" role="status" my="sm">
           Call audio may have been interrupted. Review the transcript for gaps.
         </Alert>
@@ -460,11 +470,18 @@ export function Reader({
                 </p>
               )}
               {rows.length ? (
-                <TranscriptRows
+                <CallTranscript
+                  session={session}
                   rows={rows}
+                  live={live}
                   speakerFilter={speakerFilter}
                   search={search}
                   speakerTone={speakerTone}
+                  roster={roster}
+                  people={people}
+                  playback={playback}
+                  act={act}
+                  locked={locked}
                 />
               ) : (
                 <div className="plain-transcript">
@@ -528,23 +545,26 @@ export function Reader({
                 {session?.kind === "call" ? "IN THIS CONVERSATION" : "DETAILS"}
               </span>
             </div>
-            {speakers.map((speaker, index) => (
-              <div className="person" key={speaker}>
-                <Avatar
-                  size={34}
-                  radius="xl"
-                  color={speakerColors[index % speakerColors.length]}
-                >
-                  {speaker.slice(0, 1)}
-                </Avatar>
-                <span>{speaker}</span>
-                {speaker === "You" && (
-                  <Badge size="xs" color="gray" variant="light">
-                    YOU
-                  </Badge>
-                )}
-              </div>
-            ))}
+            <SpeakerPanel
+              session={session}
+              roster={roster}
+              speakerTone={speakerTone}
+              people={people}
+              speakerFilter={speakerFilter}
+              onFilter={(speaker) => {
+                setSpeakerFilter(speaker);
+                if (speaker) setTab("transcript");
+              }}
+              act={act}
+              locked={locked || session?.id === importState?.rebuilding}
+            />
+            <RecordingPanel
+              session={session}
+              importState={importState}
+              act={act}
+              locked={locked}
+              live={live}
+            />
             <Divider my="xl" />
             <div className="detail-row">
               <Notebook size={17} />

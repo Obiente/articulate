@@ -82,13 +82,64 @@ test("playback highlights the last turn that has started", () => {
 
 test("rename suggestions skip names already used by other speakers", () => {
   const people = [{ name: "Morgan" }, { name: "Casey" }, { name: "casey" }];
-  const roster = [
-    { label: "Casey" },
-    { label: "Speaker 2" },
-  ];
+  const roster = [{ label: "Casey" }, { label: "Speaker 2" }];
   assert.deepEqual(nameSuggestions(people, roster, "Speaker 2"), ["Morgan"]);
   assert.deepEqual(nameSuggestions(people, roster, "Casey"), [
     "Morgan",
     "Casey",
   ]);
+});
+
+test("speaker names are validated like the desktop controller", async () => {
+  const { validSpeakerName, prepareAction } = await import("../src/actions.js");
+  assert.equal(validSpeakerName("  Zoë   Li "), "Zoë Li");
+  for (const bad of ["", "   ", "You", "other audio", "x".repeat(81)])
+    assert.throws(() => validSpeakerName(bad));
+  assert.throws(() =>
+    prepareAction({ type: "speaker_reassign", id: "a", rows: [] }),
+  );
+  assert.throws(() =>
+    prepareAction({
+      type: "speaker_reassign",
+      id: "a",
+      rows: [{ index: 0, start_ms: 0 }],
+      speaker: "s1",
+      name: "Casey",
+    }),
+  );
+});
+
+test("the preview workspace corrects speakers and undoes changes", async () => {
+  const { createPreviewWorkspace } = await import(
+    "../src/preview/workspace.js"
+  );
+  const storage = new Map();
+  const workspace = createPreviewWorkspace({
+    getItem: (key) => storage.get(key) ?? null,
+    setItem: (key, value) => storage.set(key, value),
+  });
+  const id = "sample-call-1";
+  await workspace.action({ type: "history_open", id });
+  const rows = () => workspace.snapshot().selected.rows;
+  assert.equal(rows()[4].speaker, "Speaker 3");
+  await workspace.action({ type: "speaker_merge", id, from: "s3", into: "s1" });
+  assert.equal(rows()[4].speaker, "Casey");
+  assert.equal(
+    workspace.snapshot().selected.speaker_undo,
+    "Merged Speaker 3 into Casey",
+  );
+  await workspace.action({
+    type: "speaker_reassign",
+    id,
+    rows: [{ index: 1, start_ms: 33000 }],
+    name: "Morgan",
+  });
+  assert.equal(rows()[1].speaker, "Morgan");
+  await workspace.action({ type: "speaker_undo", id });
+  await workspace.action({ type: "speaker_undo", id });
+  assert.deepEqual(
+    rows().map((row) => row.speaker),
+    ["Casey", "Jordan", "You", "Casey", "Speaker 3"],
+  );
+  await assert.rejects(workspace.action({ type: "speaker_undo", id }));
 });
