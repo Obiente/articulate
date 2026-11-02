@@ -10,11 +10,13 @@ use crate::app::App;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::Value;
 
+pub(super) mod assort;
 pub(super) mod capture;
 pub(super) mod discord;
 pub(super) mod library;
 pub(super) mod models;
 pub(super) mod output;
+pub(super) mod polish;
 pub(super) mod settings;
 pub(super) mod updates;
 pub(super) mod vocabulary;
@@ -25,6 +27,8 @@ pub(crate) enum Action {
     Output(output::Action),
     Vocabulary(vocabulary::Action),
     Settings(settings::Action),
+    Polish(polish::Action),
+    Assort(assort::Action),
     Models(models::Action),
     Discord(discord::Action),
     Updates(updates::Action),
@@ -34,6 +38,12 @@ type Parser = fn(&Value) -> Result<Action, serde_json::Error>;
 
 /// Feature parsers in routing order.
 const FEATURES: &[(&str, Parser)] = &[
+    ("assort", |value| {
+        assort::Action::deserialize(value).map(Action::Assort)
+    }),
+    ("polish", |value| {
+        polish::Action::deserialize(value).map(Action::Polish)
+    }),
     ("library", |value| {
         library::Action::deserialize(value).map(Action::Library)
     }),
@@ -111,6 +121,8 @@ impl App {
             Action::Output(action) => output::run(action),
             Action::Vocabulary(action) => self.desktop_vocabulary_action(action),
             Action::Settings(action) => self.desktop_settings_action(action),
+            Action::Polish(action) => self.desktop_polish_action(action),
+            Action::Assort(action) => self.desktop_assort_action(action),
             Action::Models(action) => self.desktop_models_action(action),
             Action::Discord(action) => self.desktop_discord_action(action),
             Action::Updates(action) => self.desktop_updates_action(action),

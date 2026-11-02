@@ -114,7 +114,7 @@ fn wide(text: &str) -> Vec<u16> {
 /// Ask for a file path. `open` selects an existing file; otherwise the user
 /// chooses where to save, with an overwrite prompt.
 #[cfg(windows)]
-fn choose_path(
+pub(crate) fn choose_path(
     document: Document,
     suggested: &str,
     extension: &str,
@@ -168,6 +168,17 @@ fn choose_path(
     Ok(Some(PathBuf::from(std::ffi::OsString::from_wide(
         &name[..end],
     ))))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn choose_path(
+    _: Document,
+    _: &str,
+    _: &str,
+    _: bool,
+    _: &str,
+) -> Result<Option<PathBuf>> {
+    anyhow::bail!("The model file dialog is not available on this platform.")
 }
 
 /// Save with a neutral title and name. Prefer `save_document`.

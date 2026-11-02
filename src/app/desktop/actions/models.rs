@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Action {
+    ModelDelete { id: model::ModelId },
+    ModelDownloadCancel { id: model::ModelId },
     ModelDownload,
     ModelLoad,
     SummaryDownload,
@@ -22,6 +24,17 @@ pub(crate) enum Action {
 impl App {
     pub(crate) fn desktop_models_action(&mut self, action: Action) -> Result<(), String> {
         match action {
+            Action::ModelDownloadCancel { id } => {
+                if let Some(cancel) = self.model_cancels.get(&id) {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Action::ModelDelete { id } => {
+                if !self.desktop_active_downloads().is_empty() {
+                    return Err("Finish or cancel downloads before deleting a model.".into());
+                }
+                model::delete_model(id).map_err(|e| e.to_string())?;
+            }
             Action::ModelDownload => {
                 if self.downloading.is_some()
                     || self.recording.is_some()
@@ -56,12 +69,15 @@ impl App {
         }
         self.context_progress = Some(0.0);
         self.context_status = "Downloading audio context".into();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.model_cancels
+            .insert(model::ModelId::SoundCues, cancel.clone());
         let sender = self.event_tx.clone();
         std::thread::Builder::new()
             .name("audio-context-install".into())
             .spawn(move || {
                 let mut last = Instant::now() - Duration::from_secs(1);
-                let result = crate::sensevoice::install(|progress| {
+                let result = crate::sensevoice::install_cancellable(&cancel, |progress| {
                     if last.elapsed() >= Duration::from_millis(100) {
                         let _ = sender.send(Event::ContextProgress(progress));
                         last = Instant::now();
@@ -83,12 +99,15 @@ impl App {
         }
         self.speakers_downloading = Some(0.0);
         self.speakers_download_status = "Downloading speaker identification…".into();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.model_cancels
+            .insert(model::ModelId::Speaker, cancel.clone());
         let sender = self.event_tx.clone();
         std::thread::Builder::new()
             .name("speaker-model-download".into())
             .spawn(move || {
                 let mut last = Instant::now() - Duration::from_secs(1);
-                let result = model::download_speakers(|progress| {
+                let result = model::download_speakers_cancellable(&cancel, |progress| {
                     if last.elapsed() >= Duration::from_millis(100) {
                         let _ = sender.send(Event::SpeakersProgress(progress));
                         last = Instant::now();
@@ -117,12 +136,15 @@ impl App {
         }
         self.verifier_downloading = Some(0.0);
         self.verifier_download_status = "Downloading second speech model…".into();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.model_cancels
+            .insert(model::ModelId::Verifier, cancel.clone());
         let sender = self.event_tx.clone();
         std::thread::Builder::new()
             .name("verifier-model-download".into())
             .spawn(move || {
                 let mut last = Instant::now() - Duration::from_secs(1);
-                let result = model::download_verifier(|progress| {
+                let result = model::download_verifier_cancellable(&cancel, |progress| {
                     if last.elapsed() >= Duration::from_millis(100) {
                         let _ = sender.send(Event::VerifierProgress(progress));
                         last = Instant::now();

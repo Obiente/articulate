@@ -24,10 +24,20 @@ impl Context {
 }
 
 impl App {
-    pub(super) fn desktop_cleanup_status(&self) -> serde_json::Value {
-        serde_json::json!({"installed":crate::polish::profile_installed(crate::polish::ModelProfile::Polish),
-            "working":self.polish.job.is_some(),"status":self.polish.status,"progress":self.polish.fraction,
-            "preview":self.polish.preview.as_ref().map(|p| serde_json::json!({"original":p.original,"source":p.source,"text":p.text,"blocked":p.blocked,"cleanup_only":p.cleanup_only}))})
+    pub(super) fn desktop_cleanup_status(&self) -> CleanupStatus<'_> {
+        CleanupStatus {
+            installed: crate::polish::profile_installed(crate::polish::ModelProfile::Polish),
+            working: self.polish.job.is_some(),
+            status: &self.polish.status,
+            progress: self.polish.fraction,
+            preview: self.polish.preview.as_ref().map(|p| CleanupPreview {
+                original: &p.original,
+                source: &p.source,
+                text: &p.text,
+                blocked: p.blocked.as_deref(),
+                cleanup_only: p.cleanup_only,
+            }),
+        }
     }
 
     pub(super) fn desktop_cleanup_download(&mut self) -> Result<(), String> {
@@ -195,6 +205,23 @@ impl App {
     }
 }
 
+#[derive(serde::Serialize)]
+pub(crate) struct CleanupStatus<'a> {
+    pub installed: bool,
+    pub working: bool,
+    pub status: &'a str,
+    pub progress: Option<f32>,
+    pub preview: Option<CleanupPreview<'a>>,
+}
+#[derive(serde::Serialize)]
+pub(crate) struct CleanupPreview<'a> {
+    original: &'a str,
+    source: &'a str,
+    text: &'a str,
+    blocked: Option<&'a str>,
+    cleanup_only: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{App, Context, Preview};
@@ -238,7 +265,7 @@ mod tests {
         app.polish.job = Some(job);
         tx.send(crate::polish::Event::Complete(preview)).unwrap();
         app.polish_poll();
-        assert!(app.desktop_cleanup_status()["preview"].is_object());
+        assert!(app.desktop_cleanup_status().preview.is_some());
         app.polish_apply();
         assert!(app.text.starts_with("Hi Casey,"));
 

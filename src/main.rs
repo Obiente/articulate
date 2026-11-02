@@ -51,7 +51,9 @@ mod polish;
 mod sensevoice;
 mod speakers;
 mod speech;
+mod startup;
 mod topics;
+mod tray;
 #[allow(
     dead_code,
     reason = "Preserve verified updater backend for React update controls"
@@ -68,8 +70,26 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 
-/// State sections newer than `since` (section name to revision), or all of
-/// them. Changes are also pushed as `desktop-state` events.
+/// Select a local speech model without blocking the controller.
+#[tauri::command]
+async fn desktop_model_file(window: tauri::WebviewWindow) -> Result<Option<String>, String> {
+    require_main(&window)?;
+    tauri::async_runtime::spawn_blocking(|| {
+        crate::export_file::choose_path(
+            crate::export_file::Document::Export,
+            "",
+            "gguf",
+            true,
+            "Choose a speech model",
+        )
+        .map(|path| path.map(|p| p.to_string_lossy().into_owned()))
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// State sections newer than `since`, or all sections when omitted.
 #[tauri::command]
 fn desktop_snapshot(
     window: tauri::WebviewWindow,
@@ -366,7 +386,8 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if !args.is_empty() {
+    let login = args == ["--login"];
+    if !args.is_empty() && !login {
         diagnostics::attach_parent_console();
         diagnostics::init_console_log();
         return cli::run(&args);
@@ -380,7 +401,7 @@ fn run() -> anyhow::Result<()> {
         )
     })?;
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             let (indicator, visibility) = mpsc::channel();
             let state_events = app.handle().clone();
             let overlay_events = app.handle().clone();
@@ -399,9 +420,14 @@ fn run() -> anyhow::Result<()> {
                 .on_navigation(local_navigation)
                 .build()?;
             setup_overlay(app, visibility)?;
+            tray::setup(app)?;
+            if login && let Some(window) = app.get_webview_window("main") {
+                window.hide()?;
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            desktop_model_file,
             desktop_snapshot,
             desktop_revision,
             desktop_health,
@@ -416,6 +442,16 @@ fn run() -> anyhow::Result<()> {
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                let quit = window
+                    .app_handle()
+                    .state::<tray::QuitRequested>()
+                    .inner()
+                    .0
+                    .swap(false, std::sync::atomic::Ordering::Relaxed);
+                if !quit && tray::setting(window.app_handle(), "close_to_tray") {
+                    let _ = window.hide();
+                    return;
+                }
                 let app = window.app_handle().clone();
                 let bridge = app.state::<Arc<Bridge>>().inner().clone();
                 match bridge.request_close() {

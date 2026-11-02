@@ -27,6 +27,9 @@ pub(crate) struct SettingsView<'a> {
     discord_auto_transcribe: bool,
     discord_companion: bool,
     vencord_auto_update: bool,
+    close_to_tray: bool,
+    start_with_windows: bool,
+    automatic_update_checks: bool,
 }
 
 #[derive(Serialize)]
@@ -59,6 +62,9 @@ pub(crate) fn settings(app: &App) -> Settings<'_> {
             discord_auto_transcribe: settings.discord_auto_transcribe,
             discord_companion: settings.discord_companion,
             vencord_auto_update: settings.vencord_auto_update,
+            close_to_tray: settings.close_to_tray,
+            start_with_windows: settings.start_with_windows,
+            automatic_update_checks: settings.automatic_update_checks,
         },
         microphones: &app.microphones,
         outputs: &app.outputs,
@@ -67,12 +73,14 @@ pub(crate) fn settings(app: &App) -> Settings<'_> {
 
 #[derive(Serialize)]
 pub(crate) struct Vocabulary<'a> {
+    assort: crate::app::assort_ui::ReviewStatus<'a>,
     dictionary: &'a [Entry],
     macros: &'a [VoiceMacro],
 }
 
 pub(crate) fn vocabulary(app: &App) -> Vocabulary<'_> {
     Vocabulary {
+        assort: app.desktop_assort_status(),
         dictionary: &app.settings.entries,
         macros: &app.settings.macros,
     }
