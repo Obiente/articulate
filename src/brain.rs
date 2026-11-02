@@ -42,7 +42,7 @@ pub enum Kind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Saved in history; unknown fields from newer versions are ignored.
 pub struct Citation {
     pub source_id: String,
     /// Byte range in the immutable original turn, always UTF-8 aligned.
@@ -58,7 +58,7 @@ pub struct Citation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Saved in history; unknown fields from newer versions are ignored.
 pub struct Item {
     pub kind: Kind,
     pub text: String,
@@ -68,7 +68,7 @@ pub struct Item {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Saved in history; unknown fields from newer versions are ignored.
 pub struct Draft {
     pub schema: u32,
     pub source_id: String,
