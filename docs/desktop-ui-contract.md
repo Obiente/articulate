@@ -13,7 +13,7 @@ Sections are typed serde views in `src/app/desktop/view/`; the registry is `view
 | `controller` | `controller` | On change (published by the bridge) |
 | `shell` | `ready`, `loading`, `busy`, `status`, `saving`, `history_loading`, `history_error`, `filing_status`, `filing_working`, `source_move_working`, `summary_working` | Live |
 | `capture` | `recording`, `call_recording`, `note_recording`, `seconds`, `call_status`, `note_status`, `call_cues_enabled`, `call_cues_status`, `capture_feedback` | Live |
-| `dictation` | `text`, `original`, `dictation_session` | Live |
+| `dictation` | `text`, `original`, `dictation_session`, `dictation_interruption` | Live |
 | `live` | `call_session`, `note_session` | Live |
 | `live_rows` | `call_rows`, `note_rows` | Live, sent as row splices |
 | `document` | `selected` | Live |
@@ -183,5 +183,13 @@ retry after restart.
 Insights contain `words`, `sessions`, `words_per_minute`, `current_streak`, `longest_streak`, `active_days`, `dictionary_replacements`, `cleanup_edits`, `apps: [{app, words, sessions}]` and `days: [{date, words, sessions}]`.
 
 The Tauri interface includes model installation, companion setup and application
-updates. Per-app writing-style editing and manual Polish previews are not yet
+updates and per-app writing-style editing. Manual Polish previews are not yet
 exposed in the renderer. There is no legacy UI build.
+
+## Dictation input additions
+
+`settings_patch` accepts `spoken_editing_commands: boolean`, `styles: {app, style}[]` and `input_profiles: {app, hotkey_mode?, insert?, live_insert?, line_break?, style?, spoken_editing_commands?}[]`. Nullable profile fields inherit defaults. Enums: Hold/Toggle, Enter/ShiftEnter, Verbatim/Clean/Chat. Lists are capped at 100; invalid basenames and duplicate profiles reject the entire patch.
+
+Settings exposes those fields plus `recent_dictation_app`, `shortcut_error` and `microphone_check: {running, result, error}`. Result is null or `{device, peak, rms, clipping_ratio, silent}`. `microphone_check` starts a three-second worker and rejects overlapping tests or active recording. The reusable `MicrophoneCheck` component accepts `check`, `onTest` and `disabled` for call setup integration.
+
+`dictation_interruption` is null or the reason capture ended early, retained until the next capture. `insert_text {text, line_breaks?}` runs outside the controller, waits three seconds for external focus, then arms and inserts through field identity guards. It accepts up to 16,000 bytes and an optional executable-to-line-break map (up to 100 entries), used to select the focused app profile. Browser preview simulates microphone results; it never inserts into external apps.

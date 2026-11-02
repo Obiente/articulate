@@ -61,3 +61,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for local builds and checks, and [SECURIT
 Tauri with React and Mantine is the only application interface built from this source. See the [desktop UI guide](docs/desktop-ui.md) for preview and build commands, available screens, and remaining feature migration work. Previously published releases are unchanged.
 
 Articulate is licensed under **AGPL-3.0-or-later**, following [Obiente's open-source commitment](https://github.com/Obiente/.github/blob/main/profile/README.md). You may use, modify, and redistribute it under those terms; it comes without warranty. Included Assort weights carry their own model cards and license notices. Bundled fonts, icons, runtimes and Rust dependencies retain their own notices. Separately downloaded Qwen weights are Apache-2.0; Sortformer weights use the NVIDIA Open Model License; Nemotron 3.5 ASR weights use OpenMDW-1.1. See [LICENSE](LICENSE), [visual asset notices](assets/LICENSES.md), and the `licenses/` directory inside each binary distribution.
+
+## Dictation input preferences
+
+Settings > Dictation includes spoken editing (off by default), app profiles and writing styles. Say a command as its own finalized segment: new line, new paragraph, scratch that, delete that, or undo that. With commands enabled, external live typing waits for finalized segments, so command phrases are never typed provisionally. Embedded command phrases remain literal.
+
+Profiles match executable basenames, ignoring case. Hold/toggle, insertion, live typing, line breaks, writing style and spoken editing may inherit defaults or override them. Discord, Slack, Teams and MS Teams use Shift+Enter by default; other apps use Enter. Explicit profile settings take precedence. Writing styles offer No cleanup, Clean and Casual chat.
+
+Audio settings offers a three-second microphone test with resolved device name, peak/average level, clipping and silence warnings. It does not load speech models. Incomplete dictations show the interruption reason and skip automatic insertion. Copy remains available; Insert in 3 seconds lets you focus a destination field before guarded insertion.
