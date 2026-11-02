@@ -90,6 +90,11 @@ export const sampleRecords = [
     original: "",
     personal_notes: notes,
     rows: sampleRows,
+    // Stands in for generated action items kept in the notes.
+    follow_ups: [
+      "Update and share the onboarding checklist tomorrow. Keep the model download explanation short and clear.",
+      "Try the revised flow with the team on Friday, then review the feedback together.",
+    ],
   },
   {
     id: "sample-call-2",
@@ -108,6 +113,7 @@ export const sampleRecords = [
     id: "sample-note-1",
     title: "Ideas worth coming back to",
     kind: "note",
+    pinned: true,
     created_ms: now - 90000000,
     updated_ms: now - 90000000,
     duration_ms: 0,
@@ -128,6 +134,60 @@ export const sampleRecords = [
     original: "",
     personal_notes: "",
     rows: [],
+  },
+  {
+    id: "sample-dictation-old",
+    title: "Reminder about the spring survey",
+    kind: "dictation",
+    created_ms: now - 200 * 86400000,
+    updated_ms: now - 200 * 86400000,
+    duration_ms: 9000,
+    text: "Remember to send the spring survey results to the team once the last responses are in.",
+    original: "",
+    personal_notes: "",
+    rows: [],
+  },
+];
+
+// Damaged files for the preview's recovery view. Never real user data.
+export const sampleQuarantine = [
+  {
+    file_name: "sample-damaged.corrupt-1",
+    id: "sample-damaged",
+    bytes: 18432,
+    modified_ms: now - 3 * 86400000,
+    restorable: true,
+    title: "Weekly planning call",
+    reason: "The file was cut short while saving. The last complete copy can be restored.",
+    record: {
+      id: "sample-damaged",
+      title: "Weekly planning call",
+      kind: "call",
+      created_ms: now - 3 * 86400000,
+      updated_ms: now - 3 * 86400000,
+      duration_ms: 0,
+      text: "We reviewed the weekly plan and agreed on the next steps.",
+      original: "",
+      personal_notes: "",
+      rows: [],
+    },
+  },
+  {
+    file_name: "sample-unknown.corrupt-1",
+    id: "sample-unknown",
+    bytes: 2048,
+    modified_ms: now - 12 * 86400000,
+    restorable: false,
+    title: null,
+    reason: "The file isn't a complete Articulate item.",
+  },
+];
+
+export const sampleWarnings = [
+  {
+    id: "sample-locked",
+    kind: "unavailable",
+    message: "This history item is temporarily unavailable and will be retried.",
   },
 ];
 

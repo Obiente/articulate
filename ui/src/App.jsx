@@ -38,6 +38,7 @@ import { CallSetupDialog } from "./features/calls/CallSetupDialog.jsx";
 import { DictationPage } from "./features/dictation/DictationPage.jsx";
 import { InsightsPage } from "./features/insights/InsightsPage.jsx";
 import { LibraryPage } from "./features/library/LibraryPage.jsx";
+import { useLibraryNotices } from "./features/library/useLibraryNotices.jsx";
 import { Reader } from "./features/notes/Reader.jsx";
 import { SettingsPage } from "./features/settings/SettingsPage.jsx";
 import { useUpdateNotices } from "./features/updates/useUpdateNotices.jsx";
@@ -184,6 +185,7 @@ export function App() {
     feedback: state?.capture_feedback,
     openRecording: open,
   });
+  useLibraryNotices(state?.library_notice);
   // A spoken note started from the shortcut opens in Notetaker.
   useEffect(() => {
     const id = state?.note_recording && state.note_session?.id;
@@ -422,6 +424,9 @@ export function App() {
               <LibraryPage
                 mode={page === "conversations" ? "call" : "note"}
                 history={state.history}
+                search={state.search}
+                recovery={state.recovery}
+                act={act}
                 captureBlocked={captureBlocked}
                 filingStatus={state.filing_status}
                 quickNoteHotkey={state.settings.quick_note_hotkey}

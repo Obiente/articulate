@@ -5,9 +5,18 @@ import { previewSupports, savedPatchValue } from "../actions.js";
 import {
   sampleDictionary,
   sampleMacros,
+  sampleQuarantine,
   sampleRecords,
   sampleSettings,
+  sampleWarnings,
 } from "./fixtures.js";
+import {
+  emptySearch,
+  emptyStorage,
+  followUps,
+  libraryHandlers,
+  subtitlesUnavailable,
+} from "./library.js";
 
 const storageKey = "articulate-ui-sample-workspace-v1";
 
@@ -54,6 +63,7 @@ export function createPreviewWorkspace(storage) {
     ];
   }
   let selected = null;
+  let isolated = structuredClone(sampleQuarantine);
   let sample = {
     preview: true,
     ready: true,
@@ -83,6 +93,15 @@ export function createPreviewWorkspace(storage) {
     microphones: ["Default microphone"],
     outputs: ["Default speakers"],
     insights: null,
+    search: emptySearch(),
+    storage: emptyStorage(saved?.storage),
+    recovery: {
+      warnings: structuredClone(sampleWarnings),
+      quarantined: isolated.length,
+      quarantine: [],
+      listed: false,
+    },
+    library_notice: null,
     notes: {
       ready: false,
       working: false,
@@ -103,6 +122,10 @@ export function createPreviewWorkspace(storage) {
         dictionary: sample.dictionary,
         macros: sample.macros,
         settings: sample.settings,
+        storage: {
+          encrypt_at_rest: sample.storage.encrypt_at_rest,
+          retention: sample.storage.retention,
+        },
         topic_examples_added: true,
       }),
     );
@@ -133,6 +156,16 @@ export function createPreviewWorkspace(storage) {
     };
   }
 
+  function documentView(session) {
+    if (!session) return null;
+    return {
+      ...session,
+      pinned: Boolean(session.pinned),
+      follow_ups: followUps(session).length,
+      subtitles_unavailable: subtitlesUnavailable(session),
+    };
+  }
+
   // A renderer snapshot must not retain writable references to saved documents.
   function snapshot() {
     return structuredClone({
@@ -140,7 +173,9 @@ export function createPreviewWorkspace(storage) {
       history: records
         .map((item) => summary(withSources(item)))
         .sort((a, b) => b.created_ms - a.created_ms),
-      selected: withSources(records.find((s) => s.id === selected)) ?? null,
+      selected: documentView(
+        withSources(records.find((s) => s.id === selected)),
+      ),
     });
   }
 
@@ -153,7 +188,53 @@ export function createPreviewWorkspace(storage) {
 
   const record = (id) => records.find((s) => s.id === id);
 
+  function notify(message, error = false) {
+    sample.library_notice = {
+      sequence: (sample.library_notice?.sequence ?? 0) + 1,
+      error,
+      message,
+    };
+  }
+
+  const library = libraryHandlers({
+    get sample() {
+      return sample;
+    },
+    record,
+    records: () => records,
+    selected: () => selected,
+    isolated: () => isolated,
+    notify,
+    // Finish simulated background work, as the controller would.
+    later(delay, finish) {
+      setTimeout(() => {
+        finish();
+        persist();
+        publish();
+      }, delay);
+    },
+    remove(ids) {
+      records = records.filter((item) => !ids.includes(item.id));
+    },
+    restore(file) {
+      if (!record(file.record.id)) records = [file.record, ...records];
+      isolated = isolated.filter((item) => item.file_name !== file.file_name);
+      sample.recovery.quarantined = isolated.length;
+      sample.recovery.quarantine = sample.recovery.quarantine.filter(
+        (item) => item.file_name !== file.file_name,
+      );
+    },
+    discard(fileName) {
+      isolated = isolated.filter((item) => item.file_name !== fileName);
+      sample.recovery.quarantined = isolated.length;
+      sample.recovery.quarantine = sample.recovery.quarantine.filter(
+        (item) => item.file_name !== fileName,
+      );
+    },
+  });
+
   const handlers = {
+    ...library,
     history_open(action) {
       if (!record(action.id)) throw Error("This note is no longer available.");
       selected = action.id;

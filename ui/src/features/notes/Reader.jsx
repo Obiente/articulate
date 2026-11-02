@@ -18,11 +18,11 @@ import {
   Check,
   Copy,
   DotsThree,
-  DownloadSimple,
   LockSimple,
   MagnifyingGlass,
   Microphone,
   Notebook,
+  PushPin,
   Record,
   Sparkle,
   Stop,
@@ -40,6 +40,7 @@ import {
   transcriptText,
 } from "../calls/speakers.js";
 import { DeleteDocumentDialog, MoveSourceDialog } from "./DocumentDialogs.jsx";
+import { ExportMenu } from "./ExportMenu.jsx";
 
 const NO_ROWS = [];
 
@@ -108,6 +109,10 @@ export function Reader({
       end.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   }, [tail, live, follow, tab]);
   const run = (command) => void act(command).catch(() => {});
+  const accepted = (command) => act(command).then(
+    () => true,
+    () => false,
+  );
   const moveSource = (source, topicId) =>
     setMoving({ ...source, topic_id: topicId ?? null });
   const noteWords = countWords(notes);
@@ -218,6 +223,25 @@ export function Reader({
           </div>
         </div>
         <Group gap={8}>
+          {!live && session && (
+            <Tooltip label={session.pinned ? "Unpin" : "Pin"}>
+              <ActionIcon
+                variant={session.pinned ? "light" : "default"}
+                size={38}
+                aria-label={session.pinned ? "Unpin" : "Pin"}
+                aria-pressed={Boolean(session.pinned)}
+                onClick={() =>
+                  run({
+                    type: "session_pin",
+                    id: session.id,
+                    pinned: !session.pinned,
+                  })
+                }
+              >
+                <PushPin size={19} weight={session.pinned ? "fill" : "regular"} />
+              </ActionIcon>
+            </Tooltip>
+          )}
           {live && (
             <Button
               leftSection={<Stop size={16} weight="fill" />}
@@ -266,15 +290,6 @@ export function Reader({
                     Find a topic automatically
                   </Menu.Item>
                 )}
-              <Menu.Item
-                leftSection={<DownloadSimple size={16} />}
-                disabled={tab === "sources"}
-                onClick={() =>
-                  run({ type: "export", text: content(), extension: "txt" })
-                }
-              >
-                Export as text
-              </Menu.Item>
               <Menu.Divider />
               <Menu.Item
                 color="red"
@@ -365,20 +380,7 @@ export function Reader({
                 <Copy size={18} />
               </ActionIcon>
             </Tooltip>
-            <Tooltip label={`Export ${tab}`}>
-              <ActionIcon
-                size={34}
-                variant="subtle"
-                color="gray"
-                aria-label={`Export ${tab}`}
-                disabled={!hasContent || tab === "sources"}
-                onClick={() =>
-                  run({ type: "export", text: content(), extension: "txt" })
-                }
-              >
-                <DownloadSimple size={19} />
-              </ActionIcon>
-            </Tooltip>
+            <ExportMenu session={session} run={accepted} />
           </Group>
         </div>
         <div className="reader-body">
