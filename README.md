@@ -38,13 +38,15 @@ Hold **Ctrl+Alt+Space** to dictate, then release to finish. Double-press for han
 
 The optional [Vencord companion](docs/vencord.md) sends current voice participants, avatar identifiers and speaking activity through a paired local connection. Articulate can prepare and update its custom Vencord build. The debugger-based connection remains available for the standard client.
 
-The custom companion includes a [native receive adapter](plugins/discord-native/README.md) for separate participant audio by default. Its synthetic tests pass; real desktop-call validation is still pending. On unsupported clients, mixed output capture can use fresh Discord activity for names without acoustic classification, but cannot reliably separate overlapping voices. The interface distinguishes these audio sources. After pairing, Discord connects automatically; an optional setting starts and finishes transcripts on confirmed call joins and leaves. [Connection details →](docs/discord-integration.md)
+The custom companion includes a [native receive adapter](plugins/discord-native/README.md) for separate participant audio by default. Its synthetic tests pass; real desktop-call validation is still pending. On unsupported clients, mixed output capture can use fresh Discord activity for names without acoustic classification, but cannot reliably separate overlapping voices. The interface distinguishes these audio sources. After pairing, Discord connects automatically; an optional setting starts and finishes transcripts on confirmed call joins and leaves. Stable, PTB and Canary clients are supported. [Connection details →](docs/discord-integration.md)
+
+Optional, off-by-default meeting detection can notice Microsoft Teams, Zoom and (best-effort) Google Meet calls and ask before starting a transcript, or start one automatically, with a reminder to get participants' consent.
 
 ## Updates and privacy
 
 Articulate checks for a release on launch and once a day while open. Update notices appear throughout the workspace. Downloads remain your choice, are verified against the GitHub asset's SHA-256 digest, and install after recording has finished and pending history saves have completed. Models and saved sessions survive updates.
 
-Speech runs locally after models are downloaded. Model downloads contact Hugging Face; app update checks and downloads contact GitHub. The Discord companion uses loopback. Participant pictures are fetched from Discord's CDN and cached locally. Text is never sent for transcription or correction. Saved text, notes, preferences and models live under `%LOCALAPPDATA%\TranscribeLocal`; audio is not saved. Uninstalling keeps this local data.
+Speech runs locally after models are downloaded. Model downloads contact Hugging Face; app update checks and downloads contact GitHub. The Discord companion uses a mutually authenticated loopback connection. Participant pictures are fetched from Discord's CDN over HTTPS and cached locally in a bounded folder; this can be turned off in Settings. Text is never sent for transcription or correction. Saved text, notes, preferences and models live under `%LOCALAPPDATA%\TranscribeLocal`; audio is not saved. Uninstalling keeps this local data.
 
 The initial Windows build is **unsigned**, so Windows may show an unknown-publisher warning. Obtain binaries from this repository's Releases page.
 

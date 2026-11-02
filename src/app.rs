@@ -60,8 +60,15 @@ struct Settings {
     discord_auto_connect: bool,
     discord_auto_transcribe: bool,
     discord_standard_configured: bool,
+    /// Installed Discord edition to relaunch: "stable", "ptb", "canary" or "" for automatic.
+    discord_flavor: String,
+    /// Loopback debugger port of the last Articulate relaunch, or 0 when none is open.
+    discord_debugger_port: u16,
+    #[serde(default = "enabled")]
+    discord_avatars: bool,
     vencord_source: String,
     vencord_auto_update: bool,
+    meetings: discord_ui::meetings::Settings,
     assort: assort_ui::Configuration,
     polish_style: crate::polish::Style,
 }
@@ -99,8 +106,12 @@ impl Default for Settings {
             discord_auto_connect: true,
             discord_auto_transcribe: false,
             discord_standard_configured: false,
+            discord_flavor: String::new(),
+            discord_debugger_port: 0,
+            discord_avatars: true,
             vencord_source: String::new(),
             vencord_auto_update: false,
+            meetings: Default::default(),
             assort: Default::default(),
             polish_style: Default::default(),
         }
