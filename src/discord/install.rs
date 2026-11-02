@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{Arc, OnceLock, atomic::AtomicBool},
     thread,
     time::{Duration, Instant},
 };
@@ -17,15 +17,19 @@ const SOURCE_REVISION: &str = "59a54286542651fff5ea53f0ce6cadf2a6aa7521";
 const SOURCE_URL: &str =
     "https://codeload.github.com/Vendicated/Vencord/zip/59a54286542651fff5ea53f0ce6cadf2a6aa7521";
 const SOURCE_SHA256: &str = "8b58c3eef5c93ecd94b8950a5ef47001e4da3c22e90175b02eb736141b3ece57";
+const SOURCE_SIZE: u64 = 1_258_924;
 const INSTALLER_URL: &str =
     "https://github.com/Vencord/Installer/releases/download/v1.4.2/VencordInstaller.exe";
 const INSTALLER_SHA256: &str = "1cb4115a99a8b7a0b0371dddb2ac7dde38b9acc23f53a69540319b4b7ca6c2da";
+const INSTALLER_SIZE: u64 = 11_566_080;
 #[cfg(windows)]
 const NODE_FOLDER: &str = "node-v22.23.2-win-x64";
 #[cfg(windows)]
 const NODE_URL: &str = "https://nodejs.org/dist/v22.23.2/node-v22.23.2-win-x64.zip";
 #[cfg(windows)]
 const NODE_SHA256: &str = "1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97";
+#[cfg(windows)]
+const NODE_SIZE: u64 = 35_683_585;
 const MANIFEST: &str = ".articulate-companion.json";
 const NATIVE_FILES: [(&str, &[u8]); 5] = [
     (
@@ -610,9 +614,15 @@ fn ensure_node(progress: &impl Fn(&str)) -> Result<PathBuf> {
             );
             return Ok(node);
         }
-        progress("Downloading the verified local Node.js build tools…");
         let archive = runtimes.join(format!("{NODE_FOLDER}.zip"));
-        download(NODE_URL, NODE_SHA256, &archive, 128 * 1024 * 1024)?;
+        download(
+            NODE_URL,
+            NODE_SHA256,
+            NODE_SIZE,
+            &archive,
+            "Downloading the verified local Node.js build tools",
+            progress,
+        )?;
         let stage = runtimes.join(format!("extract-{}", super::plugin::new_token()?));
         fs::create_dir(&stage)?;
         extract_archive(&archive, &stage)?;
@@ -892,94 +902,46 @@ impl Drop for ToolJob {
     }
 }
 
-fn download(url: &str, expected: &str, destination: &Path, limit: u64) -> Result<()> {
-    if destination.exists() {
-        ordinary(destination)?;
-        ensure!(
-            hash(&bounded_read(destination, limit)?) == expected,
-            "A cached download has changed. Remove it before retrying."
-        );
-        return Ok(());
-    }
-    ensure!(url.starts_with("https://"), "Downloads must use HTTPS");
-    // https_only also refuses any redirect to a plain HTTP target.
-    let config = ureq::Agent::config_builder()
-        .https_only(true)
-        .timeout_global(Some(Duration::from_secs(180)))
-        .build();
-    let mut response = config
-        .new_agent()
-        .get(url)
-        .call()
-        .context("The verified download could not be fetched")?;
-    if let Some(length) = response.headers().get("Content-Length") {
-        ensure!(
-            length.to_str()?.trim().parse::<u64>()? <= limit,
-            "Downloaded file exceeds its size limit"
-        );
-    }
-    stream_verified(
-        response.body_mut().as_reader(),
-        expected,
-        destination,
-        limit,
-    )
-}
-
-/// Streams bytes to a sibling temporary file while hashing them, then renames
-/// the file into place only when the SHA-256 digest matches. Nothing is held
-/// in memory beyond one buffer, and a failed or oversized download leaves no
-/// file behind. Intended to be replaced by the shared resumable downloader.
-fn stream_verified(
-    mut reader: impl Read,
+/// Fetches one pinned artifact through the shared resumable downloader
+/// (HTTPS only, exact size, SHA-256, bounded retries) and reports its
+/// progress as a percentage. A complete cached file is verified again and
+/// reused; a changed one is refused rather than overwritten.
+fn download(
+    url: &str,
     expected: &str,
+    size: u64,
     destination: &Path,
-    limit: u64,
+    stage: &str,
+    progress: &impl Fn(&str),
 ) -> Result<()> {
-    let parent = destination
-        .parent()
-        .context("Download destination has no directory")?;
-    let name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("Download destination has no name")?;
-    let temporary = parent.join(format!(
-        ".{name}.{}.part",
-        &super::plugin::new_token()?[..16]
-    ));
-    let mut file = fs::File::options()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)?;
-    let result = (|| -> Result<()> {
-        let mut hasher = Sha256::new();
-        let mut total = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            total += count as u64;
-            ensure!(total <= limit, "Downloaded file exceeds its size limit");
-            hasher.update(&buffer[..count]);
-            file.write_all(&buffer[..count])?;
-        }
-        ensure!(
-            format!("{:x}", hasher.finalize()) == expected,
-            "Downloaded file failed SHA-256 verification"
-        );
-        file.sync_all()?;
-        Ok(())
-    })();
-    drop(file);
-    match result {
-        Ok(()) => fs::rename(&temporary, destination).map_err(Into::into),
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            Err(error)
-        }
+    let cancel = Arc::new(AtomicBool::new(false));
+    if destination.exists() {
+        return crate::model::download::verified(destination, size, expected, &cancel)
+            .context("A cached download has changed. Remove it before retrying.");
     }
+    progress(&format!("{stage}…"));
+    let mut last_percent = None;
+    crate::model::download::fetch(
+        crate::model::download::Artifact {
+            url,
+            destination,
+            size,
+            sha: expected,
+            stage,
+        },
+        &cancel,
+        &mut |step, fraction| {
+            let percent = fraction.map(|fraction| (fraction * 100.0).clamp(0.0, 100.0) as u8);
+            if percent != last_percent || step != stage {
+                last_percent = percent;
+                match percent {
+                    Some(percent) => progress(&format!("{step}… {percent}%")),
+                    None => progress(&format!("{step}…")),
+                }
+            }
+        },
+    )
+    .with_context(|| format!("{stage} failed"))
 }
 
 /// Creates a private, pinned source checkout. Does not touch Discord or installed Vencord.
@@ -993,8 +955,14 @@ pub fn prepare_managed(progress: impl Fn(&str)) -> Result<Plan> {
     fs::create_dir_all(&cache)?;
     ordinary(&cache)?;
     let archive = cache.join(format!("Vencord-{SOURCE_REVISION}.zip"));
-    progress("Downloading the verified Vencord source…");
-    download(SOURCE_URL, SOURCE_SHA256, &archive, 32 * 1024 * 1024)?;
+    download(
+        SOURCE_URL,
+        SOURCE_SHA256,
+        SOURCE_SIZE,
+        &archive,
+        "Downloading the verified Vencord source",
+        &progress,
+    )?;
     let stage = cache.join(format!("extract-{}", super::plugin::new_token()?));
     fs::create_dir(&stage)?;
     extract_archive(&archive, &stage)?;
@@ -1061,12 +1029,13 @@ pub fn open_installer(source: &Path, progress: impl Fn(&str)) -> Result<()> {
     fs::create_dir_all(&cache)?;
     ordinary(&cache)?;
     let installer = cache.join("VencordInstaller-1.4.2.exe");
-    progress("Downloading the verified Vencord installer…");
     download(
         INSTALLER_URL,
         INSTALLER_SHA256,
+        INSTALLER_SIZE,
         &installer,
-        32 * 1024 * 1024,
+        "Downloading the verified Vencord installer",
+        &progress,
     )?;
     Command::new(&installer)
         .env("VENCORD_USER_DATA_DIR", external_path(&source))
@@ -1144,50 +1113,70 @@ mod tests {
         }
     }
     #[test]
-    fn verified_downloads_stream_to_a_temporary_file_and_leave_nothing_on_failure() {
+    fn cached_downloads_are_verified_by_size_and_digest_before_reuse() {
         let fixture = Fixture::new();
         let bytes: Vec<u8> = (0..200_000_u32).map(|i| (i % 251) as u8).collect();
         let expected = hash(&bytes);
         let destination = fixture.0.join("archive.zip");
-        let leftovers = || {
-            fs::read_dir(&fixture.0)
-                .unwrap()
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
-                .count()
-        };
-        assert!(
-            stream_verified(
-                std::io::Cursor::new(&bytes),
-                &expected,
-                &destination,
-                100_000
-            )
-            .is_err(),
-            "Oversized downloads stop at the limit"
-        );
-        assert!(!destination.exists());
-        assert!(
-            stream_verified(
-                std::io::Cursor::new(&bytes),
-                &"0".repeat(64),
-                &destination,
-                1 << 20
-            )
-            .is_err(),
-            "A digest mismatch never produces the destination"
-        );
-        assert!(!destination.exists());
-        assert_eq!(leftovers(), 0);
-        stream_verified(
-            std::io::Cursor::new(&bytes),
+        fs::write(&destination, &bytes).unwrap();
+        let messages = std::cell::RefCell::new(Vec::new());
+        let progress = |message: &str| messages.borrow_mut().push(message.to_owned());
+        download(
+            "https://example.invalid/archive.zip",
             &expected,
+            bytes.len() as u64,
             &destination,
-            1 << 20,
+            "Downloading",
+            &progress,
         )
         .unwrap();
-        assert_eq!(fs::read(&destination).unwrap(), bytes);
-        assert_eq!(leftovers(), 0);
+        assert!(
+            messages.borrow().is_empty(),
+            "a verified cache needs no network"
+        );
+        assert!(
+            download(
+                "https://example.invalid/archive.zip",
+                &"0".repeat(64),
+                bytes.len() as u64,
+                &destination,
+                "Downloading",
+                &progress,
+            )
+            .is_err(),
+            "a changed cached file is refused"
+        );
+        assert!(
+            download(
+                "https://example.invalid/archive.zip",
+                &expected,
+                bytes.len() as u64 + 1,
+                &destination,
+                "Downloading",
+                &progress,
+            )
+            .is_err(),
+            "the pinned size must match"
+        );
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            bytes,
+            "verification never rewrites"
+        );
+        // Nothing may be fetched over plain HTTP or from an unpinned manifest.
+        let missing = fixture.0.join("missing.zip");
+        assert!(
+            download(
+                "http://example.invalid/archive.zip",
+                &expected,
+                bytes.len() as u64,
+                &missing,
+                "Downloading",
+                &progress,
+            )
+            .is_err()
+        );
+        assert!(!missing.exists());
     }
 
     #[test]
