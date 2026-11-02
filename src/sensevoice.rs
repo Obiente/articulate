@@ -51,16 +51,21 @@ fn verify(path: &std::path::Path, hash: &str) -> Result<()> {
     );
     Ok(())
 }
-pub fn install(mut progress: impl FnMut(f32)) -> Result<()> {
+pub fn install(progress: impl FnMut(f32)) -> Result<()> {
+    install_cancellable(&Arc::new(AtomicBool::new(false)), progress)
+}
+pub fn install_cancellable(cancel: &Arc<AtomicBool>, mut progress: impl FnMut(f32)) -> Result<()> {
+    let _lease = crate::model::acquire(crate::model::ModelId::SoundCues);
     ensure!(
         cfg!(all(windows, target_arch = "x86_64")),
         "Audio context currently requires 64-bit Windows."
     );
-    let archive = crate::model::download_file(
+    let archive = crate::model::download_file_cancellable(
         "sensevoice-runtime-1.4.16.zip",
         4_967_457,
         "f6a73a548413ba9fbaf2145263ea66ec53cbdad1fb11790dbeeee493e339492e",
         "https://github.com/modelscope/FunASR/releases/download/v1.4.16/funasr-llamacpp-windows-x64.zip",
+        cancel,
         &mut |p| progress(p * 0.02),
     )?;
     let mut zip = zip::ZipArchive::new(fs::File::open(archive)?)?;
@@ -76,11 +81,12 @@ pub fn install(mut progress: impl FnMut(f32)) -> Result<()> {
     drop(output);
     verify(&part, EXE_HASH)?;
     fs::rename(part, root().join(EXE))?;
-    crate::model::download_file(
+    crate::model::download_file_cancellable(
         MODEL,
         MODEL_SIZE,
         MODEL_HASH,
         "https://huggingface.co/FunAudioLLM/SenseVoiceSmall-GGUF/resolve/90c1c61912018b70ada0fcc024ea24aca62f2e63/sensevoice-small-q8.gguf",
+        cancel,
         &mut |p| progress(0.02 + p * 0.98),
     )?;
     fs::write(
@@ -263,9 +269,11 @@ impl Worker {
         let (results, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
+        let lease = crate::model::acquire(crate::model::ModelId::SoundCues);
         let spawned = std::thread::Builder::new()
             .name("audio-context".into())
             .spawn(move || {
+                let _lease = lease;
                 let ready = verify(&root().join(EXE), EXE_HASH)
                     .and_then(|_| verify(&root().join(MODEL), MODEL_HASH));
                 if let Err(error) = ready {

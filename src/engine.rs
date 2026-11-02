@@ -14,6 +14,8 @@ pub struct Engine {
     options: RunOptions,
     call_preference: Option<String>,
     pub languages: Vec<String>,
+    _speech_lease: crate::model::ModelLease,
+    _verifier_lease: Option<crate::model::ModelLease>,
 }
 
 impl Engine {
@@ -33,6 +35,7 @@ impl Engine {
         cancel: &CancelToken,
         language: Option<String>,
     ) -> Result<Self> {
+        let speech_lease = crate::model::acquire_path(path);
         let model = Model::load_with(
             path,
             &ModelOptions {
@@ -66,6 +69,7 @@ impl Engine {
         session.set_cancel_token(cancel);
         let mut verifier_options = options.clone();
         let mut verifier_max_samples = 0;
+        let mut verifier_lease = Some(crate::model::acquire(crate::model::ModelId::Verifier));
         let verifier_path = crate::model::verifier_path();
         let verifier = if verifier_path.is_file() && verifier_path != path {
             let attempt = (|| -> Result<Session> {
@@ -108,6 +112,9 @@ impl Engine {
         } else {
             None
         };
+        if verifier.is_none() {
+            verifier_lease = None;
+        }
         if !backend.to_ascii_lowercase().contains("cpu") {
             // Prepare GPU kernels before reporting readiness. The synthetic
             // silence is never presented as a transcript or sent for insertion.
@@ -128,6 +135,8 @@ impl Engine {
             options: options.clone(),
             call_preference: None,
             languages: caps.languages,
+            _speech_lease: speech_lease,
+            _verifier_lease: verifier_lease,
         })
     }
 
