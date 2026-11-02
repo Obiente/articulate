@@ -108,6 +108,7 @@ pub fn prune_downloads(root: &std::path::Path, pending: Option<&std::path::Path>
     if !root.exists() {
         return Ok(());
     }
+    let mut first_error = None;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
@@ -122,9 +123,15 @@ pub fn prune_downloads(root: &std::path::Path, pending: Option<&std::path::Path>
                 continue;
             }
         }
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            fs::remove_dir_all(path)?;
+        if metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && let Err(error) = fs::remove_dir_all(path)
+        {
+            first_error.get_or_insert(error);
         }
+    }
+    if let Some(error) = first_error {
+        return Err(error.into());
     }
     Ok(())
 }

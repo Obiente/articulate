@@ -20,6 +20,36 @@ use std::{
 
 static TRANSFERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+struct DirectoryLock {
+    file: Option<fs::File>,
+    path: std::path::PathBuf,
+}
+impl DirectoryLock {
+    fn acquire(directory: &Path) -> Result<Self> {
+        let path = directory.join(".download.lock");
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let file = options
+            .open(&path)
+            .context("Another download or cleanup may be active in this folder")?;
+        Ok(Self {
+            file: Some(file),
+            path,
+        })
+    }
+}
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Remove abandoned prefixes only while no managed transfer is running.
 pub fn prune_stale(directory: &Path, age: Duration) -> Result<()> {
     let _guard = TRANSFERS
@@ -28,6 +58,7 @@ pub fn prune_stale(directory: &Path, age: Duration) -> Result<()> {
     if !directory.exists() {
         return Ok(());
     }
+    let _directory_lock = DirectoryLock::acquire(directory)?;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -96,6 +127,11 @@ fn transfer(
         "Invalid download manifest."
     );
     let part = a.destination.with_extension(format!("{}.part", a.sha));
+    let _directory_lock = DirectoryLock::acquire(
+        a.destination
+            .parent()
+            .context("Missing download directory")?,
+    )?;
     if part.exists() {
         ordinary(&part)?;
     }
@@ -297,14 +333,14 @@ pub(crate) fn ordinary(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
         metadata.is_file() && !metadata.file_type().is_symlink(),
-        "The local editor contains an unexpected file type."
+        "The download path contains an unexpected file type."
     );
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         ensure!(
             metadata.file_attributes() & 0x400 == 0,
-            "The local editor contains an unexpected linked file."
+            "The download path contains an unexpected linked file."
         );
     }
     Ok(())
@@ -314,7 +350,7 @@ pub(crate) fn verified(path: &Path, size: u64, expected: &str, cancel: &AtomicBo
     let mut file = fs::File::open(path)?;
     ensure!(
         file.metadata()?.len() == size,
-        "A local editor file has the wrong size. Download it again."
+        "The downloaded file has the wrong size. Download it again."
     );
     let mut buffer = vec![0; 256 * 1024];
     let mut hash = Sha256::new();
@@ -328,7 +364,7 @@ pub(crate) fn verified(path: &Path, size: u64, expected: &str, cancel: &AtomicBo
     }
     ensure!(
         format!("{:x}", hash.finalize()) == expected,
-        "A local editor file failed verification. Download it again."
+        "The downloaded file failed verification. Download it again."
     );
     Ok(())
 }
@@ -355,6 +391,16 @@ mod tests {
         prune_stale(&directory, Duration::ZERO).unwrap();
         assert!(!directory.join("old.part").exists());
         assert!(directory.join("finished.gguf").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn directory_lock_excludes_another_handle() {
+        let (directory, _, _) = fixture();
+        let lock = DirectoryLock::acquire(&directory).unwrap();
+        assert!(DirectoryLock::acquire(&directory).is_err());
+        drop(lock);
+        drop(DirectoryLock::acquire(&directory).unwrap());
         fs::remove_dir_all(directory).unwrap();
     }
     fn request(socket: &mut TcpStream) -> String {
