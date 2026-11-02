@@ -2,6 +2,10 @@ use crate::app::App;
 use serde::Deserialize;
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "Variant names are the renderer's action types"
+)]
 pub(crate) enum Action {
     AssortStart { app: Option<String> },
     AssortApply { index: usize, saved_spelling: bool },
