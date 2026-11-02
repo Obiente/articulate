@@ -178,5 +178,91 @@ export const sampleSettings = {
   discord_auto_transcribe: false,
   discord_companion: true,
   vencord_auto_update: false,
+  discord_flavor: "",
+  discord_avatars: true,
+  meetings_teams: false,
+  meetings_zoom: false,
+  meetings_meet: false,
+  meetings_start: "ask",
   cpu: false,
+};
+
+// A connected companion in a small voice channel. The avatar identifier has
+// the exact form the desktop app produces; the preview draws its own picture.
+export const sampleAvatarUri =
+  "bytes://discord-avatar/100000000000000001/0123456789abcdef0123456789abcdef.png";
+
+export const sampleDiscord = {
+  connected: true,
+  listener_started: true,
+  status: "ready",
+  in_voice: true,
+  audio_ready: true,
+  audio_status: "ready",
+  audio_message: null,
+  participants: [
+    {
+      id: "100000000000000001",
+      name: "Casey",
+      speaking: true,
+      is_self: false,
+      avatar: sampleAvatarUri,
+    },
+    {
+      id: "100000000000000002",
+      name: "Jordan Lee",
+      speaking: false,
+      is_self: false,
+      avatar: null,
+    },
+    {
+      id: "100000000000000003",
+      name: "You",
+      speaking: false,
+      is_self: true,
+      avatar: null,
+    },
+  ],
+  pairing_state: "paired",
+  pairing_key_present: true,
+  companion_protocol: "current",
+  companion_protocol_message: null,
+  flavor: "",
+  installed_flavors: ["stable", "canary"],
+  debugger_port: 51234,
+  debugger_open: true,
+  debugger_notice:
+    "Discord is running with its local debugger open. Any program on this computer can read or control that Discord window until you restart Discord without it.",
+  automatic_can_retry: false,
+  error: null,
+  relaunching: false,
+  companion_selected: true,
+  automatic_status: "",
+  companion: {
+    checked: true,
+    installed: true,
+    runtime_status: "current",
+    source_found: true,
+    active: true,
+    busy: false,
+    status: "",
+    error: null,
+    plugin_status: "current",
+    can_build: true,
+    native_audio: true,
+    installer_ready: false,
+  },
+};
+
+export const sampleMeetings = {
+  enabled: false,
+  settings: { teams: false, zoom: false, meet: false, start: "ask" },
+  consent_reminder:
+    "Recording a meeting may require the consent of everyone taking part. Tell the other participants that a transcript is being made and check the rules that apply where you and they are.",
+  active: [],
+  prompt: null,
+  owned: null,
+  status: "",
+  probe_error: null,
+  events: [],
 };

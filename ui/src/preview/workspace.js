@@ -3,11 +3,20 @@
 // the desktop transport runs before these handlers.
 import { previewSupports, savedPatchValue } from "../actions.js";
 import {
+  sampleAvatarUri,
   sampleDictionary,
+  sampleDiscord,
   sampleMacros,
+  sampleMeetings,
   sampleRecords,
   sampleSettings,
 } from "./fixtures.js";
+
+const meetingApps = {
+  teams: { id: "teams", label: "Microsoft Teams", best_effort: false },
+  zoom: { id: "zoom", label: "Zoom", best_effort: false },
+  meet: { id: "meet", label: "Google Meet", best_effort: true },
+};
 
 const storageKey = "articulate-ui-sample-workspace-v1";
 
@@ -82,6 +91,8 @@ export function createPreviewWorkspace(storage) {
     settings: { ...structuredClone(sampleSettings), ...saved?.settings },
     microphones: ["Default microphone"],
     outputs: ["Default speakers"],
+    discord: structuredClone(sampleDiscord),
+    meetings: structuredClone(sampleMeetings),
     insights: null,
     notes: {
       ready: false,
@@ -359,8 +370,105 @@ export function createPreviewWorkspace(storage) {
     settings_patch(action) {
       const { type, ...patch } = action;
       sample.settings = { ...sample.settings, ...patch };
+      if (patch.discord_flavor !== undefined)
+        sample.discord.flavor = patch.discord_flavor;
+      if (patch.discord_avatars === false)
+        for (const participant of sample.discord.participants)
+          participant.avatar = null;
+      else if (patch.discord_avatars === true && sample.discord.participants[0])
+        sample.discord.participants[0].avatar = sampleAvatarUri;
+      syncMeetings();
+    },
+    meeting_respond(action) {
+      const prompt = sample.meetings.prompt;
+      if (!prompt) throw Error("No meeting is waiting for an answer.");
+      sample.meetings.prompt = null;
+      if (action.accept) {
+        sample.meetings.owned = prompt;
+        sample.meetings.status = `Transcribing the ${prompt.label} meeting.`;
+      } else {
+        sample.meetings.status = `Transcription is paused for this ${prompt.label} meeting.`;
+      }
+    },
+    discord_relaunch_normally() {
+      sample.discord.debugger_open = false;
+      sample.discord.debugger_port = 0;
+      sample.discord.debugger_notice = null;
+    },
+    discord_rotate_key() {
+      sample.discord.pairing_key_present = true;
+    },
+    discord_forget_pairing() {
+      sample.discord.pairing_key_present = false;
+      sample.discord.listener_started = false;
+      sample.discord.connected = false;
+      sample.discord.in_voice = false;
+      sample.discord.status = "disconnected";
+      sample.discord.pairing_state = "automatic";
+      sample.discord.participants = [];
+      sample.settings.discord_auto_connect = false;
     },
   };
+
+  // Mirrors the desktop controller: watched apps, and a synthetic meeting a
+  // few seconds after detection is switched on so the prompt can be checked.
+  let detection = null;
+  function syncMeetings() {
+    const settings = sample.settings;
+    const meetings = sample.meetings;
+    meetings.settings = {
+      teams: Boolean(settings.meetings_teams),
+      zoom: Boolean(settings.meetings_zoom),
+      meet: Boolean(settings.meetings_meet),
+      start: settings.meetings_start || "ask",
+    };
+    const watched = Object.entries(meetings.settings)
+      .filter(([key, on]) => key !== "start" && on)
+      .map(([key]) => meetingApps[key]);
+    meetings.enabled = watched.length > 0;
+    meetings.active = meetings.active.filter((item) =>
+      watched.some((app) => app.id === item.id),
+    );
+    for (const key of ["prompt", "owned"])
+      if (meetings[key] && !watched.some((app) => app.id === meetings[key].id))
+        meetings[key] = null;
+    if (!meetings.enabled) {
+      meetings.status = "";
+      clearTimeout(detection);
+      detection = null;
+      return;
+    }
+    meetings.status = meetings.owned
+      ? `Transcribing the ${meetings.owned.label} meeting.`
+      : meetings.prompt
+        ? `${meetings.prompt.label} meeting detected. Choose whether to start a transcript.`
+        : "Watching for a meeting.";
+    if (!meetings.active.length && !detection)
+      detection = setTimeout(() => {
+        detection = null;
+        const app = watched[0];
+        if (!app || !sample.meetings.enabled) return;
+        sample.meetings.active = [app];
+        sample.meetings.events = [
+          ...sample.meetings.events.slice(-15),
+          {
+            app: app.id,
+            label: app.label,
+            kind: "started",
+            at_unix_ms: Date.now(),
+          },
+        ];
+        if (sample.meetings.settings.start === "automatic") {
+          sample.meetings.owned = app;
+          sample.meetings.status = `Transcribing the ${app.label} meeting.`;
+        } else {
+          sample.meetings.prompt = app;
+          sample.meetings.status = `${app.label} meeting detected. Choose whether to start a transcript.`;
+        }
+        publish();
+      }, 2500);
+  }
+  syncMeetings();
 
   // Clipboard and download requests do not change the workspace.
   const effects = {
@@ -385,8 +493,37 @@ export function createPreviewWorkspace(storage) {
     for (const listener of listeners) listener(next);
   }
 
+  // A drawn placeholder picture for the one sample participant with an avatar.
+  let avatarBytes = null;
+  async function avatar(uri) {
+    if (uri !== sampleAvatarUri || !sample.settings.discord_avatars)
+      return null;
+    if (avatarBytes) return avatarBytes;
+    const canvas = globalThis.document?.createElement("canvas");
+    if (!canvas) return null;
+    canvas.width = 64;
+    canvas.height = 64;
+    const context = canvas.getContext("2d");
+    const gradient = context.createLinearGradient(0, 0, 64, 64);
+    gradient.addColorStop(0, "#5b8def");
+    gradient.addColorStop(1, "#93dfc2");
+    context.fillStyle = gradient;
+    context.fillRect(0, 0, 64, 64);
+    context.fillStyle = "#10201b";
+    context.font = "bold 30px sans-serif";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText("C", 32, 34);
+    const blob = await new Promise((resolve) =>
+      canvas.toBlob(resolve, "image/png"),
+    );
+    avatarBytes = new Uint8Array(await blob.arrayBuffer());
+    return avatarBytes;
+  }
+
   return {
     snapshot,
+    avatar,
     revision: () => revision,
     state(since) {
       return since?.preview === revision

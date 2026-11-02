@@ -53,9 +53,14 @@ export const actionCatalog = Object.freeze({
   discord_disconnect: {},
   discord_retry: {},
   discord_relaunch: {},
+  discord_relaunch_normally: { preview: true },
+  discord_rotate_key: { preview: true },
+  discord_forget_pairing: { preview: true },
   companion_detect: {},
   companion_install: {},
   companion_open_installer: {},
+  // Meeting detection
+  meeting_respond: { preview: true },
   // Updates
   update_check: {},
   update_download: {},
@@ -101,6 +106,22 @@ export function sourceMoveAction(id, topicId, expectedTopicId) {
 // Checks shared by the desktop and preview transports. Messages match the
 // native controller's.
 const validators = {
+  settings_patch(action) {
+    if (
+      action.discord_flavor !== undefined &&
+      !["", "stable", "ptb", "canary"].includes(action.discord_flavor)
+    )
+      throw Error("Choose Discord, Discord PTB or Discord Canary.");
+    if (
+      action.meetings_start !== undefined &&
+      !["ask", "automatic"].includes(action.meetings_start)
+    )
+      throw Error("Choose whether to ask first or start automatically.");
+  },
+  meeting_respond(action) {
+    if (typeof action.accept !== "boolean")
+      throw Error("Choose whether to start the transcript.");
+  },
   session_patch(action) {
     if (action.title !== undefined && !validTitle(action.title))
       throw Error("Use a title from 1 to 160 characters.");
