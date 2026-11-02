@@ -23,6 +23,7 @@ mod cli;
     reason = "Preserve context-aware correction review for React controls"
 )]
 mod correction_context;
+mod diagnostics;
 mod dictionary;
 mod discord;
 mod discord_attribution;
@@ -58,21 +59,48 @@ mod topics;
 mod update;
 mod writing_style;
 
-use app::desktop::{Action, Bridge};
-use std::sync::Arc;
+use app::desktop::{
+    Action, Bridge, CLOSE_ACK_TIMEOUT, CloseStep, ControllerHealth, Listeners, Overlay, StateUpdate,
+};
+use std::{
+    collections::HashMap,
+    sync::{Arc, mpsc},
+};
 use tauri::{Emitter, Manager};
 
+/// State sections newer than `since` (section name to revision), or all of
+/// them. Changes are also pushed as `desktop-state` events.
 #[tauri::command]
 fn desktop_snapshot(
     window: tauri::WebviewWindow,
     bridge: tauri::State<'_, Arc<Bridge>>,
-) -> Result<serde_json::Value, String> {
+    since: Option<HashMap<String, u64>>,
+) -> Result<StateUpdate, String> {
     require_main(&window)?;
-    Ok(bridge.snapshot())
+    Ok(bridge.snapshot(since.as_ref()))
+}
+
+/// The newest section revision, for a cheap check for missed events.
+#[tauri::command]
+fn desktop_revision(
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, Arc<Bridge>>,
+) -> Result<u64, String> {
+    require_main(&window)?;
+    Ok(bridge.revision())
 }
 
 #[tauri::command]
-fn desktop_overlay(bridge: tauri::State<'_, Arc<Bridge>>) -> serde_json::Value {
+fn desktop_health(
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, Arc<Bridge>>,
+) -> Result<ControllerHealth, String> {
+    require_main(&window)?;
+    Ok(bridge.health())
+}
+
+#[tauri::command]
+fn desktop_overlay(bridge: tauri::State<'_, Arc<Bridge>>) -> Overlay {
     bridge.overlay()
 }
 
@@ -83,30 +111,136 @@ async fn desktop_action(
     action: Action,
 ) -> Result<(), String> {
     require_main(&window)?;
-    let installing_update = matches!(action, Action::UpdateInstall);
+    let installing_update = action.installs_update();
     let bridge = bridge.inner().clone();
     tauri::async_runtime::spawn_blocking(move || bridge.action(action))
         .await
         .map_err(|e| e.to_string())??;
     if installing_update {
+        log::info!("Closing to install an update");
         window.app_handle().exit(0);
     }
     Ok(())
 }
 
+/// The window received close request `id`. `cancelled` means it decided to
+/// stay open, for example because saving its edits failed.
+#[tauri::command]
+fn desktop_close_ack(
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, Arc<Bridge>>,
+    id: u64,
+    cancelled: Option<bool>,
+) -> Result<(), String> {
+    require_main(&window)?;
+    bridge.acknowledge_close(id, cancelled.unwrap_or(false));
+    Ok(())
+}
+
+/// Save everything and exit. `force` skips save verification and is allowed
+/// only after the controller stopped working.
 #[tauri::command]
 async fn desktop_close(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     bridge: tauri::State<'_, Arc<Bridge>>,
+    force: Option<bool>,
 ) -> Result<(), String> {
     require_main(&window)?;
     let bridge = bridge.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || bridge.shutdown())
-        .await
-        .map_err(|e| e.to_string())??;
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = if force == Some(true) {
+            if bridge.force_close_allowed() {
+                log::warn!("Closing without verified saves at the user's request");
+                Ok(())
+            } else {
+                Err("Articulate can close without saving only after it stops working.".to_owned())
+            }
+        } else {
+            bridge.shutdown()
+        };
+        if result.is_err() {
+            bridge.close_finished();
+        }
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    log::info!("Closing");
     app.exit(0);
     Ok(())
+}
+
+/// Close without the window's help: it did not answer, or the user asked
+/// again while it seemed stuck. Unsent edits in a stuck window are lost;
+/// everything the controller holds is saved first.
+fn native_close(app: &tauri::AppHandle, bridge: &Bridge) {
+    match bridge.shutdown() {
+        Ok(()) => {
+            log::info!("Closing after saving");
+            app.exit(0);
+        }
+        Err(error) => {
+            log::warn!("Close did not complete: {error}");
+            let force = bridge.force_close_allowed();
+            bridge.close_finished();
+            let window = app.get_webview_window("main");
+            if force {
+                if confirm_close_anyway(window.as_ref(), &error) {
+                    log::warn!("Closing without verified saves at the user's request");
+                    app.exit(0);
+                }
+            } else {
+                show_close_problem(window.as_ref(), &error);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn message_box(window: Option<&tauri::WebviewWindow>, text: &str, style: u32) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW;
+    let owner = window
+        .and_then(|window| window.hwnd().ok())
+        .map_or(std::ptr::null_mut(), |handle| handle.0);
+    let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = "Articulate".encode_utf16().chain(Some(0)).collect();
+    unsafe { MessageBoxW(owner, text.as_ptr(), title.as_ptr(), style) }
+}
+
+fn confirm_close_anyway(window: Option<&tauri::WebviewWindow>, error: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO,
+        };
+        message_box(
+            window,
+            &format!(
+                "{error}\n\nClose Articulate anyway? Changes that were not saved will be lost."
+            ),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, error);
+        false
+    }
+}
+
+fn show_close_problem(window: Option<&tauri::WebviewWindow>, error: &str) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK};
+        message_box(
+            window,
+            &format!("Articulate is still open.\n\n{error}"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (window, error);
 }
 
 fn require_main(window: &tauri::WebviewWindow) -> Result<(), String> {
@@ -126,7 +260,9 @@ fn local_navigation(url: &tauri::Url) -> bool {
             && url.port() == Some(4173))
 }
 
-fn setup_overlay(app: &mut tauri::App) -> tauri::Result<()> {
+/// Create the indicator window. Its native visibility follows `visibility`,
+/// which receives a value whenever the controller publishes indicator state.
+fn setup_overlay(app: &mut tauri::App, visibility: mpsc::Receiver<bool>) -> tauri::Result<()> {
     let overlay = tauri::WebviewWindowBuilder::new(
         app,
         "dictation-overlay",
@@ -151,16 +287,15 @@ fn setup_overlay(app: &mut tauri::App) -> tauri::Result<()> {
     .build()?;
     overlay.set_ignore_cursor_events(true)?;
     let handle = app.handle().clone();
-    let bridge = app.state::<Arc<Bridge>>().inner().clone();
     std::thread::Builder::new()
         .name("dictation-indicator".into())
         .spawn(move || {
             let mut shown = false;
-            loop {
+            // Sleeps until the controller publishes a change.
+            for visible in visibility {
                 let Some(window) = handle.get_webview_window("dictation-overlay") else {
                     break;
                 };
-                let visible = bridge.overlay()["visible"].as_bool().unwrap_or(false);
                 if visible && !shown {
                     if let Ok(Some(monitor)) = window.primary_monitor() {
                         let area = monitor.work_area();
@@ -181,7 +316,6 @@ fn setup_overlay(app: &mut tauri::App) -> tauri::Result<()> {
                 } else if !visible && shown && show_indicator(&window, false) {
                     shown = false;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         })
         .map_err(tauri::Error::Io)?;
@@ -210,6 +344,7 @@ fn show_indicator(window: &tauri::WebviewWindow, visible: bool) -> bool {
 
 fn main() {
     if let Err(error) = run() {
+        log::error!("{error}");
         eprintln!("{error}");
         #[cfg(windows)]
         if std::env::args_os().len() == 1 {
@@ -232,9 +367,12 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
+        diagnostics::attach_parent_console();
+        diagnostics::init_console_log();
         return cli::run(&args);
     }
     let _instance = Instance::acquire()?;
+    diagnostics::init_file_log();
     #[cfg(windows)]
     tauri::webview_version().map_err(|error| {
         anyhow::anyhow!(
@@ -243,16 +381,32 @@ fn run() -> anyhow::Result<()> {
     })?;
     tauri::Builder::default()
         .setup(|app| {
-            app.manage(Arc::new(Bridge::start().map_err(std::io::Error::other)?));
+            let (indicator, visibility) = mpsc::channel();
+            let state_events = app.handle().clone();
+            let overlay_events = app.handle().clone();
+            let bridge = Bridge::start(Listeners {
+                state: Box::new(move |update| {
+                    let _ = state_events.emit_to("main", "desktop-state", update);
+                }),
+                overlay: Box::new(move |overlay| {
+                    let _ = overlay_events.emit_to("dictation-overlay", "desktop-overlay", overlay);
+                    let _ = indicator.send(overlay.visible);
+                }),
+            })
+            .map_err(std::io::Error::other)?;
+            app.manage(Arc::new(bridge));
             tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
                 .on_navigation(local_navigation)
                 .build()?;
-            setup_overlay(app)?;
+            setup_overlay(app, visibility)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             desktop_snapshot,
+            desktop_revision,
+            desktop_health,
             desktop_action,
+            desktop_close_ack,
             desktop_close,
             desktop_overlay
         ])
@@ -264,15 +418,24 @@ fn run() -> anyhow::Result<()> {
                 api.prevent_close();
                 let app = window.app_handle().clone();
                 let bridge = app.state::<Arc<Bridge>>().inner().clone();
-                if bridge.has_frontend() {
-                    let _ = window.emit("desktop-close-requested", ());
-                    return;
-                }
-                tauri::async_runtime::spawn_blocking(move || {
-                    if bridge.shutdown().is_ok() {
-                        app.exit(0);
+                match bridge.request_close() {
+                    CloseStep::AskRenderer(id) => {
+                        log::info!("Close requested; asking the window to save its edits");
+                        let _ = app.emit_to("main", "desktop-close-requested", id);
+                        // A hung window must not keep the app open.
+                        std::thread::spawn(move || {
+                            if bridge.close_unanswered(id, CLOSE_ACK_TIMEOUT) {
+                                log::warn!("The window did not answer; closing from native code");
+                                native_close(&app, &bridge);
+                            }
+                        });
                     }
-                });
+                    CloseStep::Native => {
+                        log::info!("Closing from native code");
+                        tauri::async_runtime::spawn_blocking(move || native_close(&app, &bridge));
+                    }
+                    CloseStep::InProgress => {}
+                }
             }
         })
         .run(tauri::generate_context!())?;

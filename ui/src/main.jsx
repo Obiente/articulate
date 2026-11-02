@@ -1,7 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.jsx";
-import { Overlay } from "./Overlay.jsx";
+import { Overlay } from "./features/overlay/Overlay.jsx";
 import { MotionShell, dialogTransition } from "./motion.jsx";
 import { MantineProvider, createTheme } from "@mantine/core";
 import { Notifications } from "@mantine/notifications";

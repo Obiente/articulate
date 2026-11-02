@@ -828,6 +828,10 @@ p {
 .transcript-row.provisional p {
   color: #96d3af;
 }
+/* A measured row in a long, partly rendered transcript. Contains margins. */
+.virtual-row {
+  display: flow-root;
+}
 .dictation-stage {
   border: 1px solid #2c4032;
   border-radius: 18px;

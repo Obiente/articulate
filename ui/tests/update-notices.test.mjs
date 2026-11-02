@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   createUpdateNoticeTracker,
   updateNotices,
-} from "../src/update-notices.js";
+} from "../src/features/updates/update-notices.js";
 
 test("app and companion updates appear together and advance through their stages", () => {
   const state = {
