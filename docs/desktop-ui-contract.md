@@ -21,6 +21,7 @@ Sections are typed serde views in `src/app/desktop/view/`; the registry is `view
 | `settings` | `settings`, `microphones`, `outputs` | Live |
 | `models` | `model_status`, `downloading` | Live |
 | `discord` | `discord` | Live |
+| `meetings` | `meetings` | Live |
 | `updater` | `updater` | Live |
 | `overlay` | `overlay` | Live |
 | `history` | `history` | Background |
@@ -58,6 +59,38 @@ type Row = {
   provisional: boolean;
 };
 type Overlay = { visible: boolean; recording: boolean; finishing: boolean; message: string };
+type Participant = {
+  id: string; name: string; speaking: boolean; is_self: boolean;
+  avatar: string | null; // "bytes://discord-avatar/{id}/{hash}.png", null while pictures are off
+};
+type Discord = {
+  connected: boolean; listener_started: boolean;
+  status: "ready" | "connecting" | "unavailable" | "disconnected";
+  in_voice: boolean; audio_ready: boolean; audio_status: string | null; audio_message: string | null;
+  participants: Participant[];
+  pairing_state: "paired" | "waiting" | "automatic"; pairing_key_present: boolean;
+  companion_protocol: "current" | "outdated" | "newer" | "unknown"; companion_protocol_message: string | null;
+  flavor: "" | "stable" | "ptb" | "canary"; installed_flavors: ("stable" | "ptb" | "canary")[];
+  debugger_port: number; debugger_open: boolean; debugger_notice: string | null;
+  automatic_can_retry: boolean; error: string | null; relaunching: boolean;
+  companion_selected: boolean; automatic_status: string;
+  companion: {
+    checked: boolean; installed: boolean;
+    runtime_status: "current" | "restart_required" | "update_required" | "offline" | "unverified";
+    source_found: boolean; active: boolean; busy: boolean; status: string; error: string | null;
+    plugin_status: "missing" | "current" | "update_available" | "unknown";
+    can_build: boolean; native_audio: boolean; installer_ready: boolean;
+  };
+};
+type MeetingApp = { id: "teams" | "zoom" | "meet"; label: string; best_effort: boolean };
+type Meetings = {
+  enabled: boolean;
+  settings: { teams: boolean; zoom: boolean; meet: boolean; start: "ask" | "automatic" };
+  consent_reminder: string;
+  active: MeetingApp[]; prompt: MeetingApp | null; owned: MeetingApp | null;
+  status: string; probe_error: string | null;
+  events: { app: string; label: string; kind: "started" | "ended"; at_unix_ms: number }[];
+};
 type Updater =
   | { state: "idle" | "checking" | "latest" }
   | { state: "available"; version: string; size: number }
@@ -66,7 +99,7 @@ type Updater =
   | { state: "error"; error: string };
 ```
 
-`settings` contains `clean_speech`, `insert`, `live_insert`, `cpu`, `transcription_language`, `audio_context`, `learn_corrections`, `audio_feedback`, `microphone`, `output`, `hotkey`, `quick_note_hotkey`, `quick_note_hotkey_pending`, `quick_note_shortcut_error`, `hotkey_mode`, `discord_auto_connect`, `discord_auto_transcribe`, `discord_companion` and `vencord_auto_update`. `model_status` reports installation, progress and status for the speech, speaker, audio context, second speech (verifier) and cleanup models, plus `backend`, `model_name` (file name only), `speech_languages` and `model_custom`. `downloading` is the speech model download progress from 0 to 1. The `discord`, `capture_feedback` and notes status objects are produced by their feature modules and keep the shapes described below.
+`settings` contains `clean_speech`, `insert`, `live_insert`, `cpu`, `transcription_language`, `audio_context`, `learn_corrections`, `audio_feedback`, `microphone`, `output`, `hotkey`, `quick_note_hotkey`, `quick_note_hotkey_pending`, `quick_note_shortcut_error`, `hotkey_mode`, `discord_auto_connect`, `discord_auto_transcribe`, `discord_companion`, `vencord_auto_update`, `discord_flavor`, `discord_avatars`, `meetings_teams`, `meetings_zoom`, `meetings_meet` and `meetings_start`. `model_status` reports installation, progress and status for the speech, speaker, audio context, second speech (verifier) and cleanup models, plus `backend`, `model_name` (file name only), `speech_languages` and `model_custom`. `downloading` is the speech model download progress from 0 to 1. The `discord`, `meetings`, `capture_feedback` and notes status objects are produced by their feature modules and keep the shapes described above and below.
 
 A live call's or spoken note's transcript is only in `call_rows` or `note_rows`; `call_session` and `note_session` carry no `text`, `original` or `rows`. The open document arrives as `selected` (metadata and notes) plus `selected_body` (transcript), so editing notes never resends a long transcript. The renderer joins them into `state.selected` when both have the same `id`; until the body arrives, the joined document has empty text and rows.
 
@@ -89,6 +122,7 @@ type Section = {
 - `desktop_snapshot({ since?: Record<string, number> })` returns every section newer than `since`, or all sections without it. Row sections are returned as splices when the renderer is exactly one revision behind, otherwise as complete `data`.
 - `desktop_revision()` returns the state revision. The renderer calls it every two seconds as a fallback for missed events and fetches newer sections when it differs.
 - `desktop_health()` returns the `Controller` object. It also reports `unresponsive` after a close request times out, which the event stream cannot.
+- `desktop_discord_avatar({ uri })` returns the cached PNG bytes for a `Participant.avatar` identifier, or an empty body while the picture is not cached yet or pictures are turned off. Only identifiers of that exact form are accepted; the renderer never receives Discord URLs and the existing `img-src 'self' data: blob:` policy is enough because the bytes are shown through a blob URL. The renderer retries an empty answer a few times and then keeps initials.
 
 The renderer (`ui/src/state/store.js`) applies sections in order, ignores sections at or below its revision, and keeps the previous object identity for every unchanged value, including individual rows and history entries (matched by `id`).
 
@@ -117,11 +151,15 @@ Vocabulary (`actions/vocabulary.rs`):
 - `dictionary_save { heard, wanted, app?: string, cues?: string, index?: number, expected_heard?: string, expected_entry?: Entry }`, `dictionary_delete { index, expected_heard, expected_entry }`
 - `macro_save { trigger, expansion, app?: string, index?: number, expected_trigger?: string, expected_macro?: VoiceMacro }`, `macro_delete { index, expected_trigger, expected_macro }`
 
-Settings (`actions/settings.rs`): `settings_patch { cpu?, model_path?, transcription_language?, clean_speech?, insert?, live_insert?, learn_corrections?, audio_feedback?, audio_context?, microphone?, output?, hotkey_mode?, hotkey?, quick_note_hotkey?, discord_auto_connect?, discord_auto_transcribe?, vencord_auto_update? }`. The whole patch is validated before anything changes; a failed save restores the previous values. Shortcut changes are registered only after the preferences are saved.
+Settings (`actions/settings.rs`): `settings_patch { cpu?, model_path?, transcription_language?, clean_speech?, insert?, live_insert?, learn_corrections?, audio_feedback?, audio_context?, microphone?, output?, hotkey_mode?, hotkey?, quick_note_hotkey?, discord_auto_connect?, discord_auto_transcribe?, vencord_auto_update?, discord_flavor?, discord_avatars?, meetings_teams?, meetings_zoom?, meetings_meet?, meetings_start? }`. The whole patch is validated before anything changes; a failed save restores the previous values. Shortcut changes are registered only after the preferences are saved. `discord_flavor` must be empty or an installed edition id and cannot change while Discord runs with the debugger or a restart is in progress; `meetings_start` is `ask` or `automatic`. Turning `discord_avatars` off drops the picture cache and removes avatar identifiers from the next update. The debugger port is not patchable: it is chosen by `discord_relaunch` and cleared by `discord_relaunch_normally`.
 
 Models (`actions/models.rs`): `model_download`, `model_load`, `summary_download`, `summary_download_cancel`, `cleanup_download`, `cleanup_download_cancel`, `context_download`, `speakers_download`, `verifier_download`.
 
-Discord (`actions/discord.rs`): `discord_connect { companion: boolean }`, `discord_disconnect`, `discord_retry`, `discord_relaunch`, `companion_detect`, `companion_install`, `companion_open_installer`.
+Discord (`actions/discord.rs`): `discord_connect { companion: boolean }`, `discord_disconnect`, `discord_retry`, `discord_relaunch`, `discord_relaunch_normally`, `discord_rotate_key`, `discord_forget_pairing`, `companion_detect`, `companion_install`, `companion_open_installer`, `meeting_respond { accept: boolean }`.
+
+- `discord_relaunch_normally` restarts the chosen edition without the debugger an earlier `discord_relaunch` opened; refused while recording or while another restart runs.
+- `discord_rotate_key` replaces the companion pairing key, so every companion holding the old key stops working; the current companion re-reads the new key locally and reconnects. `discord_forget_pairing` removes the key and stops listening until the next `discord_connect`. Both are refused during a recording.
+- `meeting_respond` answers the `meetings.prompt`; `accept: true` starts a transcript through the same path as automatic Discord capture, `false` leaves that meeting alone until it ends. It fails when no prompt is waiting.
 
 Updates (`actions/updates.rs`): `update_check`, `update_download`, `update_install`. Installation requires capture and processing to finish, no active download, and pending document saves to complete before the verified installer launches.
 
@@ -164,6 +202,10 @@ and `automatic_can_retry`. The `discord_retry` action clears an automatic
 capture pause and retries model loading without replacing a healthy listener.
 The companion discovers its authentication key locally; the desktop renderer
 never receives it.
+
+`companion_protocol` reports the local protocol version the connected companion speaks relative to this build; `outdated` asks for a companion update and `newer` for an app update, with `companion_protocol_message` holding the explanation. `debugger_open` and `debugger_notice` stay set while a relaunched Discord still exposes its debugger, until `discord_relaunch_normally` completes.
+
+`meetings` is a separate section: `enabled` mirrors the per-app settings, `active` lists confirmed meetings, `prompt` is the meeting waiting for `meeting_respond` in ask mode, `owned` is the meeting whose transcript detection started (and will finish when the meeting ends), `status` and `probe_error` describe the detector, and `events` keeps the last sixteen confirmed starts and ends.
 
 `companion.runtime_status` verifies the fresh companion fingerprint separately
 from source/build receipts (`current`, `restart_required`, `update_required`,
