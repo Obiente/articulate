@@ -660,6 +660,7 @@ impl App {
     }
 
     fn cancel_dictation(&mut self) {
+        self.capture_interruption = None;
         self.cancel.cancel();
         self.insertion_cancel.cancel();
         self.pending_final = None;
@@ -686,6 +687,7 @@ impl App {
         reason = "Audio import controller retained for the Tauri file import flow"
     )]
     fn transcribe(&mut self, pcm: Vec<f32>) {
+        self.capture_interruption = None;
         self.history_save_dictation();
         self.history.dictation = None;
         self.history.dictation_deleted = false;
@@ -2248,6 +2250,7 @@ mod tests {
     #[test]
     fn explicit_cancel_does_not_restart_pending_final_or_publish_late_chunks() {
         let (mut app, commands) = app();
+        app.capture_interruption = Some("Interrupted capture".into());
         let (tx, actions) = mpsc::channel();
         app.integration_tx = tx;
         app.busy = true;
@@ -2256,6 +2259,7 @@ mod tests {
         app.text = "Visible preview".into();
         let cancelled_id = app.utterance;
         app.cancel_dictation();
+        assert!(app.capture_interruption.is_none());
         assert!(app.cancel.is_cancelled() && app.insertion_cancel.is_cancelled());
         assert!(matches!(
             actions.try_recv().unwrap(),
