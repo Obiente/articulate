@@ -27,19 +27,20 @@ pub fn data_dir() -> PathBuf {
         }
         return std::env::temp_dir().join(format!("articulate-tests-{}", std::process::id()));
     }
-    std::env::var_os("LOCALAPPDATA")
+    let directory = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("TranscribeLocal")
-}
-pub fn default_path() -> PathBuf {
+        .join("TranscribeLocal");
     static CLEANUP: std::sync::Once = std::sync::Once::new();
     CLEANUP.call_once(|| {
         let _ = download::prune_stale(
-            &data_dir().join("models"),
+            &directory.join("models"),
             std::time::Duration::from_secs(7 * 86400),
         );
     });
+    directory
+}
+pub fn default_path() -> PathBuf {
     data_dir().join("models").join(NAME)
 }
 pub fn verifier_path() -> PathBuf {
@@ -113,9 +114,17 @@ pub fn download_file_cancellable(
         std::path::Path::new(name)
             .file_name()
             .and_then(|n| n.to_str())
-            == Some(name),
+            == Some(name)
+            && !name.contains(['/', '\\', ':']),
         "Invalid model filename"
     );
+    let _lease = match name {
+        NAME => Some(acquire(ModelId::Speech)),
+        VERIFIER_NAME => Some(acquire(ModelId::Verifier)),
+        crate::speakers::NAME => Some(acquire(ModelId::Speaker)),
+        "sensevoice-small-q8.gguf" => Some(acquire(ModelId::SoundCues)),
+        _ => None,
+    };
     let path = data_dir().join("models").join(name);
     fs::create_dir_all(path.parent().context("Missing model directory")?)?;
     download::fetch(
@@ -156,4 +165,120 @@ pub fn download_verifier_cancellable(
         cancel,
         &mut progress,
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelId {
+    Speech,
+    Verifier,
+    Speaker,
+    SoundCues,
+    Polish,
+    Notes,
+}
+#[derive(serde::Serialize)]
+pub struct ModelInfo {
+    pub id: ModelId,
+    pub installed: bool,
+    pub disk_size: u64,
+    pub path: PathBuf,
+    pub in_use: bool,
+}
+static MODEL_USERS: std::sync::Mutex<Vec<ModelId>> = std::sync::Mutex::new(Vec::new());
+/// Retain this lease for the complete lifetime of an inference engine or download.
+pub struct ModelLease(ModelId);
+impl Drop for ModelLease {
+    fn drop(&mut self) {
+        let mut users = MODEL_USERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = users.iter().position(|id| *id == self.0) {
+            users.remove(index);
+        }
+    }
+}
+#[allow(dead_code)]
+pub fn acquire(id: ModelId) -> ModelLease {
+    MODEL_USERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(id);
+    ModelLease(id)
+}
+fn managed_path(id: ModelId) -> PathBuf {
+    match id {
+        ModelId::Speech => data_dir().join("models").join(NAME),
+        ModelId::Verifier => verifier_path(),
+        ModelId::Speaker => data_dir().join("models").join(crate::speakers::NAME),
+        ModelId::SoundCues => data_dir().join("models").join("sensevoice-small-q8.gguf"),
+        ModelId::Polish => crate::polish::model_path(crate::polish::ModelProfile::Polish),
+        ModelId::Notes => crate::polish::model_path(crate::polish::ModelProfile::Summary),
+    }
+}
+#[allow(dead_code)]
+pub fn list_models() -> Vec<ModelInfo> {
+    let users = MODEL_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    [
+        ModelId::Speech,
+        ModelId::Verifier,
+        ModelId::Speaker,
+        ModelId::SoundCues,
+        ModelId::Polish,
+        ModelId::Notes,
+    ]
+    .into_iter()
+    .map(|id| {
+        let path = managed_path(id);
+        let disk_size = path.metadata().map_or(0, |m| m.len());
+        let installed = match id {
+            ModelId::Speech => disk_size == SIZE,
+            ModelId::Verifier => disk_size == VERIFIER_SIZE,
+            ModelId::Speaker => disk_size == 236_606_560,
+            ModelId::SoundCues => crate::sensevoice::installed(),
+            ModelId::Polish => {
+                crate::polish::profile_installed(crate::polish::ModelProfile::Polish)
+            }
+            ModelId::Notes => {
+                crate::polish::profile_installed(crate::polish::ModelProfile::Summary)
+            }
+        };
+        ModelInfo {
+            id,
+            installed,
+            disk_size,
+            path,
+            in_use: users.contains(&id),
+        }
+    })
+    .collect()
+}
+#[allow(dead_code)]
+pub fn delete_model(id: ModelId) -> Result<()> {
+    let users = MODEL_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    anyhow::ensure!(!users.contains(&id), "This model is in use");
+    let path = managed_path(id);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let _ = fs::remove_file(path.with_extension("verified.json"));
+    crate::polish::invalidate_install_state();
+    Ok(())
+}
+#[cfg(test)]
+mod management_tests {
+    use super::*;
+    #[test]
+    fn active_lease_prevents_deletion() {
+        let lease = acquire(ModelId::Speech);
+        assert!(
+            list_models()
+                .iter()
+                .find(|m| m.id == ModelId::Speech)
+                .unwrap()
+                .in_use
+        );
+        assert!(delete_model(ModelId::Speech).is_err());
+        drop(lease);
+    }
 }

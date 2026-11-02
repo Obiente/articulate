@@ -21,6 +21,9 @@ pub fn markdown(items: &[Item]) -> String {
 }
 fn escape(value: &str) -> String {
     value
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect::<String>()
         .replace('\\', "\\\\")
         .replace('\r', "")
         .replace('\n', "\\n")
@@ -39,6 +42,21 @@ fn line(output: &mut String, value: &str) {
     }
     output.push_str("\r\n");
 }
+
+/// Export tasks with an explicitly selected UTC reminder for every action.
+pub fn ics_with_reminder(
+    items: &[Item],
+    session: &str,
+    timestamp: &str,
+    reminder: &str,
+) -> anyhow::Result<String> {
+    // Reuse timestamp validation before interpolating calendar properties.
+    ics(&[], session, reminder)?;
+    Ok(ics(items, session, timestamp)?.replace(
+        "STATUS:NEEDS-ACTION\r\n",
+        &format!("STATUS:NEEDS-ACTION\r\nDUE:{reminder}\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Meeting follow-up\r\nTRIGGER;VALUE=DATE-TIME:{reminder}\r\nEND:VALARM\r\n"),
+    ))
+}
 /// UTC stamp must be supplied by the caller as YYYYMMDDTHHMMSSZ.
 /// Tasks have no inferred due date; callers can add reminders after import.
 pub fn ics(items: &[Item], session: &str, timestamp: &str) -> anyhow::Result<String> {
@@ -51,6 +69,32 @@ pub fn ics(items: &[Item], session: &str, timestamp: &str) -> anyhow::Result<Str
                 .enumerate()
                 .all(|(i, b)| i == 8 || i == 15 || b.is_ascii_digit()),
         "Invalid calendar timestamp"
+    );
+    let number = |range: std::ops::Range<usize>| timestamp[range].parse::<u32>().unwrap();
+    let year = number(0..4);
+    let month = number(4..6);
+    let day = number(6..8);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        _ => 0,
+    };
+    anyhow::ensure!(
+        year > 0
+            && day > 0
+            && day <= days
+            && number(9..11) < 24
+            && number(11..13) < 60
+            && number(13..15) < 60,
+        "Invalid calendar date"
     );
     let mut output =
         String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Articulate//Follow-ups//EN\r\n");
@@ -95,6 +139,12 @@ mod tests {
         assert!(text.contains("SUMMARY:Review\\, plan\\;\\nEND:VTODO"));
         assert_eq!(text.matches("\r\nEND:VTODO\r\n").count(), 1);
         assert!(ics(&items, "synthetic", "invalid").is_err());
+        assert!(ics(&items, "synthetic", "20260230T120000Z").is_err());
+        assert!(
+            ics_with_reminder(&items, "synthetic", "20260101T120000Z", "20260102T120000Z")
+                .unwrap()
+                .contains("BEGIN:VALARM\r\n")
+        );
         let mut folded = String::new();
         line(&mut folded, &"é".repeat(100));
         assert!(folded.split("\r\n").all(|l| l.len() <= 75));

@@ -17,6 +17,7 @@ const INSTRUCTION: &str = "Edit a dictated message. Return ONLY the edited text,
 
 pub(crate) struct Server {
     profile: ModelProfile,
+    _lease: crate::model::ModelLease,
     child: Child,
     #[cfg(windows)]
     _job: Job,
@@ -26,6 +27,25 @@ pub(crate) struct Server {
 }
 
 const WARM_IDLE: Duration = Duration::from_secs(60);
+fn matches_identity(value: &Value, alias: &str) -> bool {
+    value["data"]
+        .as_array()
+        .is_some_and(|models| models.len() == 1 && models[0]["id"].as_str() == Some(alias))
+}
+
+#[cfg(test)]
+#[test]
+fn identity_requires_the_unique_launched_alias() {
+    assert!(matches_identity(
+        &json!({"data":[{"id":"expected"}]}),
+        "expected"
+    ));
+    assert!(!matches_identity(
+        &json!({"data":[{"id":"another"}]}),
+        "expected"
+    ));
+    assert!(!matches_identity(&json!({"status":"ok"}), "expected"));
+}
 static SUMMARY_CACHE: Mutex<Option<(Instant, Server)>> = Mutex::new(None);
 static GPU_FAILURE: Mutex<Option<Instant>> = Mutex::new(None);
 fn prefer_gpu() -> bool {
@@ -98,6 +118,11 @@ impl Server {
         Self::start_profile(ModelProfile::Polish, cancel)
     }
     pub(crate) fn start_profile(profile: ModelProfile, cancel: &AtomicBool) -> Result<Self> {
+        let _lease = crate::model::acquire(if profile == ModelProfile::Polish {
+            crate::model::ModelId::Polish
+        } else {
+            crate::model::ModelId::Notes
+        });
         install::verify_profile(profile, cancel)?;
         if profile == ModelProfile::Summary && prefer_gpu() {
             if let Ok(server) = Self::start_verified(profile, true, cancel) {
@@ -218,6 +243,11 @@ impl Server {
             }
         };
         let mut server = Self {
+            _lease: crate::model::acquire(if profile == ModelProfile::Polish {
+                crate::model::ModelId::Polish
+            } else {
+                crate::model::ModelId::Notes
+            }),
             profile,
             child,
             #[cfg(windows)]
@@ -256,9 +286,7 @@ impl Server {
                 );
                 let value: Value = serde_json::from_str(&body)?;
                 ensure!(
-                    value["data"].as_array().is_some_and(|models| models
-                        .iter()
-                        .any(|model| model["id"].as_str() == Some(&alias))),
+                    matches_identity(&value, &alias),
                     "Local server identity did not match"
                 );
                 ensure!(
@@ -326,6 +354,10 @@ impl Server {
         schema: Option<&Value>,
         cancel: &AtomicBool,
     ) -> Result<String> {
+        ensure!(
+            self.child.try_wait()?.is_none(),
+            "The local editor stopped. Retry the request."
+        );
         if cancel.load(Ordering::Acquire) {
             let _ = self.child.kill();
             let _ = self.child.wait();

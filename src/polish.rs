@@ -117,6 +117,17 @@ pub struct Job {
     events: Receiver<Event>,
 }
 impl Job {
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, mpsc::Sender<Event>) {
+        let (tx, events) = mpsc::channel();
+        (
+            Self {
+                cancel: Arc::new(AtomicBool::new(false)),
+                events,
+            },
+            tx,
+        )
+    }
     pub fn try_recv(&self) -> std::result::Result<Event, TryRecvError> {
         self.events.try_recv()
     }

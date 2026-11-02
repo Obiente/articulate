@@ -1,5 +1,11 @@
 //! Pinned artifact transfers retain their saved, length-checked prefix across reconnects.
-use crate::polish::check_cancel;
+fn check_cancel(cancel: &std::sync::atomic::AtomicBool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !cancel.load(std::sync::atomic::Ordering::Acquire),
+        "Download cancelled"
+    );
+    Ok(())
+}
 #[path = "polish/transport.rs"]
 mod transport;
 use anyhow::{Context, Result, ensure};
@@ -335,6 +341,22 @@ mod tests {
         net::{TcpListener, TcpStream},
         thread,
     };
+    #[test]
+    fn cleanup_is_blocked_during_transfer_and_keeps_finished_files() {
+        let (directory, _, _) = fixture();
+        fs::write(directory.join("old.part"), b"partial").unwrap();
+        fs::write(directory.join("finished.gguf"), b"complete").unwrap();
+        {
+            let _guard = TRANSFERS.lock().unwrap();
+            assert!(prune_stale(&directory, Duration::ZERO).is_err());
+            assert!(directory.join("old.part").exists());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        prune_stale(&directory, Duration::ZERO).unwrap();
+        assert!(!directory.join("old.part").exists());
+        assert!(directory.join("finished.gguf").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
     fn request(socket: &mut TcpStream) -> String {
         socket
             .set_read_timeout(Some(Duration::from_secs(3)))
@@ -388,6 +410,45 @@ mod tests {
             socket.write_all(&data[1000..]).unwrap();
         });
         let path = directory.join("model");
+        transfer(
+            Artifact {
+                url: &url,
+                destination: &path,
+                size: size as u64,
+                sha: &sha,
+                stage: "Testing",
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &mut |_, _| {},
+            policy(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(fs::read(path).unwrap(), expected);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn changed_remote_identity_restarts_before_appending() {
+        let (directory, data, sha) = fixture();
+        let path = directory.join("model");
+        let part = path.with_extension(format!("{sha}.part"));
+        fs::write(&part, b"old prefix").unwrap();
+        fs::write(part.with_extension("identity"), "\"old\"").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/model", listener.local_addr().unwrap());
+        let expected = data.clone();
+        let size = data.len();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let headers = request(&mut first);
+            assert!(headers.contains("if-range: \"old\""));
+            write!(first,"HTTP/1.1 206 Partial Content\r\nETag: \"new\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().unwrap();
+            assert!(!request(&mut second).contains("range:"));
+            write!(second,"HTTP/1.1 200 OK\r\nETag: \"new\"\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n").unwrap();
+            second.write_all(&data).unwrap();
+        });
         transfer(
             Artifact {
                 url: &url,

@@ -241,6 +241,11 @@ pub(super) fn download_profile(
         "The local editor download is already running."
     );
     let _lock = DownloadLock;
+    let _lease = crate::model::acquire(if profile == ModelProfile::Polish {
+        crate::model::ModelId::Polish
+    } else {
+        crate::model::ModelId::Notes
+    });
     invalidate_install_state();
     fs::create_dir_all(root())?;
     let model = model_for(profile);
