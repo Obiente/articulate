@@ -81,8 +81,15 @@ pub struct Track {
     pending: VecDeque<Packet>,
     rate: u32,
     cursor: u64,
+    converter: crate::audio::StreamingResampler,
+    control: Arc<Control>,
     failed: Arc<AtomicBool>,
     pub level: Arc<AtomicU32>,
+    selected: Option<String>,
+    output: bool,
+    pub gaps: u64,
+    recovering: bool,
+    pub device: String,
 }
 
 impl Track {
@@ -97,13 +104,23 @@ impl Track {
             };
             devices
                 .find(|d| d.name().is_ok_and(|n| n == name))
-                .context("Selected audio device is unavailable")?
+                .or_else(|| {
+                    if output {
+                        host.default_output_device()
+                    } else {
+                        host.default_input_device()
+                    }
+                })
+                .context("No audio device is available")?
         } else if output {
             host.default_output_device()
                 .context("No speaker or headphone output found")?
         } else {
             host.default_input_device().context("No microphone found")?
         };
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "Default audio device".into());
         let config = if output {
             device.default_output_config()?
         } else {
@@ -117,7 +134,7 @@ impl Track {
             producer,
             channels: config.channels() as usize,
             rate,
-            control,
+            control: control.clone(),
             failed: failed.clone(),
             level: level.clone(),
             next: None,
@@ -138,16 +155,24 @@ impl Track {
             pending: VecDeque::new(),
             rate,
             cursor: 0,
+            converter: crate::audio::StreamingResampler::new(rate)?,
+            control,
             failed,
             level,
+            selected: selected.map(str::to_owned),
+            output,
+            gaps: 0,
+            recovering: false,
+            device: device_name,
         })
     }
 
     pub fn take_until(&mut self, seconds: f64) -> Result<Vec<f32>> {
-        anyhow::ensure!(
-            !self.failed.load(Ordering::Relaxed),
-            "Call audio capture failed or its buffer overflowed. Check your devices."
-        );
+        let interrupted = self.failed.swap(false, Ordering::Relaxed);
+        if interrupted && !self.recovering {
+            self.gaps += 1;
+            self.recovering = true;
+        }
         while let Some(packet) = self.consumer.try_pop() {
             self.pending.push_back(packet);
         }
@@ -174,7 +199,28 @@ impl Track {
             self.pending.pop_front();
         }
         self.cursor = end;
-        crate::audio::resample(&pcm, self.rate)
+        let mut output = Vec::new();
+        self.converter.append(&pcm, &mut output)?;
+        if self.control.stop_ns.load(Ordering::SeqCst) != 0 && seconds >= self.control.end_seconds()
+        {
+            self.converter.finish(&mut output)?;
+        }
+        if interrupted && self.control.stop_ns.load(Ordering::SeqCst) == 0 {
+            self.converter.finish(&mut output)?;
+            match Self::open(self.selected.as_deref(), self.output, self.control.clone()) {
+                Ok(mut replacement) => {
+                    replacement.cursor = (seconds * f64::from(replacement.rate)).round() as u64;
+                    replacement.gaps = self.gaps;
+                    *self = replacement;
+                }
+                Err(_) => {
+                    // Preserve the other track and retry at the next refresh.
+                    self.failed.store(true, Ordering::Relaxed);
+                    self.converter = crate::audio::StreamingResampler::new(self.rate)?;
+                }
+            }
+        }
+        Ok(output)
     }
 }
 

@@ -204,6 +204,7 @@ dependencies = [
  "tungstenite",
  "ureq 3.4.2",
  "windows 0.61.3",
+ "windows-core 0.61.2",
  "windows-sys 0.61.2",
  "winit",
  "zip 7.2.0",

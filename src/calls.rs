@@ -339,6 +339,7 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
     let mut cursor = 0.0;
     let mut draft_start = 0.0;
     let mut draft = Draft::default();
+    let mut refresh_seconds = REFRESH_SECONDS;
     let mut checkpoint = None;
     let result = (|| -> Result<()> {
         loop {
@@ -356,7 +357,8 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
             );
             let ready = if stopping { now } else { (now - 0.25).max(0.0) };
             let remaining = draft.remaining_seconds();
-            if stopping || ready >= cursor + REFRESH_SECONDS.min(remaining) {
+            if stopping || ready >= cursor + refresh_seconds.min(remaining) {
+                let decode_started = std::time::Instant::now();
                 // Slow CPUs consume available audio in one revision instead of
                 // queueing every missed refresh, with a fixed PCM memory bound.
                 let end = ready.min(cursor + remaining);
@@ -366,6 +368,10 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                 draft.mic.extend(microphone.take_until(end)?);
                 if let Some(output) = &mut output {
                     draft.remote.extend(output.take_until(end)?);
+                }
+                let gaps = microphone.gaps + output.as_ref().map_or(0, |track| track.gaps);
+                if gaps > 0 {
+                    update(Update::AudioGap(gaps));
                 }
                 let final_pass = draft.endpoint(microphone_only) || (stopping && end >= now);
                 let offset_ms = (draft_start * 1000.0) as u64;
@@ -452,6 +458,8 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                     }
                     rows
                 };
+                refresh_seconds =
+                    (decode_started.elapsed().as_secs_f64() * 1.25).clamp(REFRESH_SECONDS, 12.0);
                 draft.rows = rows;
                 cursor = end;
                 if final_pass {

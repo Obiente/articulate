@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use std::sync::mpsc::Sender;
 
+#[cfg(windows)]
+pub mod devices;
 mod hotkey_lifecycle;
 
 /// How the app interprets a shortcut gesture. Explicit choices are preserved.
