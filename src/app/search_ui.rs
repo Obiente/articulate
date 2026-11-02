@@ -1,5 +1,5 @@
 use super::*;
-use crate::brain::search::{self, Field, Hit, Job, Results};
+use crate::brain::search::{self, Field, Filters, Hit, Job, Results};
 
 #[derive(Default)]
 pub(super) struct State {
@@ -8,6 +8,12 @@ pub(super) struct State {
         reason = "Saved search query retained for the Tauri search flow"
     )]
     pub query: String,
+    /// Date, kind, speaker and app restrictions for the next search.
+    #[allow(
+        dead_code,
+        reason = "Search filters are exposed to the desktop UI in a later change"
+    )]
+    pub filters: Filters,
     pub results: Option<Results>,
     job: Option<Job>,
     submitted: String,
@@ -106,7 +112,16 @@ impl App {
         self.saved_search.cancel();
         self.saved_search.error = None;
         self.saved_search.submitted = self.saved_search.query.trim().to_owned();
-        match search::start(self.saved_search.submitted.clone()) {
+        let index = self
+            .history
+            .worker
+            .as_ref()
+            .and_then(crate::history::Worker::search_index);
+        match search::start(
+            self.saved_search.submitted.clone(),
+            self.saved_search.filters.clone(),
+            index,
+        ) {
             Ok(job) => self.saved_search.job = Some(job),
             Err(error) => self.saved_search.error = Some(error.to_string()),
         }
@@ -120,9 +135,12 @@ impl App {
 fn metadata(hit: &Hit) -> String {
     let field = match hit.field {
         Field::Title => "Title",
-        Field::Dictation => "Dictation",
+        Field::Text => "Dictation",
+        Field::Original => "Original wording",
         Field::PersonalNotes => "My notes",
+        Field::GeneratedNotes => "Generated notes",
         Field::CallTranscript => "Transcript",
+        Field::SpeakerNames => "Speakers",
     };
     let when =
         time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(hit.created_ms) * 1_000_000)
@@ -182,8 +200,11 @@ mod tests {
         let hit = Hit {
             session_id: "synthetic".into(),
             title: "Plan".into(),
+            kind: crate::history::Kind::Call,
             created_ms: 0,
             field: Field::CallTranscript,
+            excerpt_start: 0,
+            matches: Vec::new(),
             excerpt: "Exact source words.".into(),
             row: Some(0),
             speaker: Some("Casey".into()),
@@ -201,8 +222,11 @@ mod tests {
         let mut hit = Hit {
             session_id: "synthetic-session".into(),
             title: "Planning the next release".into(),
+            kind: crate::history::Kind::Call,
             created_ms: 0,
             field: Field::CallTranscript,
+            excerpt_start: 0,
+            matches: Vec::new(),
             excerpt: "Review the release together on Thursday.".into(),
             row: Some(0),
             speaker: Some("Casey".into()),

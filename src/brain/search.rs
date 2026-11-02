@@ -1,5 +1,11 @@
-//! Bounded local phrase search. No embeddings, remote requests, or generated answers.
-use crate::history::{History, Kind, Session};
+//! Local phrase search over saved history. No embeddings, remote requests, or
+//! generated answers.
+//!
+//! Searches use the history worker's full-text index once it has finished its
+//! first pass. Until then, or if the index could not be created, a bounded scan
+//! of the most recent saved files is used instead and marked `partial`.
+pub use crate::history::search_index::{Field, Filters};
+use crate::history::{History, Kind, Session, search_index::SearchIndex};
 use anyhow::{Result, ensure};
 use std::{
     fs,
@@ -17,22 +23,31 @@ const MAX_DIRECTORY_ENTRIES: usize = 10_000;
 const MAX_SCANNED_BYTES: usize = 32 * 1024 * 1024;
 const MAX_MATCHES: usize = 50;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Field {
-    Title,
-    Dictation,
-    PersonalNotes,
-    CallTranscript,
-}
-
 #[derive(Clone, Debug)]
 pub struct Hit {
     pub session_id: String,
     pub title: String,
+    #[allow(
+        dead_code,
+        reason = "Shown by desktop search results in a later change"
+    )]
+    pub kind: Kind,
     pub created_ms: u64,
     pub field: Field,
     /// Exact substring of the saved text, never generated or paraphrased.
     pub excerpt: String,
+    /// Byte offset of `excerpt` within the full field text.
+    #[allow(
+        dead_code,
+        reason = "Shown by desktop search results in a later change"
+    )]
+    pub excerpt_start: usize,
+    /// Byte ranges of matched terms within `excerpt`.
+    #[allow(
+        dead_code,
+        reason = "Shown by desktop search results in a later change"
+    )]
+    pub matches: Vec<(usize, usize)>,
     pub row: Option<usize>,
     pub speaker: Option<String>,
     pub start_ms: Option<u64>,
@@ -45,8 +60,14 @@ pub struct Results {
     pub hits: Vec<Hit>,
     pub scanned_sessions: usize,
     pub unreadable_sessions: usize,
-    /// More files/content/results exist than this bounded scan could inspect.
+    /// More files/content/results exist than this search could inspect or return.
     pub partial: bool,
+    /// Whether the full-text index answered (rather than the bounded scan).
+    #[allow(
+        dead_code,
+        reason = "Shown by desktop search results in a later change"
+    )]
+    pub indexed: bool,
 }
 
 pub struct Job {
@@ -67,7 +88,8 @@ impl Drop for Job {
     }
 }
 
-pub fn start(query: String) -> Result<Job> {
+/// Search in the background. `index` is the history worker's live index.
+pub fn start(query: String, filters: Filters, index: Option<SearchIndex>) -> Result<Job> {
     let query = query.trim().to_owned();
     ensure!(
         !query.is_empty() && query.chars().count() <= 160 && !query.chars().any(char::is_control),
@@ -80,13 +102,76 @@ pub fn start(query: String) -> Result<Job> {
     std::thread::Builder::new()
         .name("saved-content-search".into())
         .spawn(move || {
-            let answer = scan(directory, query, &worker_cancel).map_err(|e| e.to_string());
-            let _ = tx.send(answer);
+            let answer = match index.filter(SearchIndex::is_ready) {
+                Some(index) => indexed(&index, query, &filters),
+                None => scan(directory, query, &filters, &worker_cancel),
+            };
+            let _ = tx.send(answer.map_err(|e| e.to_string()));
         })?;
     Ok(Job { cancel, result })
 }
 
-fn scan(directory: PathBuf, query: String, cancel: &AtomicBool) -> Result<Results> {
+fn indexed(index: &SearchIndex, query: String, filters: &Filters) -> Result<Results> {
+    let found = index.search(&query, filters)?;
+    Ok(Results {
+        query,
+        scanned_sessions: found.indexed_sessions,
+        unreadable_sessions: found.unreadable_sessions,
+        partial: found.partial,
+        indexed: true,
+        hits: found
+            .hits
+            .into_iter()
+            .map(|hit| Hit {
+                session_id: hit.session_id,
+                title: hit.title,
+                kind: hit.kind,
+                created_ms: hit.created_ms,
+                field: hit.field,
+                excerpt: hit.snippet,
+                excerpt_start: hit.snippet_start,
+                matches: hit.matches,
+                row: hit.row,
+                speaker: hit.speaker,
+                start_ms: hit.start_ms,
+                end_ms: hit.end_ms,
+            })
+            .collect(),
+    })
+}
+
+/// Whether a session can satisfy the filters at all (the scan fallback).
+fn session_matches(session: &Session, filters: &Filters) -> bool {
+    filters
+        .from_ms
+        .is_none_or(|from| session.created_ms >= from)
+        && filters.to_ms.is_none_or(|to| session.created_ms <= to)
+        && filters.kind.is_none_or(|kind| session.kind == kind)
+        && filters.app.as_deref().is_none_or(|app| {
+            session
+                .metrics
+                .app
+                .as_deref()
+                .is_some_and(|saved| saved.eq_ignore_ascii_case(app.trim()))
+        })
+}
+
+fn speaker_matches(label: Option<&str>, filters: &Filters) -> bool {
+    filters.speaker.as_deref().is_none_or(|speaker| {
+        label.is_some_and(|label| {
+            label
+                .to_lowercase()
+                .contains(&speaker.trim().to_lowercase())
+        })
+    })
+}
+
+fn scan(
+    directory: PathBuf,
+    query: String,
+    filters: &Filters,
+    cancel: &AtomicBool,
+) -> Result<Results> {
     let mut result = Results {
         query: query.clone(),
         ..Default::default()
@@ -157,29 +242,50 @@ fn scan(directory: PathBuf, query: String, cancel: &AtomicBool) -> Result<Result
         }
         scanned += bytes;
         result.scanned_sessions += 1;
-        search_session(&session, &query, &mut result);
+        if session_matches(&session, filters) {
+            search_session(&session, &query, filters, &mut result);
+        }
     }
     Ok(result)
 }
 
-fn search_session(session: &Session, query: &str, results: &mut Results) {
+fn search_session(session: &Session, query: &str, filters: &Filters, results: &mut Results) {
+    let participants = session
+        .rows
+        .iter()
+        .map(|row| crate::calls::label(row, &session.speaker_names))
+        .chain(session.speaker_names.iter().cloned())
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut add = |text: &str, field: Field, row: Option<usize>| {
         if results.hits.len() >= MAX_MATCHES {
             results.partial = true;
             return;
         }
-        let Some(excerpt) = excerpt(text, query) else {
+        let turn = row.and_then(|index| session.rows.get(index));
+        let speaker = turn.map(|turn| crate::calls::label(turn, &session.speaker_names));
+        let label = if turn.is_some() {
+            speaker.as_deref()
+        } else {
+            Some(participants.as_str())
+        };
+        if !speaker_matches(label, filters) {
+            return;
+        }
+        let Some((start, end, found)) = locate(text, query) else {
             return;
         };
-        let turn = row.and_then(|index| session.rows.get(index));
         results.hits.push(Hit {
             session_id: session.id.clone(),
             title: session.title.clone(),
+            kind: session.kind,
             created_ms: session.created_ms,
             field,
-            excerpt,
+            excerpt: text[start..end].to_owned(),
+            excerpt_start: start,
+            matches: vec![(found.0 - start, found.1 - start)],
             row,
-            speaker: turn.map(|turn| crate::calls::label(turn, &session.speaker_names)),
+            speaker,
             start_ms: turn.map(|turn| turn.start_ms),
             end_ms: turn.map(|turn| turn.end_ms),
         });
@@ -191,11 +297,17 @@ fn search_session(session: &Session, query: &str, results: &mut Results) {
             add(&row.text, Field::CallTranscript, Some(index));
         }
     } else {
-        add(&session.text, Field::Dictation, None);
+        add(&session.text, Field::Text, None);
     }
 }
 
+#[cfg(test)]
 fn excerpt(text: &str, query: &str) -> Option<String> {
+    locate(text, query).map(|(start, end, _)| text[start..end].to_owned())
+}
+
+/// The excerpt range and the matched range, as byte offsets into `text`.
+fn locate(text: &str, query: &str) -> Option<(usize, usize, (usize, usize))> {
     let folded = text.to_lowercase();
     let query = query.to_lowercase();
     let offset = folded.find(&query)?;
@@ -226,7 +338,7 @@ fn excerpt(text: &str, query: &str) -> Option<String> {
         .char_indices()
         .nth(120)
         .map_or(text.len(), |(at, _)| match_end + at);
-    Some(text[start..end].to_owned())
+    Some((start, end, (match_start, match_end)))
 }
 
 #[cfg(test)]
@@ -257,7 +369,7 @@ mod tests {
             text: "The zephyr launch is Friday.".into(),
         });
         let mut results = Results::default();
-        search_session(&session, "zephyr", &mut results);
+        search_session(&session, "zephyr", &Filters::default(), &mut results);
         assert_eq!(results.hits.len(), 2);
         assert_eq!(results.hits[0].field, Field::PersonalNotes);
         assert_eq!(results.hits[1].field, Field::CallTranscript);
@@ -281,11 +393,33 @@ mod tests {
             "Earlier discussion. ".repeat(30)
         );
         history.save(session.clone()).unwrap();
-        let result = scan(directory.clone(), "zephyr".into(), &AtomicBool::new(false)).unwrap();
+        let result = scan(
+            directory.clone(),
+            "zephyr".into(),
+            &Filters::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].session_id, session.id);
         assert!(session.text.contains(&result.hits[0].excerpt));
         assert!(result.hits[0].excerpt.contains("zephyr"));
+        let (start, end) = result.hits[0].matches[0];
+        assert_eq!(&result.hits[0].excerpt[start..end], "zephyr");
+        assert!(
+            scan(
+                directory.clone(),
+                "zephyr".into(),
+                &Filters {
+                    kind: Some(Kind::Call),
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap()
+            .hits
+            .is_empty()
+        );
         assert!(!result.partial);
         // A save can have staged temporary/backup files beside the committed
         // JSON. Searching must neither consume nor remove those files.
@@ -293,12 +427,24 @@ mod tests {
         let backup = directory.join(format!("{}.bak", session.id));
         fs::write(&temporary_save, b"an in-flight save").unwrap();
         fs::write(&backup, b"the writer's backup").unwrap();
-        let result = scan(directory.clone(), "zephyr".into(), &AtomicBool::new(false)).unwrap();
+        let result = scan(
+            directory.clone(),
+            "zephyr".into(),
+            &Filters::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(result.hits.len(), 1);
         assert_eq!(fs::read(&temporary_save).unwrap(), b"an in-flight save");
         assert_eq!(fs::read(&backup).unwrap(), b"the writer's backup");
         history.delete(&session.id).unwrap();
-        let result = scan(directory.clone(), "zephyr".into(), &AtomicBool::new(false)).unwrap();
+        let result = scan(
+            directory.clone(),
+            "zephyr".into(),
+            &Filters::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(result.hits.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
