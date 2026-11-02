@@ -1,11 +1,9 @@
-use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
-use std::{
-    fs::{self, File},
-    io::{Read, Write},
-    path::PathBuf,
-    time::Duration,
-};
+use anyhow::{Context, Result};
+#[path = "download.rs"]
+#[allow(dead_code)]
+pub mod download;
+use std::sync::{Arc, atomic::AtomicBool};
+use std::{fs, path::PathBuf};
 
 pub const NAME: &str = "Qwen3-ASR-1.7B-Q8_0.gguf";
 pub const SIZE: u64 = 2_185_030_624;
@@ -35,6 +33,13 @@ pub fn data_dir() -> PathBuf {
         .join("TranscribeLocal")
 }
 pub fn default_path() -> PathBuf {
+    static CLEANUP: std::sync::Once = std::sync::Once::new();
+    CLEANUP.call_once(|| {
+        let _ = download::prune_stale(
+            &data_dir().join("models"),
+            std::time::Duration::from_secs(7 * 86400),
+        );
+    });
     data_dir().join("models").join(NAME)
 }
 pub fn verifier_path() -> PathBuf {
@@ -60,11 +65,20 @@ pub fn download(mut progress: impl FnMut(f32)) -> Result<PathBuf> {
     reason = "Preserve speaker-model download for React audio setup"
 )]
 pub fn download_speakers(mut progress: impl FnMut(f32)) -> Result<PathBuf> {
-    download_file(
+    download_speakers_cancellable(&Arc::new(AtomicBool::new(false)), &mut progress)
+}
+
+#[allow(dead_code)]
+pub fn download_speakers_cancellable(
+    cancel: &Arc<AtomicBool>,
+    mut progress: impl FnMut(f32),
+) -> Result<PathBuf> {
+    download_file_cancellable(
         crate::speakers::NAME,
         236606560,
         "62faec7b99ad23e323087597604b50728abe85089b6364970b019a845547bf99",
         "https://huggingface.co/handy-computer/diar_streaming_sortformer_4spk-v2.1-gguf/resolve/ae4afbb5c3d33b71cf2dbf600022b655ee706dd0/diar_streaming_sortformer_4spk-v2.1-F16.gguf",
+        cancel,
         &mut progress,
     )
 }
@@ -76,44 +90,70 @@ pub(crate) fn download_file(
     url: &str,
     progress: &mut impl FnMut(f32),
 ) -> Result<PathBuf> {
+    download_file_cancellable(
+        name,
+        size,
+        expected_hash,
+        url,
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    )
+}
+
+#[allow(dead_code)]
+pub fn download_file_cancellable(
+    name: &str,
+    size: u64,
+    expected_hash: &str,
+    url: &str,
+    cancel: &Arc<AtomicBool>,
+    progress: &mut impl FnMut(f32),
+) -> Result<PathBuf> {
+    anyhow::ensure!(
+        std::path::Path::new(name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            == Some(name),
+        "Invalid model filename"
+    );
     let path = data_dir().join("models").join(name);
     fs::create_dir_all(path.parent().context("Missing model directory")?)?;
-    let part = path.with_extension("gguf.part");
-    let result = (|| {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(1800)))
-            .build();
-        let agent: ureq::Agent = config.into();
-        let mut response = agent.get(url).call().context("Model download failed")?;
-        let mut reader = response.body_mut().as_reader();
-        let mut file = File::create(&part)?;
-        let mut buffer = vec![0u8; 256 * 1024];
-        let mut hash = Sha256::new();
-        let mut received = 0u64;
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
+    download::fetch(
+        download::Artifact {
+            url,
+            destination: &path,
+            size,
+            sha: expected_hash,
+            stage: "Downloading model",
+        },
+        cancel,
+        &mut |_, fraction| {
+            if let Some(value) = fraction {
+                progress(value)
             }
-            received += count as u64;
-            if received > size {
-                bail!("Downloaded model has an unexpected size");
-            }
-            hash.update(&buffer[..count]);
-            file.write_all(&buffer[..count])?;
-            progress(received as f32 / size as f32);
-        }
-        if received != size || format!("{:x}", hash.finalize()) != expected_hash {
-            bail!("Model integrity check failed. Please retry the download.");
-        }
-        file.sync_all()?;
-        drop(file);
-        // Replace only after verification, without first deleting a valid model.
-        fs::rename(&part, &path)?;
-        Ok(path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(part);
-    }
-    result
+        },
+    )?;
+    Ok(path)
+}
+
+#[allow(dead_code)]
+pub fn download_cancellable(
+    cancel: &Arc<AtomicBool>,
+    mut progress: impl FnMut(f32),
+) -> Result<PathBuf> {
+    download_file_cancellable(NAME, SIZE, SHA256, URL, cancel, &mut progress)
+}
+#[allow(dead_code)]
+pub fn download_verifier_cancellable(
+    cancel: &Arc<AtomicBool>,
+    mut progress: impl FnMut(f32),
+) -> Result<PathBuf> {
+    download_file_cancellable(
+        VERIFIER_NAME,
+        VERIFIER_SIZE,
+        VERIFIER_SHA256,
+        VERIFIER_URL,
+        cancel,
+        &mut progress,
+    )
 }

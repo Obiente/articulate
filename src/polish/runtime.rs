@@ -115,6 +115,7 @@ impl Server {
         let reservation = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         let port = reservation.local_addr()?.port();
         let key = crate::discord::plugin::new_token()?;
+        let alias = crate::discord::plugin::new_token()?;
         let executable = if gpu {
             install::executable_for_gpu()
         } else {
@@ -128,6 +129,7 @@ impl Server {
             available.clamp(1, 8)
         };
         command
+            .args(["--alias", &alias])
             .args(["-m"])
             .arg(install::model_for(profile))
             .args([
@@ -238,6 +240,31 @@ impl Server {
                 .call()
                 .is_ok()
             {
+                let mut response = agent
+                    .get(format!("{}/v1/models", server.url))
+                    .header("Authorization", format!("Bearer {}", server.key))
+                    .call()?;
+                let mut body = String::new();
+                response
+                    .body_mut()
+                    .as_reader()
+                    .take(65537)
+                    .read_to_string(&mut body)?;
+                ensure!(
+                    body.len() <= 65536,
+                    "Local server identity response too large"
+                );
+                let value: Value = serde_json::from_str(&body)?;
+                ensure!(
+                    value["data"].as_array().is_some_and(|models| models
+                        .iter()
+                        .any(|model| model["id"].as_str() == Some(&alias))),
+                    "Local server identity did not match"
+                );
+                ensure!(
+                    server.child.try_wait()?.is_none(),
+                    "Local server stopped during identification"
+                );
                 break;
             }
             ensure!(
