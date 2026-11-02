@@ -23,10 +23,12 @@ Sections are typed serde views in `src/app/desktop/view/`; the registry is `view
 | `discord` | `discord` | Live |
 | `updater` | `updater` | Live |
 | `overlay` | `overlay` | Live |
+| `call_tools` | `audio_import`, `playback` | Live |
 | `history` | `history` | Background |
 | `document_body` | `selected_body` | Background |
 | `vocabulary` | `dictionary`, `macros` | Background |
 | `insights` | `insights` | Background |
+| `people` | `people`, `people_error` | Background |
 
 Live sections are compared every 250 ms. Background sections (large lists and document bodies) are compared about once a second, after every action, and in the same pass whenever `document` changes, so a newly opened document arrives with its body. Comparison serializes the borrowed view into a reused buffer and compares bytes; nothing is sent for unchanged sections.
 
@@ -47,6 +49,17 @@ type SessionMeta = {
   audio_packets_lost: number; created_ms: number; updated_ms: number;
   topic_id: string | null; is_collection: boolean; can_receive_sources: boolean;
   sources: { id: string; title: string; kind: string; created_ms: number; preview: string }[];
+  interruptions: Interruption[];
+  speaker_undo: string | null;      // what `speaker_undo` would revert
+  audio: { duration_ms: number; bytes: number; channels: string[]; incomplete: boolean } | null;
+  transcript_versions: { index: number; replaced_ms: number; model: string; preview: string }[];
+};
+type Interruption = {
+  start_ms: number; end_ms: number;
+  source: "microphone" | "system_audio" | "participants" | "processing" | "unknown";
+  cause: "device_lost" | "overflow" | "packet_loss" | "fell_behind" | "unknown";
+  ongoing: boolean;
+  message: string; // "Audio interrupted 12:03–12:07: microphone disconnected"
 };
 // `selected_body`: the open document's transcript, sent separately.
 type SessionBody = { id: string; text: string; original: string; rows: Row[] };
@@ -54,8 +67,26 @@ type SessionBody = { id: string; text: string; original: string; rows: Row[] };
 type SessionView = SessionMeta & Omit<SessionBody, "id">;
 type Row = {
   start_ms: number; end_ms: number; speaker: string; speaker_labels: string[];
+  // Opaque, parallel to speaker_labels: "you", "s1".."s8", "other",
+  // "uncertain", or "n:<digest>" for a named person. Valid for one snapshot.
+  speaker_keys: string[];
   text: string; cues: { start_ms: number; end_ms: number; label: string }[];
   provisional: boolean;
+};
+type AudioImport = {
+  state: "idle" | "ready" | "working" | "done" | "failed";
+  dragging: boolean;              // audio files are over the window
+  file_name: string | null;       // the offered file's name, never its path
+  progress: number | null; stage: string; message: string;
+  session_id: string | null;      // the finished import or re-transcription
+  rebuilding: string | null;      // the session being re-transcribed
+  speakers_available: boolean;
+};
+type Playback = { session_id: string | null; playing: boolean; position_ms: number; error: string | null };
+type Person = {
+  id: string; name: string; source: "discord" | "name";
+  discord_name: string | null; avatar: string | null; // bytes://discord-avatar/... reference
+  used_ms: number;
 };
 type Overlay = { visible: boolean; recording: boolean; finishing: boolean; message: string };
 type Updater =
@@ -66,7 +97,7 @@ type Updater =
   | { state: "error"; error: string };
 ```
 
-`settings` contains `clean_speech`, `insert`, `live_insert`, `cpu`, `transcription_language`, `audio_context`, `learn_corrections`, `audio_feedback`, `microphone`, `output`, `hotkey`, `quick_note_hotkey`, `quick_note_hotkey_pending`, `quick_note_shortcut_error`, `hotkey_mode`, `discord_auto_connect`, `discord_auto_transcribe`, `discord_companion` and `vencord_auto_update`. `model_status` reports installation, progress and status for the speech, speaker, audio context, second speech (verifier) and cleanup models, plus `backend`, `model_name` (file name only), `speech_languages` and `model_custom`. `downloading` is the speech model download progress from 0 to 1. The `discord`, `capture_feedback` and notes status objects are produced by their feature modules and keep the shapes described below.
+`settings` contains `clean_speech`, `insert`, `live_insert`, `cpu`, `transcription_language`, `audio_context`, `learn_corrections`, `audio_feedback`, `microphone`, `output`, `hotkey`, `quick_note_hotkey`, `quick_note_hotkey_pending`, `quick_note_shortcut_error`, `hotkey_mode`, `discord_auto_connect`, `discord_auto_transcribe`, `discord_companion`, `vencord_auto_update` and `keep_call_audio`. `model_status` reports installation, progress and status for the speech, speaker, audio context, second speech (verifier) and cleanup models, plus `backend`, `model_name` (file name only), `speech_languages` and `model_custom`. `downloading` is the speech model download progress from 0 to 1. The `discord`, `capture_feedback` and notes status objects are produced by their feature modules and keep the shapes described below.
 
 A live call's or spoken note's transcript is only in `call_rows` or `note_rows`; `call_session` and `note_session` carry no `text`, `original` or `rows`. The open document arrives as `selected` (metadata and notes) plus `selected_body` (transcript), so editing notes never resends a long transcript. The renderer joins them into `state.selected` when both have the same `id`; until the body arrives, the joined document has empty text and rows.
 
@@ -107,7 +138,7 @@ Library and documents (`actions/library.rs`):
 Capture (`actions/capture.rs`):
 
 - `dictation_start`, `dictation_stop`, `dictation_cancel`
-- `call_start { source?: "system"|"discord", language_preference?: string|null, audio_context?: boolean }`, `call_stop`
+- `call_start { source?: "system"|"discord", language_preference?: string|null, audio_context?: boolean, keep_audio?: boolean }`, `call_stop`. `keep_audio` defaults to the `keep_call_audio` preference.
 - `note_capture_start`, `note_capture_stop`
 
 Copy and export (`actions/output.rs`): `copy { text }`, `export { text, extension }` with extension `txt`, `md`, `srt` or `vtt`. Export runs outside the controller so a save dialog never pauses capture.
@@ -117,13 +148,21 @@ Vocabulary (`actions/vocabulary.rs`):
 - `dictionary_save { heard, wanted, app?: string, cues?: string, index?: number, expected_heard?: string, expected_entry?: Entry }`, `dictionary_delete { index, expected_heard, expected_entry }`
 - `macro_save { trigger, expansion, app?: string, index?: number, expected_trigger?: string, expected_macro?: VoiceMacro }`, `macro_delete { index, expected_trigger, expected_macro }`
 
-Settings (`actions/settings.rs`): `settings_patch { cpu?, model_path?, transcription_language?, clean_speech?, insert?, live_insert?, learn_corrections?, audio_feedback?, audio_context?, microphone?, output?, hotkey_mode?, hotkey?, quick_note_hotkey?, discord_auto_connect?, discord_auto_transcribe?, vencord_auto_update? }`. The whole patch is validated before anything changes; a failed save restores the previous values. Shortcut changes are registered only after the preferences are saved.
+Settings (`actions/settings.rs`): `settings_patch { cpu?, model_path?, transcription_language?, clean_speech?, insert?, live_insert?, learn_corrections?, audio_feedback?, audio_context?, microphone?, output?, hotkey_mode?, hotkey?, quick_note_hotkey?, discord_auto_connect?, discord_auto_transcribe?, vencord_auto_update?, keep_call_audio? }`. The whole patch is validated before anything changes; a failed save restores the previous values. Shortcut changes are registered only after the preferences are saved.
 
 Models (`actions/models.rs`): `model_download`, `model_load`, `summary_download`, `summary_download_cancel`, `cleanup_download`, `cleanup_download_cancel`, `context_download`, `speakers_download`, `verifier_download`.
 
 Discord (`actions/discord.rs`): `discord_connect { companion: boolean }`, `discord_disconnect`, `discord_retry`, `discord_relaunch`, `companion_detect`, `companion_install`, `companion_open_installer`.
 
-Updates (`actions/updates.rs`): `update_check`, `update_download`, `update_install`. Installation requires capture and processing to finish, no active download, and pending document saves to complete before the verified installer launches.
+Updates (`actions/updates.rs`): `update_check`, `update_download`, `update_install`.
+
+Conversations and speakers (`actions/calls.rs`):
+
+- `speaker_rename { id, speaker, name }`, `speaker_merge { id, from, into }`, `speaker_reassign { id, rows: {index, start_ms}[], speaker? | name? }`, `speaker_undo { id }`. `speaker`, `from` and `into` are `speaker_keys` from the current snapshot. Each row reference carries the `start_ms` the renderer saw; a changed transcript is rejected. They apply to the call being recorded (committed rows only; later turns follow merges and participant renames) or to the open saved conversation, and save through the normal history path.
+- `person_save { id?, name }`, `person_delete { id }`, `people_clear`: the known-people list.
+- `audio_import_choose` opens the system file dialog outside the controller. A chosen or dropped file is offered as `audio_import.state = "ready"`; `audio_import_start { kind: "call"|"dictation", keep_audio? }` imports it on the speech worker, `audio_import_cancel` stops it and `audio_import_dismiss` clears the offer or result. The renderer never sends or receives file paths.
+- `audio_play { id, from_ms? }`, `audio_stop`: native playback of kept audio. `audio_delete { id }` removes kept audio and keeps the transcript.
+- `transcript_rebuild { id }` re-transcribes kept audio with the loaded model and keeps the replaced transcript in `transcript_versions`; `transcript_restore { id, index }` swaps a kept version back. Installation requires capture and processing to finish, no active download, and pending document saves to complete before the verified installer launches.
 
 Editing an existing vocabulary entry requires `index` and its original `expected_heard`; snippet edits require `index` and `expected_trigger`. Edits and deletions also require the complete original snapshot object in `expected_entry` or `expected_macro`. A stale row or changed scope is rejected without mutating data. Device preferences use an empty string to select the Windows default.
 
@@ -179,6 +218,8 @@ include `is_collection`, `topic_id`, `can_receive_sources` and a `sources` list;
 source text remains in independently saved sessions. `filing_working` and
 `filing_status` describe automatic organization. Pending filing is persisted for
 retry after restart.
+
+`audio_import` follows imports and re-transcription (one runs at a time on the speech worker). `playback` reports the playing session and position; only the native player touches audio. `people` lists known people, most recently used first; `people_error` explains a list that could not be read and is not overwritten.
 
 Insights contain `words`, `sessions`, `words_per_minute`, `current_streak`, `longest_streak`, `active_days`, `dictionary_replacements`, `cleanup_edits`, `apps: [{app, words, sessions}]` and `days: [{date, words, sessions}]`.
 

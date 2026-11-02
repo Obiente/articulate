@@ -399,6 +399,42 @@ impl App {
         self.call.is_some() && self.history.call.as_ref().is_some_and(|s| s.id == id)
     }
 
+    /// Store a changed saved session. A finished call stays the current call
+    /// until another capture starts, and later saves of the current call
+    /// rebuild it from the controller's rows, so those follow the change.
+    fn calls_store(&mut self, session: Session) -> Result<(), String> {
+        let worker = self
+            .history
+            .worker
+            .as_ref()
+            .ok_or("Local history is unavailable.")?;
+        worker.save(session.clone());
+        self.brain.remember(&session);
+        if self.call.is_none()
+            && self
+                .history
+                .call
+                .as_ref()
+                .is_some_and(|current| current.id == session.id)
+        {
+            self.call_rows.clone_from(&session.rows);
+            self.call_committed.clone_from(&session.rows);
+            self.speaker_names.clone_from(&session.speaker_names);
+            self.call_notes.clone_from(&session.notes);
+            self.history.call = Some(session.clone());
+            self.history.call_dirty = None;
+        }
+        if self
+            .history
+            .selected
+            .as_ref()
+            .is_some_and(|selected| selected.id == session.id)
+        {
+            self.history.selected = Some(session);
+        }
+        Ok(())
+    }
+
     /// Prepare rows arriving from capture: chosen participant names and the
     /// corrections made during this call.
     pub(super) fn calls_prepare_rows(&mut self, rows: &mut [calls::Row]) {
@@ -561,15 +597,7 @@ impl App {
         session.speaker_names = names;
         result?;
         speaker_edits::refresh_derived(&mut session);
-        let worker = self
-            .history
-            .worker
-            .as_ref()
-            .ok_or("Local history is unavailable.")?;
-        worker.save(session.clone());
-        self.brain.remember(&session);
-        self.history.selected = Some(session);
-        Ok(())
+        self.calls_store(session)
     }
 
     fn calls_live_edit(&mut self, op: SpeakerOp) -> Result<(), String> {
@@ -864,15 +892,7 @@ impl App {
         if session.kind == Kind::Call {
             speaker_edits::refresh_derived(&mut session);
         }
-        let worker = self
-            .history
-            .worker
-            .as_ref()
-            .ok_or("Local history is unavailable.")?;
-        worker.save(session.clone());
-        self.brain.remember(&session);
-        self.history.selected = Some(session);
-        Ok(())
+        self.calls_store(session)
     }
 
     /// Delete retained audio but keep the transcript.
@@ -901,14 +921,7 @@ impl App {
             }
         }
         session.audio = None;
-        let worker = self
-            .history
-            .worker
-            .as_ref()
-            .ok_or("Local history is unavailable.")?;
-        worker.save(session.clone());
-        self.history.selected = Some(session);
-        Ok(())
+        self.calls_store(session)
     }
 
     pub(crate) fn calls_play(&mut self, id: &str, from_ms: u64) -> Result<(), String> {
@@ -971,19 +984,11 @@ impl App {
                             "Import finished".into()
                         };
                         import.session_id = Some(session.id.clone());
-                        if let Some(worker) = &self.history.worker {
-                            worker.save((*session).clone());
-                        }
-                        self.brain.remember(&session);
-                        if self
-                            .history
-                            .selected
-                            .as_ref()
-                            .is_some_and(|selected| selected.id == session.id)
-                        {
-                            self.history.selected = Some(*session);
-                        }
-                        if let Some(worker) = &self.history.worker {
+                        if let Err(error) = self.calls_store(*session) {
+                            let import = &mut self.call_tools.import;
+                            import.failed = true;
+                            import.message = error;
+                        } else if let Some(worker) = &self.history.worker {
                             worker.list();
                         }
                     }
@@ -1138,6 +1143,35 @@ mod tests {
         let mut later = vec![row(9000, &[2], "Later.")];
         app.calls_prepare_rows(&mut later);
         assert_eq!(later[0].speakers, [2]);
+    }
+
+    #[test]
+    fn corrections_to_a_finished_call_survive_later_saves_of_that_call() {
+        let (mut app, _) = app();
+        app.history.worker = Some(crate::history::Worker::test_directory(
+            std::env::temp_dir().join(format!("articulate-call-sync-{}", crate::history::now_ms())),
+        ));
+        let mut session = Session::new(Kind::Call);
+        session.rows = vec![row(0, &[1], "Hello.")];
+        let id = session.id.clone();
+        app.call_rows.clone_from(&session.rows);
+        app.call_committed.clone_from(&session.rows);
+        app.history.call = Some(session.clone());
+        app.history.selected = Some(session);
+        app.calls_speaker_edit(
+            &id,
+            SpeakerOp::Rename {
+                speaker: "s1".into(),
+                name: "Morgan".into(),
+            },
+        )
+        .unwrap();
+        // A notes save on the finished call rebuilds it from controller rows.
+        app.history_save_call();
+        let saved = app.history.selected.as_ref().unwrap();
+        assert_eq!(saved.speaker_names[0], "Morgan");
+        assert!(saved.text.contains("Morgan: Hello."));
+        assert_eq!(saved.speaker_edits.len(), 1);
     }
 
     #[test]

@@ -52,9 +52,9 @@ Rust (`src/app/desktop/`):
 | `bridge.rs` | The controller thread, panic isolation, controller health and the close handshake. |
 | `publish.rs` | Section revisions, byte-level change detection, row splices and the shared published state. |
 | `view.rs` | The section registry (`collect`). |
-| `view/*.rs` | Typed views by area: `shell`, `capture` (dictation, calls, spoken notes, live rows), `library` (history, open document, insights), `settings` (preferences, vocabulary), `models`, `discord`, `updates`, `rows`. |
+| `view/*.rs` | Typed views by area: `shell`, `capture` (dictation, calls, spoken notes, live rows), `library` (history, open document, insights), `calls` (import and playback progress, known people, call parts of a document), `settings` (preferences, vocabulary), `models`, `discord`, `updates`, `rows`. |
 | `actions.rs` | Routes a renderer action to the feature that declares its `type`. |
-| `actions/*.rs` | One action enum and `App` handler per feature: `library`, `capture`, `output`, `vocabulary`, `settings`, `models`, `discord`, `updates`. |
+| `actions/*.rs` | One action enum and `App` handler per feature: `library`, `capture`, `output`, `vocabulary`, `settings`, `models`, `discord`, `updates`, `calls` (speaker corrections, known people, import, playback, re-transcription). |
 | `lifecycle.rs` | Shutdown, capture readiness, download guards and document edit locks. |
 | `tests.rs` | Contract tests: section shapes, key ownership and the action list. |
 
@@ -72,7 +72,7 @@ Frontend (`ui/src/`):
 | `hooks/` | Document edit autosave, the close handshake and the list virtualizer. |
 | `components/` | Shared page, dialog and settings-row components. |
 | `lib/format.js` | Dates, durations, shortcuts and language names. |
-| `features/<area>/` | `dictation`, `library`, `notes` (document reader), `calls` (transcript rows, speaker timeline, call setup), `capture`, `vocabulary`, `insights`, `settings`, `discord`, `models`, `updates`, `overlay`. |
+| `features/<area>/` | `dictation`, `library`, `notes` (document reader), `calls` (transcript rows, speaker timeline and corrections, call setup, import, kept recordings, conversation settings), `capture`, `vocabulary`, `insights`, `settings`, `discord`, `models`, `updates`, `overlay`. |
 
 ### Adding an action
 

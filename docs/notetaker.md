@@ -56,6 +56,6 @@ Open a conversation to edit **Notes** or read and search its **Transcript**. Eac
 
 Transcript exports remain available as plain text, Markdown, SRT, and WebVTT. **More → Delete note** asks for confirmation and removes the saved item from this device.
 
-Notes use the same local history storage as transcripts. For an older saved summary without a document, **Restore generated notes** brings its text into the editor. Nothing is sent to a cloud notes service, and this workspace does not connect to a calendar or save audio.
+Notes use the same local history storage as transcripts. For an older saved summary without a document, **Restore generated notes** brings its text into the editor. Nothing is sent to a cloud notes service, and this workspace does not connect to a calendar. Conversation audio is saved only when you choose to keep it in call setup or Settings.
 
 Use **Search** in the sidebar to find words or phrases throughout saved transcripts and personal notes, beyond the hub's title and preview search. Results open the original session.
