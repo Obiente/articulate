@@ -40,6 +40,7 @@ mod learning;
 mod library;
 mod live;
 mod macros;
+mod meetings;
 mod model;
 mod notes;
 mod platform;
@@ -121,6 +122,23 @@ async fn desktop_action(
         window.app_handle().exit(0);
     }
     Ok(())
+}
+
+/// A cached Discord participant picture as PNG bytes, for the identifiers in
+/// `discord.participants[].avatar`. Returns an empty body while the picture is
+/// not cached yet or pictures are turned off; the renderer shows initials.
+#[tauri::command]
+async fn desktop_discord_avatar(
+    window: tauri::WebviewWindow,
+    bridge: tauri::State<'_, Arc<Bridge>>,
+    uri: String,
+) -> Result<tauri::ipc::Response, String> {
+    require_main(&window)?;
+    let bridge = bridge.inner().clone();
+    let bytes = tauri::async_runtime::spawn_blocking(move || bridge.avatar(uri))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(bytes.unwrap_or_default()))
 }
 
 /// The window received close request `id`. `cancelled` means it decided to
@@ -406,6 +424,7 @@ fn run() -> anyhow::Result<()> {
             desktop_revision,
             desktop_health,
             desktop_action,
+            desktop_discord_avatar,
             desktop_close_ack,
             desktop_close,
             desktop_overlay

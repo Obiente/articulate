@@ -1,7 +1,7 @@
 //! Preferences, devices and the vocabulary and snippet lists.
 
 use crate::app::App;
-use crate::{dictionary::Entry, macros::VoiceMacro, platform};
+use crate::{dictionary::Entry, macros::VoiceMacro, meetings, platform};
 use serde::Serialize;
 
 /// Renderer-visible preferences. Private values such as the Discord pairing
@@ -27,6 +27,12 @@ pub(crate) struct SettingsView<'a> {
     discord_auto_transcribe: bool,
     discord_companion: bool,
     vencord_auto_update: bool,
+    discord_flavor: &'a str,
+    discord_avatars: bool,
+    meetings_teams: bool,
+    meetings_zoom: bool,
+    meetings_meet: bool,
+    meetings_start: meetings::StartMode,
 }
 
 #[derive(Serialize)]
@@ -59,6 +65,12 @@ pub(crate) fn settings(app: &App) -> Settings<'_> {
             discord_auto_transcribe: settings.discord_auto_transcribe,
             discord_companion: settings.discord_companion,
             vencord_auto_update: settings.vencord_auto_update,
+            discord_flavor: &settings.discord_flavor,
+            discord_avatars: settings.discord_avatars,
+            meetings_teams: settings.meetings.teams,
+            meetings_zoom: settings.meetings.zoom,
+            meetings_meet: settings.meetings.meet,
+            meetings_start: settings.meetings.start,
         },
         microphones: &app.microphones,
         outputs: &app.outputs,

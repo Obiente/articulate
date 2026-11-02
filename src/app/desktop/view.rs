@@ -8,8 +8,9 @@ use super::publish::{Cadence, Collector};
 use crate::app::App;
 
 pub(super) mod capture;
-pub(super) mod discord;
+pub(crate) mod discord;
 pub(super) mod library;
+pub(crate) mod meetings;
 pub(super) mod models;
 pub(super) mod rows;
 pub(super) mod settings;
@@ -37,6 +38,7 @@ pub(super) fn collect(app: &App, out: &mut Collector<'_>) {
     out.section("settings", Live, || settings::settings(app));
     out.section("models", Live, || models::models(app));
     out.section("discord", Live, || discord::discord(app));
+    out.section("meetings", Live, || meetings::meetings(app));
     out.section("updater", Live, || updates::updater(app));
     out.section("overlay", Live, || shell::overlay_section(app));
     out.section("history", Background, || library::history(app));

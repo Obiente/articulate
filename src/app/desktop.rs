@@ -14,7 +14,7 @@ mod actions;
 mod bridge;
 mod lifecycle;
 mod publish;
-mod view;
+pub(crate) mod view;
 
 #[cfg(test)]
 mod tests;

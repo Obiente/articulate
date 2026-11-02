@@ -1,7 +1,8 @@
 //! Preferences. A patch is validated completely before anything changes.
 
 use crate::app::{App, Settings};
-use crate::{integration, platform};
+use crate::discord::launch::Flavor;
+use crate::{integration, meetings, platform};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,13 @@ pub(crate) enum Action {
         discord_auto_connect: Option<bool>,
         discord_auto_transcribe: Option<bool>,
         vencord_auto_update: Option<bool>,
+        /// `stable`, `ptb`, `canary` or empty for the preferred installed edition.
+        discord_flavor: Option<String>,
+        discord_avatars: Option<bool>,
+        meetings_teams: Option<bool>,
+        meetings_zoom: Option<bool>,
+        meetings_meet: Option<bool>,
+        meetings_start: Option<meetings::StartMode>,
     },
 }
 
@@ -47,6 +55,12 @@ struct Preferences {
     discord_auto_connect: Option<bool>,
     discord_auto_transcribe: Option<bool>,
     vencord_auto_update: Option<bool>,
+    discord_flavor: Option<String>,
+    discord_avatars: Option<bool>,
+    meetings_teams: Option<bool>,
+    meetings_zoom: Option<bool>,
+    meetings_meet: Option<bool>,
+    meetings_start: Option<meetings::StartMode>,
 }
 
 impl Preferences {
@@ -85,6 +99,12 @@ impl Preferences {
             &mut self.vencord_auto_update,
             &mut settings.vencord_auto_update,
         );
+        swap(&mut self.discord_flavor, &mut settings.discord_flavor);
+        swap(&mut self.discord_avatars, &mut settings.discord_avatars);
+        swap(&mut self.meetings_teams, &mut settings.meetings.teams);
+        swap(&mut self.meetings_zoom, &mut settings.meetings.zoom);
+        swap(&mut self.meetings_meet, &mut settings.meetings.meet);
+        swap(&mut self.meetings_start, &mut settings.meetings.start);
     }
 }
 
@@ -112,6 +132,12 @@ impl App {
             discord_auto_connect,
             discord_auto_transcribe,
             vencord_auto_update,
+            discord_flavor,
+            discord_avatars,
+            meetings_teams,
+            meetings_zoom,
+            meetings_meet,
+            meetings_start,
         } = action;
         let mut preferences = Preferences {
             cpu,
@@ -129,6 +155,12 @@ impl App {
             discord_auto_connect,
             discord_auto_transcribe,
             vencord_auto_update,
+            discord_flavor: discord_flavor.map(|flavor| flavor.trim().to_ascii_lowercase()),
+            discord_avatars,
+            meetings_teams,
+            meetings_zoom,
+            meetings_meet,
+            meetings_start,
         };
         self.desktop_validate_settings(&preferences, hotkey.as_ref(), quick_note_hotkey.as_ref())?;
         let reload_model = preferences
@@ -149,6 +181,9 @@ impl App {
         }
         if learn_corrections == Some(false) {
             self.desktop_learning_disabled();
+        }
+        if discord_avatars == Some(false) {
+            self.desktop_avatars_disabled();
         }
         if let Some(hotkey) = quick_note_hotkey {
             self.quick_note_hotkey_tx
@@ -213,6 +248,33 @@ impl App {
         }
         if preferences.audio_context == Some(true) && !crate::sensevoice::installed() {
             return Err("Install the audio context model first.".into());
+        }
+        if let Some(flavor) = &preferences.discord_flavor
+            && *flavor != self.settings.discord_flavor
+        {
+            let parsed = if flavor.is_empty() {
+                None
+            } else {
+                Some(
+                    Flavor::parse(flavor)
+                        .ok_or("Choose Discord, Discord PTB or Discord Canary.")?,
+                )
+            };
+            if self.settings.discord_debugger_port != 0 {
+                return Err(
+                    "Restart Discord without the debugger before choosing another edition.".into(),
+                );
+            }
+            if self.desktop_discord_relaunching() {
+                return Err("Wait for the Discord restart to finish.".into());
+            }
+            let installed = self.desktop_installed_flavors();
+            if let Some(parsed) = parsed
+                && !installed.is_empty()
+                && !installed.contains(&parsed)
+            {
+                return Err(format!("{} is not installed.", parsed.label()));
+            }
         }
         Ok(())
     }
