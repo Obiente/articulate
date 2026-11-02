@@ -879,7 +879,7 @@ impl App {
                     calls::Update::AudioContext(row) => {
                         if self.call_context.len() < 4096 {
                             crate::sensevoice::apply(&mut self.call_rows, &row);
-                            crate::sensevoice::apply(&mut self.call_committed, &row);
+                            crate::sensevoice::apply_existing(&mut self.call_committed, &row);
                             self.call_context.push(row);
                             self.history_call_changed();
                         }
@@ -902,7 +902,7 @@ impl App {
                     }
                     calls::Update::Rows(mut rows) => {
                         for annotation in &self.call_context {
-                            crate::sensevoice::apply(&mut rows, annotation);
+                            crate::sensevoice::apply_existing(&mut rows, annotation);
                         }
                         if self.is_note_capture() {
                             // Keep source identities and timestamps immutable so
@@ -917,7 +917,7 @@ impl App {
                     }
                     calls::Update::Preview(mut rows) => {
                         for annotation in &self.call_context {
-                            crate::sensevoice::apply(&mut rows, annotation);
+                            crate::sensevoice::apply_existing(&mut rows, annotation);
                         }
                         self.call_rows.clone_from(&self.call_committed);
                         calls::append_rows(&mut self.call_rows, rows);

@@ -376,6 +376,13 @@ impl Drop for Worker {
 }
 
 pub fn apply(rows: &mut Vec<Row>, annotation: &Row) {
+    if !apply_existing(rows, annotation) {
+        crate::calls::append_rows(rows, vec![annotation.clone()]);
+    }
+}
+
+/// Attach to an existing speech row without promoting provisional cues to committed text.
+pub fn apply_existing(rows: &mut [Row], annotation: &Row) -> bool {
     if let Some(row) = rows.iter_mut().find(|row| {
         row.microphone == annotation.microphone
             && row.discord == annotation.discord
@@ -388,8 +395,9 @@ pub fn apply(rows: &mut Vec<Row>, annotation: &Row) {
                 row.cues.push(cue.clone());
             }
         }
+        true
     } else {
-        crate::calls::append_rows(rows, vec![annotation.clone()]);
+        false
     }
 }
 
