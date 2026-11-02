@@ -527,11 +527,26 @@ fn verify_manifest(
     if !cfg!(feature = "signed-updates") {
         return Ok(());
     }
-    verify_signature(
+    verify_manifest_with_key(
         manifest,
         signature,
+        version,
+        asset,
+        size,
+        digest,
         include_str!("../assets/update-signing.pub"),
-    )?;
+    )
+}
+fn verify_manifest_with_key(
+    manifest: &[u8],
+    signature: &[u8],
+    version: &str,
+    asset: &str,
+    size: u64,
+    digest: &[u8; 32],
+    key: &str,
+) -> Result<()> {
+    verify_signature(manifest, signature, key)?;
     let signed: SignedManifest = serde_json::from_slice(manifest)?;
     ensure!(
         signed.version == version
@@ -621,6 +636,35 @@ mod tests {
     fn signature_switch_preserves_legacy_updates_by_default() {
         let result = verify_manifest(b"", b"", "1.0.0", "setup.exe", 42, &[0; 32]);
         assert_eq!(result.is_err(), cfg!(feature = "signed-updates"));
+    }
+    #[test]
+    fn signed_manifest_binds_every_installer_field() {
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let digest = [0xab; 32];
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "version":"1.2.3", "asset":"setup.exe", "size":42, "sha256":hex(&digest)
+        }))
+        .unwrap();
+        let signature = hex(&key.sign(&manifest).to_bytes());
+        let public = hex(&key.verifying_key().to_bytes());
+        let verify = |version, asset, size, digest| {
+            verify_manifest_with_key(
+                &manifest,
+                signature.as_bytes(),
+                version,
+                asset,
+                size,
+                digest,
+                &public,
+            )
+        };
+        assert!(verify("1.2.3", "setup.exe", 42, &digest).is_ok());
+        assert!(verify("1.2.4", "setup.exe", 42, &digest).is_err());
+        assert!(verify("1.2.3", "other.exe", 42, &digest).is_err());
+        assert!(verify("1.2.3", "setup.exe", 43, &digest).is_err());
+        assert!(verify("1.2.3", "setup.exe", 42, &[0; 32]).is_err());
     }
     #[test]
     fn signatures_reject_tampering_missing_values_and_placeholder() {
