@@ -46,12 +46,25 @@ pub struct InstallRequest {
     path: PathBuf,
     size: u64,
     digest: [u8; 32],
+    manifest: Vec<u8>,
+    signature: Vec<u8>,
 }
 
 impl InstallRequest {
     /// Call only after capture has stopped and durable application state is saved.
     /// Recheck the downloaded bytes immediately before running the installer.
     pub fn launch(&self) -> Result<()> {
+        verify_manifest(
+            &self.manifest,
+            &self.signature,
+            &self.version,
+            self.path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .context("Invalid installer name")?,
+            self.size,
+            &self.digest,
+        )?;
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -72,10 +85,55 @@ impl InstallRequest {
     }
 }
 
-#[derive(Default)]
 pub struct State {
     pub status: Status,
     pending: Option<Receiver<Event>>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        static CLEANUP: std::sync::Once = std::sync::Once::new();
+        CLEANUP.call_once(|| {
+            let _ = prune_downloads(&crate::model::data_dir().join("updates"), None);
+        });
+        Self {
+            status: Status::Idle,
+            pending: None,
+        }
+    }
+}
+
+/// Call before starting update work; preserve only the directory of the pending installer.
+pub fn prune_downloads(root: &std::path::Path, pending: Option<&std::path::Path>) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    let mut first_error = None;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if pending == Some(path.as_path()) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                continue;
+            }
+        }
+        if metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && let Err(error) = fs::remove_dir_all(path)
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 enum Event {
@@ -317,6 +375,23 @@ fn permitted_redirect(url: &str, original: &str) -> bool {
 }
 
 fn download_release(release: &Release, mut progress: impl FnMut(f32)) -> Result<InstallRequest> {
+    let base = format!("{RELEASES}/download/v{}", release.version);
+    let (manifest, signature) = if cfg!(feature = "signed-updates") {
+        (
+            fetch_metadata(&format!("{base}/update-manifest.json"))?,
+            fetch_metadata(&format!("{base}/update-manifest.sig"))?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    verify_manifest(
+        &manifest,
+        &signature,
+        &release.version,
+        &release.name,
+        release.size,
+        &release.digest,
+    )?;
     let root = crate::model::data_dir().join("updates");
     fs::create_dir_all(&root).context("Could not create the update folder.")?;
     let unique = format!(
@@ -399,6 +474,8 @@ fn download_release(release: &Release, mut progress: impl FnMut(f32)) -> Result<
             path,
             size: release.size,
             digest: release.digest,
+            manifest,
+            signature,
         })
     })();
     if result.is_err() {
@@ -406,6 +483,107 @@ fn download_release(release: &Release, mut progress: impl FnMut(f32)) -> Result<
         let _ = fs::remove_dir(&directory);
     }
     result
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignedManifest {
+    version: String,
+    asset: String,
+    size: u64,
+    sha256: String,
+}
+fn decode_hex<const N: usize>(value: &str) -> Result<[u8; N]> {
+    ensure!(
+        value.len() == N * 2 && value.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid signing key or signature encoding"
+    );
+    let mut output = [0; N];
+    for (i, byte) in output.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)?;
+    }
+    Ok(output)
+}
+fn verify_signature(manifest: &[u8], signature: &[u8], public_key: &str) -> Result<()> {
+    ensure!(
+        manifest.len() <= 16384 && signature.len() <= 256,
+        "Update signing metadata is too large"
+    );
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&decode_hex::<32>(public_key.trim())?)?;
+    let signature = ed25519_dalek::Signature::from_bytes(&decode_hex::<64>(
+        std::str::from_utf8(signature)?.trim(),
+    )?);
+    key.verify_strict(manifest, &signature)
+        .context("The update signature is invalid")
+}
+fn verify_manifest(
+    manifest: &[u8],
+    signature: &[u8],
+    version: &str,
+    asset: &str,
+    size: u64,
+    digest: &[u8; 32],
+) -> Result<()> {
+    if !cfg!(feature = "signed-updates") {
+        return Ok(());
+    }
+    verify_manifest_with_key(
+        manifest,
+        signature,
+        version,
+        asset,
+        size,
+        digest,
+        include_str!("../assets/update-signing.pub"),
+    )
+}
+fn verify_manifest_with_key(
+    manifest: &[u8],
+    signature: &[u8],
+    version: &str,
+    asset: &str,
+    size: u64,
+    digest: &[u8; 32],
+    key: &str,
+) -> Result<()> {
+    verify_signature(manifest, signature, key)?;
+    let signed: SignedManifest = serde_json::from_slice(manifest)?;
+    ensure!(
+        signed.version == version
+            && signed.asset == asset
+            && signed.size == size
+            && decode_hex::<32>(&signed.sha256)? == *digest,
+        "The signed release manifest does not match the installer"
+    );
+    Ok(())
+}
+fn fetch_metadata(original: &str) -> Result<Vec<u8>> {
+    let mut url = original.to_owned();
+    for _ in 0..5 {
+        ensure!(
+            permitted_redirect(&url, original),
+            "Invalid signing metadata redirect"
+        );
+        let mut response = agent(30)
+            .get(&url)
+            .header("User-Agent", "Articulate")
+            .call()?;
+        if response.status().is_redirection() {
+            url = response
+                .headers()
+                .get("location")
+                .context("Missing signing metadata redirect")?
+                .to_str()?
+                .to_owned();
+        } else {
+            ensure!(
+                response.status().as_u16() == 200,
+                "Release signing metadata is missing"
+            );
+            return read_limited(response.body_mut().as_reader(), 16384);
+        }
+    }
+    anyhow::bail!("Too many signing metadata redirects")
 }
 
 fn verify_reader(reader: &mut impl Read, size: u64, digest: &[u8; 32]) -> Result<()> {
@@ -438,6 +616,69 @@ fn verify_reader(reader: &mut impl Read, size: u64, digest: &[u8; 32]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cleanup_keeps_only_the_pending_installer_directory() {
+        let root = std::env::temp_dir().join(crate::discord::plugin::new_token().unwrap());
+        let pending = root.join("pending");
+        let stale = root.join("stale");
+        fs::create_dir_all(&pending).unwrap();
+        fs::create_dir(&stale).unwrap();
+        fs::write(pending.join("setup.exe"), b"synthetic").unwrap();
+        fs::write(stale.join("setup.part"), b"partial").unwrap();
+        prune_downloads(&root, Some(&pending)).unwrap();
+        assert!(pending.join("setup.exe").exists());
+        assert!(!stale.exists());
+        prune_downloads(&root, None).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn signature_switch_preserves_legacy_updates_by_default() {
+        let result = verify_manifest(b"", b"", "1.0.0", "setup.exe", 42, &[0; 32]);
+        assert_eq!(result.is_err(), cfg!(feature = "signed-updates"));
+    }
+    #[test]
+    fn signed_manifest_binds_every_installer_field() {
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let digest = [0xab; 32];
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "version":"1.2.3", "asset":"setup.exe", "size":42, "sha256":hex(&digest)
+        }))
+        .unwrap();
+        let signature = hex(&key.sign(&manifest).to_bytes());
+        let public = hex(&key.verifying_key().to_bytes());
+        let verify = |version, asset, size, digest| {
+            verify_manifest_with_key(
+                &manifest,
+                signature.as_bytes(),
+                version,
+                asset,
+                size,
+                digest,
+                &public,
+            )
+        };
+        assert!(verify("1.2.3", "setup.exe", 42, &digest).is_ok());
+        assert!(verify("1.2.4", "setup.exe", 42, &digest).is_err());
+        assert!(verify("1.2.3", "other.exe", 42, &digest).is_err());
+        assert!(verify("1.2.3", "setup.exe", 43, &digest).is_err());
+        assert!(verify("1.2.3", "setup.exe", 42, &[0; 32]).is_err());
+    }
+    #[test]
+    fn signatures_reject_tampering_missing_values_and_placeholder() {
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let manifest = b"synthetic release";
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let signature = hex(&key.sign(manifest).to_bytes());
+        let public = hex(&key.verifying_key().to_bytes());
+        assert!(verify_signature(manifest, signature.as_bytes(), &public).is_ok());
+        assert!(verify_signature(b"changed", signature.as_bytes(), &public).is_err());
+        assert!(verify_signature(manifest, b"", &public).is_err());
+        assert!(verify_signature(manifest, signature.as_bytes(), "PLACEHOLDER").is_err());
+    }
     #[test]
     #[ignore = "Downloads the latest public installer from GitHub; never launches it"]
     fn published_installer_download_passes_the_real_update_path() {

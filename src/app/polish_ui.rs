@@ -3,6 +3,7 @@ use crate::polish::{Event, Job, Preview, Request, Worker};
 
 #[derive(Default)]
 pub(super) struct State {
+    pub(super) assort: super::assort_ui::ReviewState,
     worker: Worker,
     job: Option<Job>,
     context: Option<Context>,
@@ -25,7 +26,8 @@ impl Context {
 impl App {
     pub(super) fn desktop_cleanup_status(&self) -> serde_json::Value {
         serde_json::json!({"installed":crate::polish::profile_installed(crate::polish::ModelProfile::Polish),
-            "working":self.polish.job.is_some(),"status":self.polish.status,"progress":self.polish.fraction})
+            "working":self.polish.job.is_some(),"status":self.polish.status,"progress":self.polish.fraction,
+            "preview":self.polish.preview.as_ref().map(|p| serde_json::json!({"original":p.original,"source":p.source,"text":p.text,"blocked":p.blocked,"cleanup_only":p.cleanup_only}))})
     }
 
     pub(super) fn desktop_cleanup_download(&mut self) -> Result<(), String> {
@@ -41,6 +43,8 @@ impl App {
     }
 
     pub(super) fn desktop_cleanup_cancel(&mut self) {
+        self.polish.preview = None;
+        self.polish.context = None;
         if let Some(job) = &self.polish.job {
             job.cancel();
         }
@@ -56,7 +60,8 @@ impl App {
     }
 
     fn polish_idle(&self) -> bool {
-        self.recording.is_none()
+        !self.polish.assort.working()
+            && self.recording.is_none()
             && self.call.is_none()
             && !self.brain_working()
             && !self.busy
@@ -90,6 +95,10 @@ impl App {
                             self.polish.status = "Ready. Choose Polish text to try it.".into()
                         }
                         Event::Complete(preview) => {
+                            if self.polish.context.is_none() {
+                                self.polish.status = "Cancelled. Your text is unchanged.".into();
+                                break;
+                            }
                             self.polish.status = if preview.cleanup_only {
                                 "Spoken repeats cleaned up. Other wording was kept unchanged."
                                     .into()
@@ -124,7 +133,7 @@ impl App {
         dead_code,
         reason = "Local polish controller retained for the Tauri editing flow"
     )]
-    fn polish_start(&mut self) {
+    pub(super) fn polish_start(&mut self) {
         if !self.polish_idle() || self.macro_used.is_some() || self.polish.job.is_some() {
             return;
         }
@@ -159,7 +168,7 @@ impl App {
         dead_code,
         reason = "Local polish controller retained for the Tauri editing flow"
     )]
-    fn polish_apply(&mut self) {
+    pub(super) fn polish_apply(&mut self) {
         let valid = self.polish_idle()
             && self
                 .polish
@@ -206,6 +215,44 @@ mod tests {
             cleanup_only: false,
             elapsed_ms: 950,
         });
+    }
+
+    #[test]
+    fn cancelling_discards_a_completed_preview() {
+        let (mut app, _) = super::super::tests::app();
+        prepared_preview(&mut app);
+        let before = app.text.clone();
+        app.desktop_cleanup_cancel();
+        app.polish_apply();
+        assert_eq!(app.text, before);
+        assert!(app.polish.preview.is_none());
+    }
+
+    #[test]
+    fn completed_job_is_reviewable_and_cancel_wins_a_queued_completion() {
+        let (mut app, _) = super::super::tests::app();
+        prepared_preview(&mut app);
+        app.preview_inflight = false;
+        let preview = app.polish.preview.take().unwrap();
+        let (job, tx) = crate::polish::Job::test_channel();
+        app.polish.job = Some(job);
+        tx.send(crate::polish::Event::Complete(preview)).unwrap();
+        app.polish_poll();
+        assert!(app.desktop_cleanup_status()["preview"].is_object());
+        app.polish_apply();
+        assert!(app.text.starts_with("Hi Casey,"));
+
+        prepared_preview(&mut app);
+        let original = app.text.clone();
+        let preview = app.polish.preview.take().unwrap();
+        let (job, tx) = crate::polish::Job::test_channel();
+        app.polish.job = Some(job);
+        tx.send(crate::polish::Event::Complete(preview)).unwrap();
+        app.desktop_cleanup_cancel();
+        app.polish_poll();
+        app.polish_apply();
+        assert_eq!(app.text, original);
+        assert!(app.polish.preview.is_none());
     }
 
     #[test]

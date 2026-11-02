@@ -47,6 +47,14 @@ jobs:
       - name: Validate and package
         shell: pwsh
         run: ./scripts/package-windows.ps1 -Validate
+      - name: Sign update manifest
+        if: vars.ENABLE_UPDATE_SIGNING == 'true'
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          node scripts/sign-update.mjs ($env:RELEASE_TAG.Substring(1))
+          if ($LASTEXITCODE -ne 0) { throw 'Update signing failed.' }
       - name: Preserve artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

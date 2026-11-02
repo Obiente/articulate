@@ -71,10 +71,42 @@ pub(super) fn executable_for_gpu() -> PathBuf {
     root().join("runtime-vulkan").join("llama-server.exe")
 }
 
+type InstallState = (PathBuf, [bool; 3]);
+static INSTALL_STATE: std::sync::Mutex<Option<InstallState>> = std::sync::Mutex::new(None);
+pub fn invalidate_install_state() {
+    *INSTALL_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+fn install_state() -> [bool; 3] {
+    let mut cache = INSTALL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = root();
+    if let Some((path, state)) = cache.as_ref()
+        && *path == directory
+    {
+        return *state;
+    }
+    let state = [
+        profile_installed_uncached(ModelProfile::Polish),
+        profile_installed_uncached(ModelProfile::Summary),
+        gpu_available_uncached(),
+    ];
+    *cache = Some((directory, state));
+    state
+}
+pub fn profile_installed(profile: ModelProfile) -> bool {
+    install_state()[if profile == ModelProfile::Polish {
+        0
+    } else {
+        1
+    }]
+}
+pub(super) fn gpu_available() -> bool {
+    install_state()[2]
+}
+
 // This indicates a complete downloaded runtime, not a usable graphics device.
 // The caller must verify its hashes before trying it and fall back to the CPU
 // runtime if Vulkan initialization or model loading fails.
-pub(super) fn gpu_available() -> bool {
+fn gpu_available_uncached() -> bool {
     cfg!(all(windows, target_arch = "x86_64"))
         && fs::read_to_string(root().join("ready-vulkan"))
             .is_ok_and(|marker| marker == VULKAN_RUNTIME_SHA)
@@ -105,7 +137,7 @@ pub(super) fn verify_gpu(cancel: &AtomicBool) -> Result<()> {
 pub fn installed() -> bool {
     profile_installed(ModelProfile::Polish)
 }
-pub fn profile_installed(profile: ModelProfile) -> bool {
+fn profile_installed_uncached(profile: ModelProfile) -> bool {
     cfg!(all(windows, target_arch = "x86_64"))
         && model_for(profile)
             .metadata()
@@ -172,7 +204,7 @@ pub(super) fn verify_profile(profile: ModelProfile, cancel: &AtomicBool) -> Resu
         "Download this local model in Settings first."
     );
     let (_, size, sha, _) = manifest(profile);
-    verified(&model_for(profile), size, sha, cancel)?;
+    super::stamp::verified(&model_for(profile), size, sha, cancel)?;
     for file in artifacts()? {
         verified(
             &root().join("runtime").join(file.name),
@@ -187,6 +219,7 @@ pub(super) fn verify_profile(profile: ModelProfile, cancel: &AtomicBool) -> Resu
 struct DownloadLock;
 impl Drop for DownloadLock {
     fn drop(&mut self) {
+        invalidate_install_state();
         DOWNLOADING.store(false, Ordering::Release);
     }
 }
@@ -208,6 +241,12 @@ pub(super) fn download_profile(
         "The local editor download is already running."
     );
     let _lock = DownloadLock;
+    let _lease = crate::model::acquire(if profile == ModelProfile::Polish {
+        crate::model::ModelId::Polish
+    } else {
+        crate::model::ModelId::Notes
+    });
+    invalidate_install_state();
     fs::create_dir_all(root())?;
     let model = model_for(profile);
     let (_, model_size, model_sha, model_url) = manifest(profile);
