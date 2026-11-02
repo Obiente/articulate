@@ -256,6 +256,15 @@ fn progress(events: &mpsc::Sender<Event>, stage: &str, fraction: Option<f32>) {
     });
 }
 
+#[allow(dead_code)]
+pub fn model_path(profile: ModelProfile) -> std::path::PathBuf {
+    install::model_for(profile)
+}
+#[allow(dead_code)]
+pub fn invalidate_install_state() {
+    install::invalidate_install_state();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,13 +515,4 @@ mod tests {
         assert!(installed());
         install::verify_profile(ModelProfile::Polish, &AtomicBool::new(false)).unwrap();
     }
-}
-
-#[allow(dead_code)]
-pub fn model_path(profile: ModelProfile) -> std::path::PathBuf {
-    install::model_for(profile)
-}
-#[allow(dead_code)]
-pub fn invalidate_install_state() {
-    install::invalidate_install_state();
 }
