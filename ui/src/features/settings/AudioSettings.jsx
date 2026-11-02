@@ -7,6 +7,8 @@ import {
 } from "../../components/SettingRow.jsx";
 import { languageLabel } from "../../lib/format.js";
 
+import { MicrophoneCheck } from "../dictation/MicrophoneCheck.jsx";
+
 const devices = (list, selected) =>
   [...new Set([...(list || []), ...(selected ? [selected] : [])])].map(
     (name) => ({ value: name, label: name }),
@@ -117,6 +119,16 @@ export function AudioSettings({ controls }) {
             onChange={(value) => patch("output", value ?? "")}
             disabled={busy || state.call_recording}
             nothingFoundMessage="No matching outputs"
+          />
+        </SettingRow>
+        <SettingRow
+          title="Microphone check"
+          description="Check your input level before recording."
+        >
+          <MicrophoneCheck
+            check={settings.microphone_check}
+            onTest={() => action("microphone_check")}
+            disabled={busy || capturing}
           />
         </SettingRow>
       </Paper>

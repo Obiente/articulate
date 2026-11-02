@@ -33,6 +33,7 @@ const shortcutKeys = [
 // `{ target: "hotkey" | "quick_note_hotkey", value, open }`; it is kept
 // after closing so the closing transition shows the same content.
 export function ShortcutDialog({
+  error,
   shortcut,
   pending,
   onChange,
@@ -92,6 +93,11 @@ export function ShortcutDialog({
           <Text size="sm" c="dimmed">
             Include Ctrl, Alt, or Win to keep ordinary typing available.
           </Text>
+          {error && (
+            <Text c="red" role="alert">
+              {error}
+            </Text>
+          )}
           <Group justify="flex-end">
             <Button
               variant="default"

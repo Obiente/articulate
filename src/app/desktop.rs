@@ -10,7 +10,7 @@
 //!
 //! See docs/desktop-ui-contract.md and docs/desktop-ui.md.
 
-mod actions;
+pub(super) mod actions;
 mod bridge;
 mod lifecycle;
 mod publish;

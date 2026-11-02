@@ -199,3 +199,26 @@ mod tests {
         }
     }
 }
+
+/// Overrides for a process basename. Missing fields inherit global preferences.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InputProfile {
+    pub app: String,
+    pub hotkey_mode: Option<crate::platform::HotkeyMode>,
+    pub insert: Option<bool>,
+    pub live_insert: Option<bool>,
+    pub line_break: Option<crate::platform::LineBreak>,
+    pub style: Option<WritingStyle>,
+    pub spoken_editing_commands: Option<bool>,
+}
+
+pub fn default_line_break(app: Option<&str>) -> crate::platform::LineBreak {
+    // These chat clients normally send a message on Enter.
+    match app.unwrap_or_default().to_ascii_lowercase().as_str() {
+        "discord.exe" | "slack.exe" | "teams.exe" | "ms-teams.exe" => {
+            crate::platform::LineBreak::ShiftEnter
+        }
+        _ => crate::platform::LineBreak::Enter,
+    }
+}

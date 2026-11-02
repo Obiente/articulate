@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::Value;
 
 pub(super) mod assort;
-pub(super) mod capture;
+pub(crate) mod capture;
 pub(super) mod discord;
 pub(super) mod library;
 pub(super) mod models;
@@ -26,7 +26,7 @@ pub(crate) enum Action {
     Capture(capture::Action),
     Output(output::Action),
     Vocabulary(vocabulary::Action),
-    Settings(settings::Action),
+    Settings(Box<settings::Action>),
     Polish(polish::Action),
     Assort(assort::Action),
     Models(models::Action),
@@ -57,7 +57,7 @@ const FEATURES: &[(&str, Parser)] = &[
         vocabulary::Action::deserialize(value).map(Action::Vocabulary)
     }),
     ("settings", |value| {
-        settings::Action::deserialize(value).map(Action::Settings)
+        settings::Action::deserialize(value).map(|action| Action::Settings(Box::new(action)))
     }),
     ("models", |value| {
         models::Action::deserialize(value).map(Action::Models)
@@ -120,7 +120,7 @@ impl App {
             Action::Capture(action) => self.desktop_capture_action(action),
             Action::Output(action) => output::run(action),
             Action::Vocabulary(action) => self.desktop_vocabulary_action(action),
-            Action::Settings(action) => self.desktop_settings_action(action),
+            Action::Settings(action) => self.desktop_settings_action(*action),
             Action::Polish(action) => self.desktop_polish_action(action),
             Action::Assort(action) => self.desktop_assort_action(action),
             Action::Models(action) => self.desktop_models_action(action),

@@ -21,6 +21,7 @@ export const actionCatalog = Object.freeze({
   notes_generate: { document: true },
   insights_refresh: { preview: true },
   // Capture
+  microphone_check: { preview: true },
   dictation_start: { document: true },
   dictation_stop: {},
   dictation_cancel: {},
@@ -29,6 +30,7 @@ export const actionCatalog = Object.freeze({
   note_capture_start: { document: true },
   note_capture_stop: { document: true },
   // Copy and export
+  insert_text: {},
   copy: { preview: true },
   export: { preview: true },
   // Vocabulary and snippets
@@ -109,6 +111,28 @@ export function sourceMoveAction(id, topicId, expectedTopicId) {
 // Checks shared by the desktop and preview transports. Messages match the
 // native controller's.
 const validators = {
+  settings_patch(action) {
+    for (const key of ["hotkey", "quick_note_hotkey"]) {
+      const h = action[key];
+      if (!h) continue;
+      if (!(h.ctrl || h.alt || h.win))
+        throw Error(
+          "Include Ctrl, Alt, or Win so ordinary typing stays available.",
+        );
+      if (
+        (h.ctrl &&
+          !h.alt &&
+          !h.win &&
+          !h.shift &&
+          ["C", "V", "X", "Z", "A", "S"].includes(h.key)) ||
+        (h.alt && !h.ctrl && !h.win && ["Tab", "F4"].includes(h.key)) ||
+        (h.win && h.key === "L")
+      )
+        throw Error(
+          "This shortcut is reserved for Windows or editing. Choose another chord.",
+        );
+    }
+  },
   session_patch(action) {
     if (action.title !== undefined && !validTitle(action.title))
       throw Error("Use a title from 1 to 160 characters.");

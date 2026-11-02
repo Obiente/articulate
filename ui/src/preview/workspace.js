@@ -85,8 +85,9 @@ export function createPreviewWorkspace(storage) {
     status: "Ready when you are",
     call_status: "Ready to capture a conversation",
     seconds: 0,
-    text: "Hello Casey can you review the plan",
-    original: "",
+    text: "The captured part of this thought is still available.",
+    original: "The captured part of this thought is still available.",
+    dictation_interruption: "The sample microphone disconnected.",
     call_rows: [],
     note_rows: [],
     call_session: null,
@@ -423,6 +424,18 @@ export function createPreviewWorkspace(storage) {
       )
         throw Error("Snippets changed. Refresh and try again.");
       sample.macros = sample.macros.filter((_, i) => i !== action.index);
+    },
+    microphone_check() {
+      sample.settings.microphone_check = {
+        running: false,
+        result: {
+          device: "Sample microphone",
+          peak: 0.64,
+          rms: 0.18,
+          clipping_ratio: 0,
+          silent: false,
+        },
+      };
     },
     settings_patch(action) {
       const { type, ...patch } = action;

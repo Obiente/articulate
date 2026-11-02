@@ -69,3 +69,11 @@ Settings lists downloaded models with their sizes, local paths and in-use state.
 Use Polish on a finished dictation to compare the safe baseline and proposed edit. Apply accepts the preview; Keep original or Cancel leaves the text unchanged. Vocabulary offers a bounded review of the latest dictation, with sentence context and preference scores. Choose one spelling explicitly, then review again for another choice.
 
 The tray offers Show, Start/Stop dictation, Start call capture and Quit. Quit saves pending edits through the normal close flow. Close to tray and Start with Windows are optional and off by default. Starting at login opens in the tray.
+
+## Dictation input preferences
+
+Settings > Dictation includes spoken editing (off by default), app profiles and writing styles. Say a command as its own finalized segment: new line, new paragraph, scratch that, delete that, or undo that. With commands enabled, external live typing waits for finalized segments, so command phrases are never typed provisionally. Embedded command phrases remain literal.
+
+Profiles match executable basenames, ignoring case. Hold/toggle, insertion, live typing, line breaks, writing style and spoken editing may inherit defaults or override them. Discord, Slack, Teams and MS Teams use Shift+Enter by default; other apps use Enter. Explicit profile settings take precedence. Writing styles offer No cleanup, Clean and Casual chat.
+
+Audio settings offers a three-second microphone test with resolved device name, peak/average level, clipping and silence warnings. It does not load speech models. Incomplete dictations show the interruption reason and skip automatic insertion. Copy remains available; Insert in 3 seconds lets you focus a destination field before guarded insertion.

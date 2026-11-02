@@ -58,6 +58,8 @@ struct Settings {
     audio_feedback: bool,
     audio_context: bool,
     styles: Vec<crate::writing_style::StyleRule>,
+    spoken_editing_commands: bool,
+    input_profiles: Vec<crate::writing_style::InputProfile>,
     discord_companion: bool,
     discord_pairing_key: String,
     #[serde(default = "enabled")]
@@ -115,6 +117,8 @@ impl Default for Settings {
             audio_feedback: true,
             audio_context: false,
             styles: Vec::new(),
+            spoken_editing_commands: false,
+            input_profiles: Vec::new(),
             discord_companion: false,
             discord_pairing_key: String::new(),
             discord_auto_connect: true,
@@ -141,6 +145,7 @@ enum Command {
     Call(calls::Request, CancelToken),
 }
 enum Event {
+    MicrophoneChecked(Result<audio::AudioCheck, String>),
     Loaded(String, Vec<String>),
     Text(Result<String, String>, f32, u64, bool),
     Error(String),
@@ -218,6 +223,8 @@ pub struct App {
     preview_inflight: bool,
     preview_audio_seconds: f32,
     capture_interruption: Option<String>,
+    dictation_editor: macros::DictationEditor,
+    microphone_check: desktop::actions::capture::MicrophoneCheck,
     pending_final: Option<Vec<f32>>,
     cleanup_count: usize,
     microphones: Vec<String>,
@@ -559,6 +566,8 @@ impl App {
             preview_inflight: false,
             preview_audio_seconds: 0.0,
             capture_interruption: None,
+            dictation_editor: Default::default(),
+            microphone_check: Default::default(),
             pending_final: None,
             cleanup_count: 0,
             microphones: audio::input_devices(),
@@ -696,6 +705,7 @@ impl App {
                     self.history.dictation_deleted = false;
                     self.status = format!("Listening on {}", recording.device);
                     self.capture_interruption = None;
+                    self.dictation_editor = Default::default();
                     self.recording = Some(recording);
                     if self.settings.audio_feedback {
                         crate::audio_cues::play(crate::audio_cues::Cue::Started);
@@ -714,12 +724,24 @@ impl App {
                     self.insertion_cancel = CancelToken::new();
                     self.integration_inflight = false;
                     self.integration_pending = None;
-                    self.live_mode = self.settings.insert
-                        && self.settings.live_insert
+                    self.live_mode = self.insert_enabled()
+                        && self
+                            .input_profile()
+                            .and_then(|p| p.live_insert)
+                            .unwrap_or(self.settings.live_insert)
                         && target.is_some()
                         && !self.hold_recording;
                     let _ = self.integration_tx.send(integration::Action::Cancel);
-                    if self.settings.insert
+                    let line_break = self
+                        .input_profile()
+                        .and_then(|p| p.line_break)
+                        .unwrap_or_else(|| {
+                            crate::writing_style::default_line_break(self.dictation_app.as_deref())
+                        });
+                    let _ = self
+                        .integration_tx
+                        .send(integration::Action::LineBreak(line_break));
+                    if self.insert_enabled()
                         && let Some(target) = target
                     {
                         let _ = self.integration_tx.send(integration::Action::Arm(
@@ -745,7 +767,7 @@ impl App {
 
     fn shortcut(&mut self, target: Target, at: Instant) {
         if self.recording.is_some() {
-            if self.settings.hotkey_mode == platform::HotkeyMode::Toggle
+            if self.input_hotkey_mode() == platform::HotkeyMode::Toggle
                 || (self.hold_recording && self.shortcut_gesture.press_again(at))
             {
                 self.toggle(None);
@@ -771,7 +793,19 @@ impl App {
             self.overlay_until = Some(Instant::now() + Duration::from_secs(4));
             return;
         }
-        if self.settings.hotkey_mode == platform::HotkeyMode::Hold {
+        let app = platform::app_name(target);
+        let mode = self
+            .settings
+            .input_profiles
+            .iter()
+            .rev()
+            .find(|p| {
+                app.as_deref()
+                    .is_some_and(|app| app.eq_ignore_ascii_case(&p.app))
+            })
+            .and_then(|p| p.hotkey_mode)
+            .unwrap_or(self.settings.hotkey_mode);
+        if mode == platform::HotkeyMode::Hold {
             // A release may finish only the recording this press started. A
             // manual capture must remain under its explicit Finish control.
             self.hold_recording = true;
@@ -799,7 +833,7 @@ impl App {
 
     fn shortcut_instruction(&self) -> String {
         let key = self.settings.hotkey.label();
-        match self.settings.hotkey_mode {
+        match self.input_hotkey_mode() {
             platform::HotkeyMode::Hold
                 if self.hold_recording && self.shortcut_gesture.hands_free =>
             {
@@ -855,6 +889,7 @@ impl App {
         self.history.dictation = None;
         self.history.dictation_deleted = false;
         self.dictation_app = None;
+        self.dictation_editor = Default::default();
         self.dictation_metrics = Default::default();
         // The previous view is already saved. A failed import must not later
         // create another session containing the previous dictation's words.
@@ -892,17 +927,61 @@ impl App {
         }
     }
 
+    fn input_profile(&self) -> Option<&crate::writing_style::InputProfile> {
+        self.settings.input_profiles.iter().rev().find(|p| {
+            self.dictation_app
+                .as_deref()
+                .is_some_and(|app| app.eq_ignore_ascii_case(&p.app))
+        })
+    }
+    fn input_hotkey_mode(&self) -> platform::HotkeyMode {
+        self.input_profile()
+            .and_then(|p| p.hotkey_mode)
+            .unwrap_or(self.settings.hotkey_mode)
+    }
+    fn spoken_editing(&self) -> bool {
+        self.input_profile()
+            .and_then(|p| p.spoken_editing_commands)
+            .unwrap_or(self.settings.spoken_editing_commands)
+    }
+    fn insert_enabled(&self) -> bool {
+        self.input_profile()
+            .and_then(|p| p.insert)
+            .unwrap_or(self.settings.insert)
+    }
+    fn dictation_style(&self) -> crate::writing_style::WritingStyle {
+        self.input_profile()
+            .and_then(|p| p.style)
+            .unwrap_or_else(|| {
+                crate::writing_style::effective(
+                    &self.settings.styles,
+                    self.dictation_app.as_deref(),
+                    self.settings.clean_speech,
+                )
+            })
+    }
+    fn finalized_text(&mut self, segment: String) {
+        if self.spoken_editing() {
+            let edited = self.dictation_editor.apply(
+                &segment,
+                &macros::EditingSettings {
+                    spoken_editing_commands: true,
+                },
+            );
+            self.committed_raw.clear();
+            self.update_text(edited);
+        } else {
+            self.update_text(segment);
+        }
+    }
+
     fn update_text(&mut self, raw: String) {
         self.raw = [self.committed_raw.as_str(), raw.as_str()]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        let style = crate::writing_style::effective(
-            &self.settings.styles,
-            self.dictation_app.as_deref(),
-            self.settings.clean_speech,
-        );
+        let style = self.dictation_style();
         let protected: Vec<_> = self
             .settings
             .entries
@@ -1149,6 +1228,13 @@ impl App {
                     self.verifier_downloading = None;
                     self.verifier_download_status = error;
                 }
+                Event::MicrophoneChecked(result) => {
+                    self.microphone_check.running = false;
+                    match result {
+                        Ok(check) => self.microphone_check.result = Some(check),
+                        Err(error) => self.microphone_check.error = Some(error),
+                    }
+                }
                 Event::Loaded(backend, languages) => {
                     self.speech_languages = languages;
                     self.loading = false;
@@ -1166,7 +1252,7 @@ impl App {
                     if was_chunk && id == self.utterance {
                         match &result {
                             Ok(text) => {
-                                self.update_text(text.clone());
+                                self.finalized_text(text.clone());
                                 self.committed_raw = self.raw.clone();
                                 self.publish_live_preview();
                             }
@@ -1211,28 +1297,28 @@ impl App {
                             continue;
                         }
                     };
-                    self.update_text(text);
+                    if final_pass {
+                        self.finalized_text(text);
+                    } else if !self.spoken_editing() {
+                        self.update_text(text);
+                    }
                     self.elapsed = Some(elapsed);
                     if !final_pass {
                         self.publish_live_preview();
                         continue;
                     }
-                    if let Some(message) = self.capture_interruption.take() {
-                        self.status = message;
+                    if let Some(message) = &self.capture_interruption {
+                        self.status = message.clone();
                         self.history_save_dictation();
                         continue;
                     }
                     // Resolve from speech, before dictionary rules, and never rewrite literal templates.
-                    let spoken = if crate::writing_style::effective(
-                        &self.settings.styles,
-                        self.dictation_app.as_deref(),
-                        self.settings.clean_speech,
-                    ) != crate::writing_style::WritingStyle::Verbatim
-                    {
-                        cleanup::apply(&self.raw).0
-                    } else {
-                        self.raw.clone()
-                    };
+                    let spoken =
+                        if self.dictation_style() != crate::writing_style::WritingStyle::Verbatim {
+                            cleanup::apply(&self.raw).0
+                        } else {
+                            self.raw.clone()
+                        };
                     match macros::expand(
                         &spoken,
                         &self.settings.macros,
@@ -1267,7 +1353,7 @@ impl App {
                         "Your transcript is ready".into()
                     };
                     self.history_save_dictation();
-                    if self.settings.insert
+                    if self.insert_enabled()
                         && (!self.text.is_empty() || self.live_mode)
                         && let Some(target) = self.target.take()
                     {
@@ -2265,6 +2351,8 @@ mod tests {
                 preview_inflight: true,
                 preview_audio_seconds: 0.0,
                 capture_interruption: None,
+                dictation_editor: Default::default(),
+                microphone_check: Default::default(),
                 pending_final: None,
                 cleanup_count: 0,
                 microphones: Vec::new(),

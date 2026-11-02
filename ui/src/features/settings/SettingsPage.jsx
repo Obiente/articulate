@@ -36,6 +36,7 @@ const confirmations = {
 
 export function SettingsPage({ state, act }) {
   const [pending, setPending] = useState("");
+  const [shortcutError, setShortcutError] = useState("");
   const [shortcut, setShortcut] = useState(null);
   const [confirmation, setConfirmation] = useState(null);
   const controls = settingsControls({
@@ -43,8 +44,10 @@ export function SettingsPage({ state, act }) {
     act,
     pending,
     setPending,
-    editShortcut: (target, current) =>
-      setShortcut({ target, value: current, open: true }),
+    editShortcut: (target, current) => {
+      setShortcutError("");
+      setShortcut({ target, value: current, open: true });
+    },
     confirm: setConfirmation,
   });
   const closeShortcut = () =>
@@ -120,13 +123,30 @@ export function SettingsPage({ state, act }) {
         </Group>
       </Modal>
       <ShortcutDialog
+        error={
+          shortcutError ||
+          (shortcut?.target === "quick_note_hotkey"
+            ? state.settings?.quick_note_shortcut_error
+            : state.settings?.shortcut_error)
+        }
         shortcut={shortcut}
         pending={pending}
         onChange={(value) => setShortcut({ ...shortcut, value })}
         onClose={closeShortcut}
         onSave={async () => {
-          if (await controls.patch(shortcut.target, shortcut.value))
+          setShortcutError("");
+          setPending(shortcut.target);
+          try {
+            await act({
+              type: "settings_patch",
+              [shortcut.target]: shortcut.value,
+            });
             closeShortcut();
+          } catch (error) {
+            setShortcutError(String(error.message || error));
+          } finally {
+            setPending("");
+          }
         }}
       />
     </div>

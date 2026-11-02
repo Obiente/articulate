@@ -8,6 +8,12 @@ use serde::Serialize;
 /// key and the model path are never included.
 #[derive(Serialize)]
 pub(crate) struct SettingsView<'a> {
+    spoken_editing_commands: bool,
+    styles: &'a [crate::writing_style::StyleRule],
+    input_profiles: &'a [crate::writing_style::InputProfile],
+    recent_dictation_app: Option<&'a str>,
+    shortcut_error: Option<&'a str>,
+    microphone_check: &'a crate::app::desktop::actions::capture::MicrophoneCheck,
     clean_speech: bool,
     insert: bool,
     live_insert: bool,
@@ -43,6 +49,12 @@ pub(crate) fn settings(app: &App) -> Settings<'_> {
     let settings = &app.settings;
     Settings {
         settings: SettingsView {
+            spoken_editing_commands: settings.spoken_editing_commands,
+            styles: &settings.styles,
+            input_profiles: &settings.input_profiles,
+            recent_dictation_app: app.dictation_app.as_deref(),
+            shortcut_error: app.shortcut_error.as_deref(),
+            microphone_check: &app.microphone_check,
             clean_speech: settings.clean_speech,
             insert: settings.insert,
             live_insert: settings.live_insert,

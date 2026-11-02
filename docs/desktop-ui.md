@@ -40,7 +40,7 @@ Interface motion uses Motion for React for the shared navigation selection, Mant
 
 ## Migration boundaries
 
-Per-app writing styles are not yet exposed in the React interface. Manual Polish previews are available on the finished dictation. The old UI has been removed; these remaining controls must be ported before claiming feature parity. Build and packaging scripts target the single Tauri executable; no release is published by building locally.
+Per-app writing styles are available in Dictation settings. Manual Polish previews are available on the finished dictation. The old UI has been removed; these remaining controls must be ported before claiming feature parity. Build and packaging scripts target the single Tauri executable; no release is published by building locally.
 
 ## Structure
 

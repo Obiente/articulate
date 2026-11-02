@@ -48,6 +48,7 @@ pub(crate) fn capture(app: &App) -> Capture<'_> {
 pub(crate) struct Dictation<'a> {
     text: &'a str,
     original: &'a str,
+    dictation_interruption: Option<&'a str>,
     dictation_session: Option<SessionView<'a>>,
 }
 
@@ -55,6 +56,7 @@ pub(crate) fn dictation(app: &App) -> Dictation<'_> {
     Dictation {
         text: &app.text,
         original: &app.raw,
+        dictation_interruption: app.capture_interruption.as_deref(),
         dictation_session: app
             .history
             .dictation

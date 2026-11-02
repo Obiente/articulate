@@ -89,7 +89,15 @@ fn snapshot_sections_have_a_locked_shape() {
                 "capture_feedback",
             ]),
         ),
-        ("dictation", set(&["text", "original", "dictation_session"])),
+        (
+            "dictation",
+            set(&[
+                "text",
+                "original",
+                "dictation_session",
+                "dictation_interruption",
+            ]),
+        ),
         ("live", set(&["call_session", "note_session"])),
         ("live_rows", set(&["call_rows", "note_rows"])),
         ("document", set(&["selected"])),
@@ -171,6 +179,12 @@ fn snapshot_sections_have_a_locked_shape() {
     assert_eq!(
         keys(&state["settings"]),
         set(&[
+            "spoken_editing_commands",
+            "styles",
+            "input_profiles",
+            "recent_dictation_app",
+            "shortcut_error",
+            "microphone_check",
             "clean_speech",
             "insert",
             "live_insert",
@@ -766,4 +780,137 @@ fn model_cancellation_targets_the_requested_transfer() {
     .unwrap();
     assert!(verifier.load(std::sync::atomic::Ordering::Relaxed));
     assert!(!speech.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn input_preferences_validate_and_round_trip() {
+    let (mut app, _) = app();
+    app.desktop_action(action(json!({"type":"settings_patch", "spoken_editing_commands":true, "input_profiles":[{"app":"editor.exe","insert":true,"line_break":"ShiftEnter"}], "styles":[{"app":"editor.exe","style":"Chat"}]}))).unwrap();
+    let restored: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
+    assert!(restored.spoken_editing_commands);
+    assert_eq!(restored.input_profiles.len(), 1);
+    assert!(
+        app.desktop_action(action(
+            json!({"type":"settings_patch","input_profiles":[{"app":"C:/private/editor.exe"}]})
+        ))
+        .is_err()
+    );
+    assert_eq!(app.settings.input_profiles.len(), 1);
+    app.microphone_check.running = true;
+    assert!(
+        app.desktop_action(action(json!({"type":"microphone_check"})))
+            .is_err()
+    );
+}
+
+#[test]
+fn spoken_commands_use_only_finalized_segments() {
+    let (mut app, _) = app();
+    app.settings.spoken_editing_commands = true;
+    for (text, chunk, final_pass) in [
+        ("Hello.", true, true),
+        ("scratch that", false, false),
+        ("new line", true, true),
+        ("World.", true, true),
+        ("scratch that", true, true),
+        ("undo that", false, true),
+    ] {
+        app.chunk_inflight = chunk;
+        app.event_tx
+            .send(crate::app::Event::Text(
+                Ok(text.into()),
+                0.1,
+                app.utterance,
+                final_pass,
+            ))
+            .unwrap();
+        app.receive();
+        assert!(!app.text.contains("scratch that"));
+    }
+    assert_eq!(app.text, "Hello.\nWorld.");
+}
+
+#[test]
+fn spoken_commands_replace_live_text_without_typing_command_words() {
+    let (mut app, _) = app();
+    let (tx, rx) = mpsc::channel();
+    let (ack, events) = mpsc::channel();
+    app.integration_tx = tx;
+    app.integration_rx = events;
+    app.target = Some(crate::platform::test_target());
+    app.live_mode = true;
+    app.settings.insert = true;
+    app.settings.spoken_editing_commands = true;
+    for (spoken, finalized, expected) in [
+        ("Hello.", true, "Hello."),
+        ("scratch that", false, "Hello."),
+        ("scratch that", true, ""),
+    ] {
+        app.chunk_inflight = finalized;
+        app.event_tx
+            .send(crate::app::Event::Text(
+                Ok(spoken.into()),
+                0.1,
+                app.utterance,
+                finalized,
+            ))
+            .unwrap();
+        app.receive();
+        assert!(
+            matches!(rx.try_recv().unwrap(), integration::Action::Preview { text, .. } if text == expected)
+        );
+        ack.send(integration::Event::Previewed(app.utterance, Ok(())))
+            .unwrap();
+        app.receive();
+    }
+}
+
+#[test]
+fn profiles_override_defaults_only_for_the_destination() {
+    let (mut app, _) = app();
+    app.settings.input_profiles = serde_json::from_value(json!([{"app":"editor.exe", "insert":true,"spoken_editing_commands":true,"style":"Verbatim","hotkey_mode":"Toggle"}])).unwrap();
+    app.dictation_app = Some("EDITOR.EXE".into());
+    assert!(app.insert_enabled() && app.spoken_editing());
+    assert_eq!(app.input_hotkey_mode(), crate::platform::HotkeyMode::Toggle);
+    assert_eq!(
+        app.dictation_style(),
+        crate::writing_style::WritingStyle::Verbatim
+    );
+    app.dictation_app = Some("other.exe".into());
+    assert!(!app.insert_enabled() && !app.spoken_editing());
+    assert_eq!(
+        crate::writing_style::default_line_break(Some("DISCORD.EXE")),
+        crate::platform::LineBreak::ShiftEnter
+    );
+}
+
+#[test]
+fn microphone_worker_result_is_visible_without_loading_inference() {
+    let (mut app, commands) = app();
+    app.microphone_check.running = true;
+    app.event_tx
+        .send(crate::app::Event::MicrophoneChecked(Ok(
+            crate::audio::AudioCheck::measure("Synthetic input".into(), &[0.0, 1.0]),
+        )))
+        .unwrap();
+    app.receive();
+    let state = app.desktop_snapshot();
+    assert_eq!(state["settings"]["microphone_check"]["running"], false);
+    assert_eq!(
+        state["settings"]["microphone_check"]["result"]["device"],
+        "Synthetic input"
+    );
+    assert!(commands.try_recv().is_err());
+    app.event_tx
+        .send(crate::app::Event::MicrophoneChecked(Err("No input".into())))
+        .unwrap();
+    app.receive();
+    assert_eq!(app.microphone_check.error.as_deref(), Some("No input"));
+}
+
+#[test]
+fn manual_insertion_rejects_empty_text_before_waiting() {
+    let command = action(json!({"type":"insert_text","text":""}));
+    assert!(command.run_outside_controller().unwrap().is_err());
 }

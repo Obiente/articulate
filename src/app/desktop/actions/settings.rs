@@ -12,6 +12,9 @@ pub(crate) enum Action {
         cpu: Option<bool>,
         model_path: Option<String>,
         transcription_language: Option<String>,
+        spoken_editing_commands: Option<bool>,
+        input_profiles: Option<Vec<crate::writing_style::InputProfile>>,
+        styles: Option<Vec<crate::writing_style::StyleRule>>,
         clean_speech: Option<bool>,
         insert: Option<bool>,
         live_insert: Option<bool>,
@@ -38,6 +41,9 @@ struct Preferences {
     cpu: Option<bool>,
     model_path: Option<String>,
     transcription_language: Option<String>,
+    spoken_editing_commands: Option<bool>,
+    input_profiles: Option<Vec<crate::writing_style::InputProfile>>,
+    styles: Option<Vec<crate::writing_style::StyleRule>>,
     clean_speech: Option<bool>,
     insert: Option<bool>,
     live_insert: Option<bool>,
@@ -79,6 +85,12 @@ impl Preferences {
             &mut self.transcription_language,
             &mut settings.transcription_language,
         );
+        swap(
+            &mut self.spoken_editing_commands,
+            &mut settings.spoken_editing_commands,
+        );
+        swap(&mut self.input_profiles, &mut settings.input_profiles);
+        swap(&mut self.styles, &mut settings.styles);
         swap(&mut self.clean_speech, &mut settings.clean_speech);
         swap(&mut self.insert, &mut settings.insert);
         swap(&mut self.live_insert, &mut settings.live_insert);
@@ -113,6 +125,9 @@ impl App {
             cpu,
             model_path,
             transcription_language,
+            spoken_editing_commands,
+            input_profiles,
+            styles,
             clean_speech,
             insert,
             live_insert,
@@ -135,6 +150,9 @@ impl App {
             cpu,
             model_path: model_path.map(|path| path.trim().to_owned()),
             transcription_language,
+            spoken_editing_commands,
+            input_profiles,
+            styles,
             clean_speech,
             insert,
             live_insert,
@@ -152,6 +170,20 @@ impl App {
             automatic_update_checks,
         };
         self.desktop_validate_settings(&preferences, hotkey.as_ref(), quick_note_hotkey.as_ref())?;
+        if let Some(profiles) = &mut preferences.input_profiles {
+            for profile in profiles {
+                profile.app = crate::dictionary::app_scope(&profile.app)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default();
+            }
+        }
+        if let Some(styles) = &mut preferences.styles {
+            for rule in styles {
+                rule.app = crate::dictionary::app_scope(&rule.app)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default();
+            }
+        }
         let reload_model = preferences
             .transcription_language
             .as_ref()
@@ -240,6 +272,33 @@ impl App {
             && !self.speech_languages.contains(language)
         {
             return Err("Choose a language supported by the loaded speech model.".into());
+        }
+        if let Some(profiles) = &preferences.input_profiles {
+            if profiles.len() > 100 {
+                return Err("Use at most 100 app profiles.".into());
+            }
+            let mut seen = std::collections::HashSet::new();
+            for profile in profiles {
+                let app = crate::dictionary::app_scope(&profile.app)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("Choose an executable name.")?;
+                if !seen.insert(app) {
+                    return Err("Use one profile per app.".into());
+                }
+            }
+        }
+        if let Some(styles) = &preferences.styles {
+            if styles.len() > 100 {
+                return Err("Use at most 100 writing styles.".into());
+            }
+            for rule in styles {
+                if crate::dictionary::app_scope(&rule.app)
+                    .map_err(|e| e.to_string())?
+                    .is_none()
+                {
+                    return Err("Choose an executable name.".into());
+                }
+            }
         }
         let dictation = hotkey.unwrap_or(&self.settings.hotkey);
         let quick_note = quick_note_hotkey.unwrap_or(&self.settings.quick_note_hotkey);

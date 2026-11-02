@@ -3,6 +3,13 @@
 use crate::app::App;
 use serde::Deserialize;
 
+#[derive(Default, serde::Serialize)]
+pub(crate) struct MicrophoneCheck {
+    pub running: bool,
+    pub result: Option<crate::audio::AudioCheck>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CallSource {
@@ -14,6 +21,7 @@ pub(crate) enum CallSource {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Action {
+    MicrophoneCheck,
     DictationStart,
     DictationStop,
     DictationCancel,
@@ -33,6 +41,25 @@ pub(crate) enum Action {
 impl App {
     pub(crate) fn desktop_capture_action(&mut self, action: Action) -> Result<(), String> {
         match action {
+            Action::MicrophoneCheck => {
+                if self.recording.is_some() || self.call.is_some() || self.busy {
+                    return Err("Finish recording before testing the microphone.".into());
+                }
+                if self.microphone_check.running {
+                    return Err("A microphone test is already running.".into());
+                }
+                self.microphone_check = MicrophoneCheck {
+                    running: true,
+                    ..Default::default()
+                };
+                let selected = self.settings.microphone.clone();
+                let tx = self.event_tx.clone();
+                std::thread::spawn(move || {
+                    let result = crate::audio::check_microphone(selected.as_deref(), 3)
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(crate::app::Event::MicrophoneChecked(result));
+                });
+            }
             Action::DictationStart => {
                 self.desktop_capture_idle()?;
                 self.toggle(None);
