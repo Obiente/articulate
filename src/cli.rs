@@ -4,7 +4,13 @@ use crate::{
 use anyhow::{Context, Result};
 use std::{path::PathBuf, time::Instant};
 
+#[path = "bench.rs"]
+mod bench;
+
 pub fn run(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "--bench") {
+        return bench::run(&args[1..]);
+    }
     if args == ["--install-audio-context"] {
         crate::sensevoice::install(|_| {})?;
         println!("SenseVoice audio context installed and verified.");
