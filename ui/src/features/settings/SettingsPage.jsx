@@ -4,6 +4,7 @@ import { ShieldCheck } from "@phosphor-icons/react";
 import { Heading } from "../../components/Page.jsx";
 import { DiscordSettings } from "../discord/DiscordSettings.jsx";
 import { MeetingSettings } from "../meetings/MeetingSettings.jsx";
+import { StorageSettings } from "../library/StorageSettings.jsx";
 import { ModelSettings } from "../models/ModelSettings.jsx";
 import { UpdateSettings } from "../updates/UpdateSettings.jsx";
 import { AudioSettings } from "./AudioSettings.jsx";
@@ -18,6 +19,7 @@ const sections = [
   ["discord", "Discord"],
   ["meetings", "Meetings"],
   ["models", "Models"],
+  ["storage", "Privacy & storage"],
   ["updates", "Updates"],
 ];
 
@@ -94,6 +96,7 @@ export function SettingsPage({ state, act }) {
           send: (command) => void act(command).catch(() => {}),
         }}
       />
+      <StorageSettings controls={controls} />
       <UpdateSettings controls={controls} />
       <Text c="dimmed" size="sm" className="secondary-privacy">
         <ShieldCheck size={17} />

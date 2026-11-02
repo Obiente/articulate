@@ -27,26 +27,14 @@ const MAX_MATCHES: usize = 50;
 pub struct Hit {
     pub session_id: String,
     pub title: String,
-    #[allow(
-        dead_code,
-        reason = "Shown by desktop search results in a later change"
-    )]
     pub kind: Kind,
     pub created_ms: u64,
     pub field: Field,
     /// Exact substring of the saved text, never generated or paraphrased.
     pub excerpt: String,
     /// Byte offset of `excerpt` within the full field text.
-    #[allow(
-        dead_code,
-        reason = "Shown by desktop search results in a later change"
-    )]
     pub excerpt_start: usize,
     /// Byte ranges of matched terms within `excerpt`.
-    #[allow(
-        dead_code,
-        reason = "Shown by desktop search results in a later change"
-    )]
     pub matches: Vec<(usize, usize)>,
     pub row: Option<usize>,
     pub speaker: Option<String>,
@@ -63,10 +51,6 @@ pub struct Results {
     /// More files/content/results exist than this search could inspect or return.
     pub partial: bool,
     /// Whether the full-text index answered (rather than the bounded scan).
-    #[allow(
-        dead_code,
-        reason = "Shown by desktop search results in a later change"
-    )]
     pub indexed: bool,
 }
 

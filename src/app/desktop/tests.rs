@@ -118,6 +118,9 @@ fn snapshot_sections_have_a_locked_shape() {
         ("document_body", set(&["selected_body"])),
         ("vocabulary", set(&["dictionary", "macros", "assort"])),
         ("insights", set(&["insights"])),
+        ("search", set(&["search"])),
+        ("storage", set(&["storage", "library_notice"])),
+        ("recovery", set(&["recovery"])),
     ]
     .into_iter()
     .collect();
@@ -141,6 +144,9 @@ fn snapshot_sections_have_a_locked_shape() {
         "is_collection",
         "can_receive_sources",
         "sources",
+        "pinned",
+        "follow_ups",
+        "subtitles_unavailable",
     ]);
     assert_eq!(keys(&state["selected"]), session_meta);
     assert_eq!(keys(&state["call_session"]), session_meta);
@@ -175,6 +181,7 @@ fn snapshot_sections_have_a_locked_shape() {
             "topic_id",
             "is_collection",
             "can_receive_sources",
+            "pinned",
         ])
     );
     assert_eq!(

@@ -16,6 +16,7 @@ import {
   Microphone,
   Notebook,
   Plus,
+  PushPin,
   Record,
   Sparkle,
   TextAlignLeft,
@@ -23,6 +24,14 @@ import {
   X,
 } from "@phosphor-icons/react";
 import { formatDate, formatDuration, shortcutLabel } from "../../lib/format.js";
+import { pinnedFirst } from "./pins.js";
+import "./library.css";
+import { RecoveryBanner, RecoveryDialog } from "./Recovery.jsx";
+import {
+  SearchFilters,
+  SearchResults,
+  useLibrarySearch,
+} from "./SearchResults.jsx";
 
 const iconFor = (kind) =>
   kind === "call" ? Headphones : kind === "note" ? Notebook : Microphone;
@@ -56,6 +65,14 @@ const SessionCard = memo(function SessionCard({
                 : "NOTE"
               : "DICTATION"}
           <span>{formatDate(session.created_ms)}</span>
+          {session.pinned && (
+            <PushPin
+              className="pinned-mark"
+              size={13}
+              weight="fill"
+              aria-label="Pinned"
+            />
+          )}
         </div>
         <h2>{session.title || "Untitled note"}</h2>
         <p>{session.preview || "A fresh page for your thoughts."}</p>
@@ -91,6 +108,9 @@ const SessionCard = memo(function SessionCard({
 export function LibraryPage({
   mode,
   history,
+  search: searchState,
+  recovery,
+  act,
   captureBlocked,
   filingStatus,
   quickNoteHotkey,
@@ -99,18 +119,27 @@ export function LibraryPage({
   start,
   speak,
 }) {
-  const [query, setQuery] = useState(""),
-    [preview, setPreview] = useState(null);
-  const filtered = useMemo(() => {
-    const search = query.toLowerCase();
-    return history.filter(
-      (s) =>
-        s.kind === mode &&
-        (query || !s.topic_id) &&
-        `${s.title} ${s.preview}`.toLowerCase().includes(search),
+  const [preview, setPreview] = useState(null),
+    [reviewing, setReviewing] = useState(false);
+  const search = useLibrarySearch({
+    act,
+    search: searchState,
+    defaultKind: mode,
+  });
+  const { query, setQuery } = search;
+  const searching = search.view.active;
+  const filtered = useMemo(
+    () => pinnedFirst(history.filter((s) => s.kind === mode && !s.topic_id)),
+    [history, mode],
+  );
+  const selected =
+    (preview && history.find((s) => s.id === preview)) ||
+    (searching ? null : filtered[0]);
+  const run = (command) =>
+    act(command).then(
+      () => true,
+      () => false,
     );
-  }, [history, mode, query]);
-  const selected = filtered.find((s) => s.id === preview) || filtered[0];
   return (
     <div className="page-content library-page">
       <div className="page-header">
@@ -199,89 +228,103 @@ export function LibraryPage({
           <span>{filingStatus}</span>
         </div>
       )}
+      <RecoveryBanner recovery={recovery} onReview={() => setReviewing(true)} />
       <div className="library-tools">
         <span className="section-heading">
           {mode === "call" ? "SAVED CONVERSATIONS" : "SAVED NOTES"}
         </span>
-        <TextInput
-          aria-label={
-            mode === "call" ? "Search conversations" : "Search your notes"
-          }
-          placeholder={
-            mode === "call" ? "Search conversations" : "Search your notes"
-          }
-          value={query}
-          onChange={(e) => setQuery(e.currentTarget.value)}
-          leftSection={<MagnifyingGlass size={18} />}
-          rightSection={
-            query ? (
-              <ActionIcon
-                variant="subtle"
-                aria-label="Clear search"
-                onClick={() => setQuery("")}
-              >
-                <X size={14} />
-              </ActionIcon>
-            ) : null
-          }
-        />
+        <Group gap={8} wrap="nowrap" className="library-search">
+          <TextInput
+            aria-label={
+              mode === "call" ? "Search conversations" : "Search your notes"
+            }
+            placeholder={
+              mode === "call"
+                ? "Search words, speakers and notes"
+                : "Search your notes"
+            }
+            value={query}
+            onChange={(e) => setQuery(e.currentTarget.value)}
+            onKeyDown={(e) => e.key === "Escape" && setQuery("")}
+            leftSection={<MagnifyingGlass size={18} />}
+            rightSection={
+              query ? (
+                <ActionIcon
+                  variant="subtle"
+                  aria-label="Clear search"
+                  onClick={() => setQuery("")}
+                >
+                  <X size={14} />
+                </ActionIcon>
+              ) : null
+            }
+          />
+          <SearchFilters
+            filters={search.filters}
+            setFilters={search.setFilters}
+            count={search.filterCount}
+            problem={search.problem}
+            defaultKind={mode}
+          />
+        </Group>
       </div>
       <div className="library-layout">
-        <div className="session-list">
-          <div className="section-heading">
-            <span>
-              {query
-                ? "SEARCH RESULTS"
-                : mode === "call"
-                  ? "RECENT CONVERSATIONS"
-                  : "YOUR RECENT NOTES"}
-            </span>
-            <span>
-              {filtered.length} {filtered.length === 1 ? "item" : "items"}
-            </span>
-          </div>
-          {filtered.map((session, index) => (
-            <SessionCard
-              key={session.id}
-              session={session}
-              index={index}
-              focused={selected?.id === session.id}
+        {searching ? (
+          <div className="session-list">
+            <SearchResults
+              view={search.view}
+              history={history}
               open={open}
               setPreview={setPreview}
+              clear={search.clear}
+              onRecovery={() => setReviewing(true)}
             />
-          ))}
-          {!filtered.length && (
-            <div className="empty-state">
-              <Notebook size={40} weight="duotone" />
-              <h2>
-                {query
-                  ? "No matching results"
-                  : mode === "call"
+          </div>
+        ) : (
+          <div className="session-list">
+            <div className="section-heading">
+              <span>
+                {mode === "call" ? "RECENT CONVERSATIONS" : "YOUR RECENT NOTES"}
+              </span>
+              <span>
+                {filtered.length} {filtered.length === 1 ? "item" : "items"}
+              </span>
+            </div>
+            {filtered.map((session, index) => (
+              <SessionCard
+                key={session.id}
+                session={session}
+                index={index}
+                focused={selected?.id === session.id}
+                open={open}
+                setPreview={setPreview}
+              />
+            ))}
+            {!filtered.length && (
+              <div className="empty-state">
+                <Notebook size={40} weight="duotone" />
+                <h2>
+                  {mode === "call"
                     ? "Your conversations start here"
                     : "A place for your next idea"}
-              </h2>
-              <p>
-                {query
-                  ? "Try a different word or clear your search."
-                  : mode === "call"
+                </h2>
+                <p>
+                  {mode === "call"
                     ? "Record a meeting or call in any app. Its transcript will appear here."
                     : "Write or speak a note. It will be waiting here when you need it."}
-              </p>
-              <Button
-                variant="light"
-                onClick={
-                  query ? () => setQuery("") : mode === "call" ? start : newNote
-                }
-              >
-                {query
-                  ? "Clear search"
-                  : mode === "call"
+                </p>
+                <Button
+                  variant="light"
+                  onClick={mode === "call" ? start : newNote}
+                >
+                  {mode === "call"
                     ? "Record a conversation"
                     : "Write your first note"}
-              </Button>
-            </div>
-          )}
-        </div>
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
         <aside className="library-preview">
           <div className="section-heading">
             <span>AT A GLANCE</span>
@@ -310,6 +353,12 @@ export function LibraryPage({
                 <LockSimple size={17} />
                 <span>Saved on this device</span>
               </div>
+              {selected.pinned && (
+                <div className="detail-row">
+                  <PushPin size={17} weight="fill" />
+                  <span>Pinned, so retention rules keep it</span>
+                </div>
+              )}
               <Button
                 variant="light"
                 fullWidth
@@ -319,12 +368,36 @@ export function LibraryPage({
               >
                 Open {selected.kind === "call" ? "conversation" : "note"}
               </Button>
+              <Button
+                variant="subtle"
+                color="gray"
+                fullWidth
+                mt="xs"
+                leftSection={
+                  <PushPin
+                    size={16}
+                    weight={selected.pinned ? "fill" : "regular"}
+                  />
+                }
+                aria-pressed={Boolean(selected.pinned)}
+                onClick={() =>
+                  void run({
+                    type: "session_pin",
+                    id: selected.id,
+                    pinned: !selected.pinned,
+                  })
+                }
+              >
+                {selected.pinned ? "Unpin" : "Pin to the top"}
+              </Button>
             </>
           ) : (
             <p className="muted">
-              {mode === "call"
-                ? "Your conversations will appear here."
-                : "Your notes will appear here."}
+              {searching
+                ? "Point to a result to see it here."
+                : mode === "call"
+                  ? "Your conversations will appear here."
+                  : "Your notes will appear here."}
             </p>
           )}
           <div className="quiet-tip">
@@ -346,6 +419,12 @@ export function LibraryPage({
           </div>
         </aside>
       </div>
+      <RecoveryDialog
+        opened={reviewing}
+        onClose={() => setReviewing(false)}
+        recovery={recovery}
+        run={run}
+      />
     </div>
   );
 }

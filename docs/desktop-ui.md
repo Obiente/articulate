@@ -26,9 +26,14 @@ Open `http://127.0.0.1:4173`. This preview uses synthetic documents stored in th
 
 - Dictation with recording state, recent text and a separate non-activating indicator.
 - Notetaker for personal notes, Conversations for meetings and calls, and Dictation for recent dictations. Saved documents include transcript search and participant labels.
+- Full-text search of the whole library from Notetaker and Conversations, with highlighted excerpts and filters for dates, kind, speaker and dictation app. Searches start a quarter second after typing stops; a newer search cancels the previous one.
+- Pins in the library list and the open document. Pinned items are listed first and kept by retention.
+- An export menu on every open document: text, Markdown, SRT and WebVTT, plus its follow-ups as a Markdown checklist or calendar tasks with an optional reminder. Subtitle formats are disabled, with the reason, when there is no timing.
+- A banner in the library when saved items need attention, opening a recovery view to restore, export or discard damaged files.
 - Vocabulary and snippets with searchable lists and accessible editing dialogs.
 - Insights calculated from retained local dictations.
 - Settings for shortcuts, hold or toggle behavior, audio devices, automatic cleanup, Discord edition, pairing, pictures, auto-connect and capture, meeting detection for Teams, Zoom and Google Meet, and local speech and notes models.
+- **Settings > Privacy & storage** for encryption at rest, removing old items (with a preview and confirmation before anything is deleted), backups with an optional passphrase, restore, exporting everything as Markdown, and the recovery view.
 
 Document edits save after a short delay. Navigation, note generation and window close drain pending edits first. A failed save keeps changes available for retry. Manual note edits remain protected from automatic generation by the existing Rust controller.
 
@@ -72,7 +77,7 @@ Frontend (`ui/src/`):
 | `hooks/` | Document edit autosave, the close handshake and the list virtualizer. |
 | `components/` | Shared page, dialog and settings-row components. |
 | `lib/format.js` | Dates, durations, shortcuts and language names. |
-| `features/<area>/` | `dictation`, `library`, `notes` (document reader), `calls` (transcript rows, speaker timeline, call setup), `capture`, `vocabulary`, `insights`, `settings`, `discord` (settings, participant list, the reusable `ParticipantAvatar`), `meetings` (settings section, detection prompt and indicator), `models`, `updates`, `overlay`. |
+| `features/<area>/` | `dictation`, `library` (lists, search, pins, recovery, Privacy & storage), `notes` (document reader and exports), `calls` (transcript rows, speaker timeline, call setup), `capture`, `vocabulary`, `insights`, `settings`, `discord` (settings, participant list, the reusable `ParticipantAvatar`), `meetings` (settings section, detection prompt and indicator), `models`, `updates`, `overlay`. |
 
 ### Adding an action
 
