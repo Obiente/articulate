@@ -10,6 +10,8 @@ import { BookOpen, Keyboard } from "@phosphor-icons/react";
 import { SettingRow, SettingsSection } from "../../components/SettingRow.jsx";
 import { shortcutKeys } from "../../lib/format.js";
 
+import { InputProfiles } from "../dictation/InputProfiles.jsx";
+
 const defaultHotkey = { ctrl: true, alt: true, shift: false, win: false };
 
 // Shortcuts and dictation behavior, plus the spoken-note shortcut.
@@ -47,6 +49,11 @@ export function DictationSettings({ controls }) {
               </Button>
             </Group>
           </SettingRow>
+          {settings.shortcut_error && (
+            <Text c="red" role="alert" px="lg">
+              {settings.shortcut_error}
+            </Text>
+          )}
           <SettingRow
             title="Shortcut behavior"
             description={
@@ -99,6 +106,12 @@ export function DictationSettings({ controls }) {
             />
           </SettingRow>
           <SettingRow
+            title="Spoken editing commands"
+            description="Say a command on its own: new line, new paragraph, scratch that, delete that, or undo that. With commands on, live typing waits for finalized speech."
+          >
+            {toggle("spoken_editing_commands", "Spoken editing commands")}
+          </SettingRow>
+          <SettingRow
             title="Remember corrections"
             description="Learn short corrections you make after dictating."
           >
@@ -106,6 +119,7 @@ export function DictationSettings({ controls }) {
           </SettingRow>
         </Paper>
       </SettingsSection>
+      <InputProfiles controls={controls} />
       <SettingsSection icon={BookOpen} title="Spoken notes">
         <Paper withBorder radius="lg" className="secondary-settings-card">
           <SettingRow

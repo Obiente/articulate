@@ -1,10 +1,11 @@
-import { useMemo } from "react";
-import { Badge, Button, Group, Kbd } from "@mantine/core";
+import { useMemo, useState } from "react";
+import { Alert, Badge, Button, Group, Kbd } from "@mantine/core";
 import { ArrowUpRight, Copy, Microphone, Stop } from "@phosphor-icons/react";
 import { formatClock, formatTime } from "../../lib/format.js";
 import { TranscriptEditor } from "./TranscriptEditor.jsx";
 
 export function DictationPage({ state, act, open, settings, binding }) {
+  const [inserting, setInserting] = useState(false);
   const recent = useMemo(
     () => state.history.filter((s) => s.kind === "dictation").slice(0, 8),
     [state.history],
@@ -80,13 +81,41 @@ export function DictationPage({ state, act, open, settings, binding }) {
           </span>
         </div>
       </section>
-      {(state.text || state.recording) && (
+      {(state.text || state.recording || state.dictation_interruption) && (
         <section className="dictation-result">
           <Group justify="space-between">
             <div className="section-heading">
               {state.recording ? "LIVE TRANSCRIPT" : "YOUR WORDS, READY TO USE"}
             </div>
             <Group gap="xs">
+              <Button
+                variant="subtle"
+                size="xs"
+                loading={inserting}
+                disabled={
+                  state.recording || state.busy || state.preview || !state.text
+                }
+                onClick={async () => {
+                  setInserting(true);
+                  try {
+                    await act({
+                      type: "insert_text",
+                      text: state.text,
+                      line_breaks: Object.fromEntries(
+                        (state.settings.input_profiles || [])
+                          .filter((p) => p.line_break)
+                          .map((p) => [p.app, p.line_break]),
+                      ),
+                    });
+                  } catch {
+                    /* The workspace presents the error. */
+                  } finally {
+                    setInserting(false);
+                  }
+                }}
+              >
+                Insert in 3 seconds
+              </Button>
               <TranscriptEditor
                 key={state.dictation_session?.id || "latest"}
                 session={state.dictation_session}
@@ -107,7 +136,17 @@ export function DictationPage({ state, act, open, settings, binding }) {
               </Button>
             </Group>
           </Group>
-          <p>{state.text || "Listening…"}</p>
+          {state.dictation_interruption && (
+            <Alert color="yellow" title="Incomplete dictation">
+              {state.dictation_interruption} Automatic insertion was skipped.
+              Copy the captured text, or choose Insert and focus your
+              destination field within three seconds.
+            </Alert>
+          )}
+          <p style={{ whiteSpace: "pre-wrap" }}>
+            {state.text ||
+              (state.recording ? "Listening..." : "No speech recovered.")}
+          </p>
           <span className="muted">{state.status}</span>
         </section>
       )}

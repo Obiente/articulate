@@ -158,6 +158,12 @@ export const sampleMacros = [
 ];
 
 export const sampleSettings = {
+  spoken_editing_commands: false,
+  input_profiles: [
+    { app: "discord.exe", line_break: "ShiftEnter", style: "Chat" },
+  ],
+  styles: [{ app: "editor.exe", style: "Clean" }],
+  recent_dictation_app: "editor.exe",
   clean_speech: true,
   insert: true,
   live_insert: true,
