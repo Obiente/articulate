@@ -191,6 +191,7 @@ dependencies = [
  "earshot",
  "hound",
  "image",
+ "log",
  "ringbuf",
  "rubato",
  "semver",
