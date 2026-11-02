@@ -47,50 +47,117 @@ pub(super) struct State {
     pub loading: bool,
 
     /// Records skipped by the latest history pass (damaged, locked, newer).
-    #[allow(
-        dead_code,
-        reason = "Read by the storage review screen in a later change"
-    )]
     pub warnings: Vec<RecordWarning>,
     /// Isolated files kept beside the history. Review them with `quarantine`.
-    #[allow(
-        dead_code,
-        reason = "Read by the storage review screen in a later change"
-    )]
     pub quarantined: usize,
-    #[allow(
-        dead_code,
-        reason = "Read by the storage review screen in a later change"
-    )]
     pub quarantine: Vec<Quarantined>,
-    #[allow(
-        dead_code,
-        reason = "Read by the storage settings screen in a later change"
-    )]
     pub retention_preview: Option<Result<Vec<Summary>, String>>,
-    #[allow(
-        dead_code,
-        reason = "Read by the storage settings screen in a later change"
-    )]
     pub protection: Option<Result<MigrationReport, String>>,
-    #[allow(
-        dead_code,
-        reason = "Read by the storage settings screen in a later change"
-    )]
     pub backup: Option<Result<backup::Created, String>>,
-    #[allow(
-        dead_code,
-        reason = "Read by the storage settings screen in a later change"
-    )]
     pub restored: Option<Result<Box<backup::Restored>, String>>,
-    #[allow(
-        dead_code,
-        reason = "Read by the storage settings screen in a later change"
-    )]
     pub markdown_export: Option<Result<backup::Exported, String>>,
+    /// Progress of storage operations, file dialogs and library notices.
+    pub storage: Storage,
     call_saved_committed: (usize, u64, usize),
     insights_requested: Option<Instant>,
     retention_applied: Option<Instant>,
+}
+
+/// Work to finish on the controller after a file dialog closes.
+pub(super) type Continuation = Box<dyn FnOnce(&mut App) + Send>;
+
+/// The stage of an operation that asks for a file first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Progress {
+    #[default]
+    Idle,
+    /// A file or folder dialog is open.
+    Choosing,
+    /// The history worker is writing or reading.
+    Working,
+}
+
+impl Progress {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Choosing => "choosing",
+            Self::Working => "working",
+        }
+    }
+}
+
+/// A one-time message for the library, such as a finished export.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Notice {
+    /// Increases with every notice, so the renderer shows each one once.
+    pub sequence: u64,
+    pub error: bool,
+    pub message: String,
+}
+
+/// What a restore changed in this app's preferences.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RestoredSettings {
+    /// Shortcuts changed and were registered again.
+    pub shortcuts: bool,
+    /// The speech model's language or processor changed; reload it to apply.
+    pub model_reload: bool,
+}
+
+/// File dialogs, replaceable in tests so no dialog ever opens there.
+#[derive(Clone, Copy)]
+pub(super) struct Pickers {
+    pub save_text: fn(&str, &str, crate::export_file::Document, Option<&str>) -> anyhow::Result<bool>,
+    pub save_path: fn(crate::export_file::Document, &str, &str) -> anyhow::Result<Option<PathBuf>>,
+    pub backup_destination: fn(&str) -> anyhow::Result<Option<PathBuf>>,
+    pub backup_source: fn() -> anyhow::Result<Option<PathBuf>>,
+    pub folder: fn(&str) -> anyhow::Result<Option<PathBuf>>,
+}
+
+impl Default for Pickers {
+    #[cfg(not(test))]
+    fn default() -> Self {
+        use crate::export_file as files;
+        Self {
+            save_text: files::save_document,
+            save_path: files::choose_save_path,
+            backup_destination: files::choose_backup_destination,
+            backup_source: files::choose_backup_source,
+            folder: files::choose_folder,
+        }
+    }
+    /// Tests cancel every dialog unless they install their own picker.
+    #[cfg(test)]
+    fn default() -> Self {
+        Self {
+            save_text: |_, _, _, _| Ok(false),
+            save_path: |_, _, _| Ok(None),
+            backup_destination: |_| Ok(None),
+            backup_source: || Ok(None),
+            folder: |_| Ok(None),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct Storage {
+    pub encryption_working: bool,
+    pub retention_preview_working: bool,
+    /// The policy `State::retention_preview` was computed for.
+    pub retention_previewed: Option<crate::history::retention::Policy>,
+    pub backup: Progress,
+    pub restore: Progress,
+    pub markdown: Progress,
+    /// Set after a restore that included preferences.
+    pub restored_settings: Option<RestoredSettings>,
+    /// Whether the isolated files have been listed since the app started.
+    pub quarantine_listed: bool,
+    /// One file dialog at a time.
+    pub dialog_open: bool,
+    pub notice: Option<Notice>,
+    pub pickers: Pickers,
+    dialogs: Option<(mpsc::Sender<Continuation>, mpsc::Receiver<Continuation>)>,
 }
 
 impl State {
@@ -353,62 +420,92 @@ impl App {
                 HistoryEvent::Quarantine(files) => {
                     self.history.quarantined = files.len();
                     self.history.quarantine = files;
+                    self.history.storage.quarantine_listed = true;
                 }
                 HistoryEvent::QuarantineRestored(session) => {
+                    let before = self.history.quarantine.len();
                     self.history.quarantine.retain(|file| file.id != session.id);
-                    self.history.notice = format!("Restored \u{201c}{}\u{201d}", session.title);
+                    let removed = before - self.history.quarantine.len();
+                    self.history.quarantined = self.history.quarantined.saturating_sub(removed);
+                    self.history_notify(
+                        format!("Restored \u{201c}{}\u{201d}", session.title),
+                        false,
+                    );
                     self.history.upsert(Summary::from(&*session));
                     self.insights.stale = true;
+                    if let Some(worker) = &self.history.worker {
+                        worker.list();
+                    }
                 }
                 HistoryEvent::QuarantineExported { file_name, path } => {
-                    self.history.notice = format!("Exported {file_name} to {}", path.display());
+                    self.history_notify(
+                        format!("Exported {file_name} to {}", path.display()),
+                        false,
+                    );
                 }
                 HistoryEvent::QuarantineDiscarded { file_name } => {
                     self.history
                         .quarantine
                         .retain(|file| file.file_name != file_name);
                     self.history.quarantined = self.history.quarantined.saturating_sub(1);
+                    self.history_notify("Discarded the damaged file", false);
+                    if let Some(worker) = &self.history.worker {
+                        worker.list();
+                    }
                 }
                 HistoryEvent::QuarantineFailed { file_name, error } => {
-                    self.history.error = Some(format!("{error} ({file_name})"));
+                    self.history_notify(format!("{error} ({file_name})"), true);
                 }
                 HistoryEvent::Pinned(summary) => self.history.upsert(*summary),
                 HistoryEvent::ProtectionChanged(result) => {
-                    match &result {
-                        Ok(report) if report.failed > 0 => {
-                            self.history.error = Some(format!(
-                                "{} saved items could not be {} yet. They will be retried when Articulate restarts.",
-                                report.failed,
-                                if report.protect {
-                                    "encrypted"
-                                } else {
-                                    "decrypted"
-                                }
-                            ));
-                        }
-                        Ok(_) => {}
-                        Err(error) => self.history.error = Some(error.clone()),
-                    }
+                    self.history.storage.encryption_working = false;
                     self.history.protection = Some(result);
                 }
                 HistoryEvent::RetentionPreview(result) => {
+                    self.history.storage.retention_preview_working = false;
                     self.history.retention_preview = Some(result);
                 }
                 HistoryEvent::RetentionApplied(result) => {
                     match &result {
+                        Ok(applied) if !applied.failed.is_empty() => {
+                            self.history_notify(
+                                format!(
+                                    "{} old items could not be removed. They will be retried later.",
+                                    applied.failed.len()
+                                ),
+                                true,
+                            );
+                        }
                         Ok(applied) if !applied.deleted.is_empty() => {
-                            self.history.notice = format!(
-                                "Removed {} sessions older than your retention period",
-                                applied.deleted.len()
+                            let count = applied.deleted.len();
+                            self.history_notify(
+                                format!(
+                                    "Removed {count} {} older than your retention period",
+                                    if count == 1 { "item" } else { "items" }
+                                ),
+                                false,
                             );
                         }
                         Ok(_) => {}
-                        Err(error) => self.history.error = Some(error.clone()),
+                        Err(error) => self.history_notify(error.clone(), true),
+                    }
+                    if let Ok(applied) = &result {
+                        for id in &applied.deleted {
+                            self.brain.forget(id);
+                            self.history.items.retain(|item| &item.id != id);
+                        }
                     }
                     self.history.retention_preview = None;
+                    self.history.storage.retention_previewed = None;
+                    self.insights.stale = true;
                 }
-                HistoryEvent::BackupCreated(result) => self.history.backup = Some(result),
+                HistoryEvent::BackupCreated(result) => {
+                    self.history.storage.backup = Progress::Idle;
+                    self.history.backup = Some(result);
+                }
                 HistoryEvent::RestoreFinished(mut result) => {
+                    self.history.storage.restore = Progress::Idle;
+                    self.history.storage.restored_settings = None;
                     if let Ok(restored) = &mut result
                         && (restored.settings.is_some() || restored.library.is_some())
                     {
@@ -419,12 +516,14 @@ impl App {
                             library.as_deref(),
                         ) {
                             Ok(settings) => {
-                                self.settings = settings;
-                                self.save();
+                                let applied = self.history_apply_restored_settings(settings);
+                                self.history.storage.restored_settings = Some(applied);
                             }
                             Err(error) => {
-                                self.history.error =
-                                    Some(format!("Restored preferences were not applied: {error}"));
+                                self.history_notify(
+                                    format!("Restored preferences were not applied: {error}"),
+                                    true,
+                                );
                             }
                         }
                     }
@@ -432,10 +531,12 @@ impl App {
                     self.history.restored = Some(result);
                 }
                 HistoryEvent::MarkdownExported(result) => {
+                    self.history.storage.markdown = Progress::Idle;
                     self.history.markdown_export = Some(result);
                 }
             }
         }
+        self.history_poll_dialogs();
         if self.insights.stale
             && !self.insights.loading
             && self
@@ -585,69 +686,171 @@ impl App {
     }
 }
 
-/// Storage features awaiting desktop IPC wiring. Each call returns immediately;
-/// results arrive through `history_poll` into the matching `State` field.
-#[allow(
-    dead_code,
-    reason = "Storage controls are exposed to the desktop UI in a later change"
-)]
+/// Storage operations for the library and Privacy & storage settings. Each
+/// call returns immediately; file dialogs run on their own thread so they never
+/// pause capture or autosave, and results arrive through `history_poll`.
 impl App {
+    /// Show a one-time library message.
+    pub(super) fn history_notify(&mut self, message: impl Into<String>, error: bool) {
+        let storage = &mut self.history.storage;
+        let sequence = storage.notice.as_ref().map_or(1, |notice| notice.sequence + 1);
+        storage.notice = Some(Notice {
+            sequence,
+            error,
+            message: message.into(),
+        });
+    }
+
+    /// Run `choose` (which shows a file dialog) away from the controller, then
+    /// finish with the continuation it returns on the controller.
+    fn history_dialog(
+        &mut self,
+        choose: impl FnOnce(Pickers) -> Continuation + Send + 'static,
+    ) -> Result<(), String> {
+        if self.history.storage.dialog_open {
+            return Err("Finish the open file window first.".into());
+        }
+        let pickers = self.history.storage.pickers;
+        let sender = self
+            .history
+            .storage
+            .dialogs
+            .get_or_insert_with(mpsc::channel)
+            .0
+            .clone();
+        let run = move || {
+            let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| choose(pickers)))
+                .unwrap_or_else(|_| {
+                    Box::new(|app: &mut App| {
+                        app.history_notify("The file window closed unexpectedly. Try again.", true);
+                    })
+                });
+            let _ = sender.send(next);
+        };
+        // Tests use synthetic pickers and finish in the same poll.
+        #[cfg(test)]
+        run();
+        #[cfg(not(test))]
+        std::thread::Builder::new()
+            .name("file-dialog".into())
+            .spawn(run)
+            .map_err(|error| format!("Could not open the file window: {error}"))?;
+        self.history.storage.dialog_open = true;
+        Ok(())
+    }
+
+    fn history_poll_dialogs(&mut self) {
+        let ready: Vec<Continuation> = match &self.history.storage.dialogs {
+            Some((_, receiver)) => receiver.try_iter().collect(),
+            None => return,
+        };
+        for next in ready {
+            self.history.storage.dialog_open = false;
+            next(self);
+        }
+    }
+
     /// Turn encryption at rest on or off. Preferences are rewritten first, then
     /// every history file is migrated; `State::protection` reports the result.
+    /// This is the only way `Settings::encrypt_at_rest` changes.
     pub(super) fn history_set_encryption(&mut self, enabled: bool) -> Result<(), String> {
+        if self.history.storage.encryption_working {
+            return Err("Wait for the current encryption change to finish.".into());
+        }
+        let Some(worker) = &self.history.worker else {
+            return Err("Local history is unavailable.".into());
+        };
         let previous = self.settings.encrypt_at_rest;
         self.settings.encrypt_at_rest = enabled;
         if let Err(error) = self.save_preferences() {
             self.settings.encrypt_at_rest = previous;
-            return Err(error.to_string());
+            return Err(format!("Could not save preferences: {error}"));
         }
+        worker.set_protection(enabled);
         self.history.protection = None;
-        match &self.history.worker {
-            Some(worker) => {
-                worker.set_protection(enabled);
-                Ok(())
-            }
-            None => Err("Local history is unavailable.".into()),
-        }
+        self.history.storage.encryption_working = true;
+        Ok(())
     }
 
-    /// Store a retention policy. It is applied automatically once a day while
-    /// enabled; preview it first with `history_retention_preview`.
-    pub(super) fn history_set_retention(
+    /// Dry run: fills `State::retention_preview` with what `policy` would delete.
+    pub(super) fn history_retention_preview(
         &mut self,
         policy: crate::history::retention::Policy,
     ) -> Result<(), String> {
         policy.validate().map_err(|error| error.to_string())?;
-        self.settings.retention = policy;
-        self.history.retention_applied = None;
-        self.save_preferences().map_err(|error| error.to_string())
+        let active = self.history_active_ids();
+        let worker = self
+            .history
+            .worker
+            .as_ref()
+            .ok_or("Local history is unavailable.")?;
+        worker.retention_preview(policy.clone(), active);
+        self.history.retention_preview = None;
+        self.history.storage.retention_preview_working = true;
+        self.history.storage.retention_previewed = Some(policy);
+        Ok(())
     }
 
-    /// Dry run: fills `State::retention_preview` with what `policy` would delete.
-    pub(super) fn history_retention_preview(&mut self, policy: crate::history::retention::Policy) {
-        self.history.retention_preview = None;
-        let active = self.history_active_ids();
-        if let Some(worker) = &self.history.worker {
-            worker.retention_preview(policy, active);
+    /// Save a retention policy. Turning a policy on requires a finished
+    /// preview of exactly that policy; the previewed items are deleted now,
+    /// and later items are removed automatically once a day.
+    pub(super) fn history_save_retention(
+        &mut self,
+        policy: crate::history::retention::Policy,
+    ) -> Result<(), String> {
+        policy.validate().map_err(|error| error.to_string())?;
+        let confirmed = if policy.enabled {
+            if self.history.storage.retention_preview_working
+                || self.history.storage.retention_previewed.as_ref() != Some(&policy)
+            {
+                return Err("Review what this policy removes before turning it on.".into());
+            }
+            match &self.history.retention_preview {
+                Some(Ok(items)) => items.iter().map(|item| item.id.clone()).collect(),
+                Some(Err(error)) => return Err(error.clone()),
+                None => {
+                    return Err("Review what this policy removes before turning it on.".into());
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        self.settings.retention = policy.clone();
+        if let Err(error) = self.save_preferences() {
+            return Err(format!("Could not save preferences: {error}"));
         }
+        // The confirmed items are removed now; the next automatic pass waits a day.
+        self.history.retention_applied = Some(Instant::now());
+        self.history.retention_preview = None;
+        self.history.storage.retention_previewed = None;
+        if !confirmed.is_empty() {
+            self.history_apply_retention(policy, confirmed);
+        }
+        Ok(())
     }
 
     /// Delete exactly the confirmed sessions from a preview, if they still qualify.
-    pub(super) fn history_apply_retention(
+    fn history_apply_retention(
         &mut self,
         policy: crate::history::retention::Policy,
         confirmed: Vec<String>,
     ) {
         let active = self.history_active_ids();
-        for id in &confirmed {
-            self.brain.forget(id);
-        }
         if let Some(worker) = &self.history.worker {
             worker.apply_retention(policy, Some(confirmed), active);
         }
     }
 
-    pub(super) fn history_set_pinned(&mut self, id: String, pinned: bool) {
+    pub(super) fn history_set_pinned(&mut self, id: String, pinned: bool) -> Result<(), String> {
+        let worker = self
+            .history
+            .worker
+            .as_ref()
+            .ok_or("Local history is unavailable.")?;
+        if self.history.pending_deletions.contains(&id) {
+            return Err("This item is being deleted.".into());
+        }
+        worker.set_pinned(id.clone(), pinned);
         for session in [
             &mut self.history.dictation,
             &mut self.history.call,
@@ -660,71 +863,134 @@ impl App {
                 session.pinned = pinned;
             }
         }
-        if let Some(worker) = &self.history.worker {
-            worker.set_pinned(id, pinned);
-        }
+        Ok(())
     }
 
     /// Refresh `State::quarantine`.
-    pub(super) fn history_list_quarantine(&mut self) {
-        if let Some(worker) = &self.history.worker {
-            worker.quarantined();
-        }
+    pub(super) fn history_list_quarantine(&mut self) -> Result<(), String> {
+        self.history
+            .worker
+            .as_ref()
+            .ok_or("Local history is unavailable.")?
+            .quarantined();
+        Ok(())
     }
 
-    pub(super) fn history_restore_quarantined(&mut self, file_name: String) {
-        if let Some(worker) = &self.history.worker {
-            worker.restore_quarantined(file_name);
+    fn history_quarantined_file(&self, file_name: &str) -> Result<(), String> {
+        if self.history.worker.is_none() {
+            return Err("Local history is unavailable.".into());
         }
-    }
-
-    /// Ask where to save, then export the isolated file's raw (decrypted) bytes.
-    pub(super) fn history_export_quarantined(&mut self, file_name: String) -> Result<(), String> {
-        let Some(path) = crate::export_file::choose_save_path(
-            crate::export_file::Document::Export,
-            &format!("{file_name}.json"),
-            "json",
-        )
-        .map_err(|error| error.to_string())?
-        else {
-            return Ok(());
-        };
-        if let Some(worker) = &self.history.worker {
-            worker.export_quarantined(file_name, path);
+        if !self
+            .history
+            .quarantine
+            .iter()
+            .any(|file| file.file_name == file_name)
+        {
+            return Err("This file is no longer isolated. Refresh the list.".into());
         }
         Ok(())
     }
 
-    pub(super) fn history_discard_quarantined(&mut self, file_name: String) {
+    pub(super) fn history_restore_quarantined(&mut self, file_name: String) -> Result<(), String> {
+        self.history_quarantined_file(&file_name)?;
+        if let Some(worker) = &self.history.worker {
+            worker.restore_quarantined(file_name);
+        }
+        Ok(())
+    }
+
+    /// Ask where to save, then export the isolated file's raw (decrypted) bytes.
+    pub(super) fn history_export_quarantined(&mut self, file_name: String) -> Result<(), String> {
+        self.history_quarantined_file(&file_name)?;
+        self.history_dialog(move |pickers| {
+            let chosen = (pickers.save_path)(
+                crate::export_file::Document::Export,
+                &format!("{file_name}.json"),
+                "json",
+            );
+            Box::new(move |app: &mut App| match chosen {
+                Ok(Some(path)) => {
+                    if let Some(worker) = &app.history.worker {
+                        worker.export_quarantined(file_name, path);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => app.history_notify(error.to_string(), true),
+            })
+        })
+    }
+
+    pub(super) fn history_discard_quarantined(&mut self, file_name: String) -> Result<(), String> {
+        self.history_quarantined_file(&file_name)?;
         if let Some(worker) = &self.history.worker {
             worker.discard_quarantined(file_name);
         }
+        Ok(())
+    }
+
+    fn history_storage_idle(&self) -> Result<(), String> {
+        let storage = &self.history.storage;
+        if self.history.worker.is_none() {
+            return Err("Local history is unavailable.".into());
+        }
+        if storage.backup != Progress::Idle
+            || storage.restore != Progress::Idle
+            || storage.markdown != Progress::Idle
+        {
+            return Err("Wait for the current backup, restore or export to finish.".into());
+        }
+        Ok(())
     }
 
     /// Ask where to save, then write a backup archive. Optional passphrase.
     pub(super) fn history_backup(&mut self, passphrase: Option<String>) -> Result<(), String> {
+        self.history_storage_idle()?;
+        let passphrase = passphrase.filter(|passphrase| !passphrase.is_empty());
+        if passphrase
+            .as_ref()
+            .is_some_and(|passphrase| passphrase.chars().count() < 8)
+        {
+            return Err("Use a passphrase of at least 8 characters.".into());
+        }
         let date = crate::call_export::local_time(crate::history::now_ms())
             .chars()
             .take(10)
             .collect::<String>();
-        let Some(destination) =
-            crate::export_file::choose_backup_destination(&format!("Articulate backup {date}"))
-                .map_err(|error| error.to_string())?
-        else {
-            return Ok(());
-        };
-        let settings = serde_json::to_value(&self.settings).map_err(|error| error.to_string())?;
-        let library = crate::library::export(&self.settings.entries, &self.settings.macros)
-            .map_err(|error| error.to_string())?;
-        self.history.backup = None;
-        if let Some(worker) = &self.history.worker {
-            worker.backup(backup::Request {
-                destination,
-                passphrase,
-                settings,
-                library,
-            });
-        }
+        self.history_dialog(move |pickers| {
+            let chosen = (pickers.backup_destination)(&format!("Articulate backup {date}"));
+            Box::new(move |app: &mut App| {
+                app.history.storage.backup = Progress::Idle;
+                let destination = match chosen {
+                    Ok(Some(destination)) => destination,
+                    Ok(None) => return,
+                    Err(error) => return app.history_notify(error.to_string(), true),
+                };
+                let request = serde_json::to_value(&app.settings)
+                    .map_err(|error| error.to_string())
+                    .and_then(|settings| {
+                        crate::library::export(&app.settings.entries, &app.settings.macros)
+                            .map(|library| (settings, library))
+                            .map_err(|error| error.to_string())
+                    });
+                match (request, &app.history.worker) {
+                    (Ok((settings, library)), Some(worker)) => {
+                        worker.backup(backup::Request {
+                            destination,
+                            passphrase,
+                            settings,
+                            library,
+                        });
+                        app.history.backup = None;
+                        app.history.storage.backup = Progress::Working;
+                    }
+                    (Err(error), _) => app.history.backup = Some(Err(error)),
+                    (_, None) => {
+                        app.history.backup = Some(Err("Local history is unavailable.".into()));
+                    }
+                }
+            })
+        })?;
+        self.history.storage.backup = Progress::Choosing;
         Ok(())
     }
 
@@ -736,46 +1002,182 @@ impl App {
         replace_older: bool,
         include_settings: bool,
     ) -> Result<(), String> {
-        let Some(source) =
-            crate::export_file::choose_backup_source().map_err(|error| error.to_string())?
-        else {
-            return Ok(());
-        };
-        self.history.restored = None;
-        if let Some(worker) = &self.history.worker {
-            worker.restore(backup::RestoreRequest {
-                source,
-                passphrase,
-                replace_older,
-                include_settings,
-            });
+        self.history_storage_idle()?;
+        if self.recording.is_some() || self.call.is_some() || self.busy {
+            return Err("Finish recording before restoring a backup.".into());
         }
+        let passphrase = passphrase.filter(|passphrase| !passphrase.is_empty());
+        self.history_dialog(move |pickers| {
+            let chosen = (pickers.backup_source)();
+            Box::new(move |app: &mut App| {
+                app.history.storage.restore = Progress::Idle;
+                let source = match chosen {
+                    Ok(Some(source)) => source,
+                    Ok(None) => return,
+                    Err(error) => return app.history_notify(error.to_string(), true),
+                };
+                // Saving open documents first lets a restore compare their latest version.
+                app.history_save_personal_notes();
+                if let Some(worker) = &app.history.worker {
+                    worker.restore(backup::RestoreRequest {
+                        source,
+                        passphrase,
+                        replace_older,
+                        include_settings,
+                    });
+                    app.history.restored = None;
+                    app.history.storage.restored_settings = None;
+                    app.history.storage.restore = Progress::Working;
+                }
+            })
+        })?;
+        self.history.storage.restore = Progress::Choosing;
         Ok(())
     }
 
-    /// Write every session as Markdown into `folder` (chosen by the UI).
-    pub(super) fn history_export_all_markdown(&mut self, folder: PathBuf) {
-        self.history.markdown_export = None;
-        if let Some(worker) = &self.history.worker {
-            worker.export_markdown(folder);
+    /// Apply merged preferences from a backup. Encryption and retention stay
+    /// as chosen on this device: they change only through their own controls,
+    /// so a restore never rewrites files or deletes items unexpectedly.
+    /// Shortcuts are registered again; a changed speech setting needs a reload.
+    fn history_apply_restored_settings(&mut self, mut settings: Settings) -> RestoredSettings {
+        settings.encrypt_at_rest = self.settings.encrypt_at_rest;
+        settings.retention = self.settings.retention.clone();
+        let previous = std::mem::replace(&mut self.settings, settings);
+        self.save();
+        let mut applied = RestoredSettings {
+            shortcuts: false,
+            model_reload: self.settings.cpu != previous.cpu
+                || self.settings.transcription_language != previous.transcription_language,
+        };
+        if self.settings.hotkey != previous.hotkey {
+            applied.shortcuts = true;
+            if self.hotkey_tx.send(self.settings.hotkey.clone()).is_ok() {
+                self.hotkey_draft = self.settings.hotkey.clone();
+                self.hotkey_pending = true;
+            }
         }
+        if self.settings.quick_note_hotkey != previous.quick_note_hotkey {
+            applied.shortcuts = true;
+            if self
+                .quick_note_hotkey_tx
+                .send(self.settings.quick_note_hotkey.clone())
+                .is_ok()
+            {
+                self.quick_note_hotkey_pending = true;
+                self.quick_note_shortcut_error = None;
+            }
+        }
+        applied
+    }
+
+    /// Ask for a folder, then write every session there as Markdown.
+    pub(super) fn history_export_all_markdown(&mut self) -> Result<(), String> {
+        self.history_storage_idle()?;
+        self.history_dialog(|pickers| {
+            let chosen = (pickers.folder)("Choose a folder for your Markdown files");
+            Box::new(move |app: &mut App| {
+                app.history.storage.markdown = Progress::Idle;
+                match chosen {
+                    Ok(Some(folder)) => {
+                        if let Some(worker) = &app.history.worker {
+                            worker.export_markdown(folder);
+                            app.history.markdown_export = None;
+                            app.history.storage.markdown = Progress::Working;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => app.history_notify(error.to_string(), true),
+                }
+            })
+        })?;
+        self.history.storage.markdown = Progress::Choosing;
+        Ok(())
     }
 
     /// Export one session with a title and file name matching its kind.
+    /// Formats the session can't produce, such as subtitles without timing,
+    /// are refused before any dialog opens.
     pub(super) fn history_export_session(
         &mut self,
         session: &Session,
         format: crate::call_export::Format,
-    ) -> Result<bool, String> {
+    ) -> Result<(), String> {
         let text =
             crate::call_export::session(session, format).map_err(|error| error.to_string())?;
-        crate::export_file::save_document(
-            &text,
-            format.extension(),
-            crate::export_file::Document::from_kind(session.kind),
-            Some(&session.title),
-        )
-        .map_err(|error| error.to_string())
+        let document = crate::export_file::Document::from_kind(session.kind);
+        let title = session.title.clone();
+        let label = match format {
+            crate::call_export::Format::Text => "text",
+            crate::call_export::Format::Markdown => "Markdown",
+            crate::call_export::Format::Srt => "SRT subtitles",
+            crate::call_export::Format::WebVtt => "WebVTT subtitles",
+        };
+        self.history_dialog(move |pickers| {
+            let saved = (pickers.save_text)(&text, format.extension(), document, Some(&title));
+            Box::new(move |app: &mut App| match saved {
+                Ok(true) => app.history_notify(format!("Exported as {label}"), false),
+                Ok(false) => {}
+                Err(error) => app.history_notify(format!("Could not export: {error}"), true),
+            })
+        })
+    }
+
+    /// Export the action items kept in a document's notes as a Markdown
+    /// checklist or a calendar file of tasks, optionally with a reminder.
+    pub(super) fn history_export_followups(
+        &mut self,
+        session: &Session,
+        calendar: bool,
+        reminder_ms: Option<u64>,
+    ) -> Result<(), String> {
+        use crate::brain::followups;
+        let items = followups::reviewed(session);
+        if items.is_empty() {
+            return Err(
+                "There are no follow-ups in this document's notes. Update notes, then keep the action items you want to export."
+                    .into(),
+            );
+        }
+        let (text, extension) = if calendar {
+            let now = crate::history::now_ms();
+            let stamp = followups::utc_stamp(now).map_err(|error| error.to_string())?;
+            let text = match reminder_ms {
+                Some(reminder) if reminder <= now => {
+                    return Err("Choose a reminder time in the future.".into());
+                }
+                Some(reminder) => {
+                    let reminder =
+                        followups::utc_stamp(reminder).map_err(|error| error.to_string())?;
+                    followups::ics_with_reminder(&items, &session.id, &stamp, &reminder)
+                }
+                None => followups::ics(&items, &session.id, &stamp),
+            }
+            .map_err(|error| error.to_string())?;
+            (text, "ics")
+        } else {
+            (followups::markdown(&items), "md")
+        };
+        let title = format!("{} follow-ups", session.title.trim());
+        let count = items.len();
+        self.history_dialog(move |pickers| {
+            let saved = (pickers.save_text)(
+                &text,
+                extension,
+                crate::export_file::Document::FollowUps,
+                Some(&title),
+            );
+            Box::new(move |app: &mut App| match saved {
+                Ok(true) => app.history_notify(
+                    format!(
+                        "Exported {count} {}",
+                        if count == 1 { "follow-up" } else { "follow-ups" }
+                    ),
+                    false,
+                ),
+                Ok(false) => {}
+                Err(error) => app.history_notify(format!("Could not export: {error}"), true),
+            })
+        })
     }
 }
 

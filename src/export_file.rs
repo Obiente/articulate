@@ -11,6 +11,8 @@ pub enum Document {
     Export,
     /// A portable history backup archive.
     Backup,
+    /// Action items from a document's notes, as a checklist or calendar file.
+    FollowUps,
 }
 
 impl Document {
@@ -29,6 +31,7 @@ impl Document {
             Self::Notes => "Save notes",
             Self::Export => "Save export",
             Self::Backup => "Save Articulate backup",
+            Self::FollowUps => "Save follow-ups",
         }
     }
 
@@ -39,6 +42,7 @@ impl Document {
             Self::Notes => "Articulate notes",
             Self::Export => "Articulate export",
             Self::Backup => "Articulate backup",
+            Self::FollowUps => "Articulate follow-ups",
         }
     }
 }
@@ -232,6 +236,58 @@ pub fn choose_backup_destination(_: &str) -> Result<Option<PathBuf>> {
 #[cfg(not(windows))]
 pub fn choose_backup_source() -> Result<Option<PathBuf>> {
     anyhow::bail!("Backups are not available on this platform.")
+}
+
+#[cfg(not(windows))]
+pub fn choose_folder(_: &str) -> Result<Option<PathBuf>> {
+    anyhow::bail!("Choosing a folder is not available on this platform.")
+}
+
+/// Ask for an existing folder. `None` if cancelled.
+#[cfg(windows)]
+pub fn choose_folder(title: &str) -> Result<Option<PathBuf>> {
+    use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
+        CoInitializeEx, CoTaskMemFree, CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::{
+        FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog,
+        SIGDN_FILESYSPATH,
+    };
+    use windows::core::{HRESULT, HSTRING};
+
+    // SAFETY: COM is initialized for this thread before the dialog is created
+    // and released afterwards; the returned path string is freed once copied.
+    unsafe {
+        let initialized =
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok();
+        let chosen = (|| -> Result<Option<PathBuf>> {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            dialog.SetOptions(
+                dialog.GetOptions()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST,
+            )?;
+            dialog.SetTitle(&HSTRING::from(title))?;
+            let owner = own_window();
+            let owner = (!owner.is_null()).then_some(HWND(owner));
+            match dialog.Show(owner) {
+                Ok(()) => {}
+                Err(error) if error.code() == HRESULT::from_win32(ERROR_CANCELLED.0) => {
+                    return Ok(None);
+                }
+                Err(error) => anyhow::bail!("Could not open the folder dialog ({error})"),
+            }
+            let name = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let path = name.to_string();
+            CoTaskMemFree(Some(name.0 as *const _));
+            Ok(Some(PathBuf::from(path?)))
+        })();
+        if initialized {
+            CoUninitialize();
+        }
+        chosen
+    }
 }
 
 /// Ask where to save a backup archive. `None` if cancelled.

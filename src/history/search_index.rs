@@ -38,7 +38,7 @@ pub enum Field {
 }
 
 impl Field {
-    fn key(self) -> &'static str {
+    pub(crate) fn key(self) -> &'static str {
         match self {
             Self::Title => "title",
             Self::Text => "text",

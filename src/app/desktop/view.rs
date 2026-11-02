@@ -43,6 +43,9 @@ pub(super) fn collect(app: &App, out: &mut Collector<'_>) {
     out.section("document_body", Background, || library::document_body(app));
     out.section("vocabulary", Background, || settings::vocabulary(app));
     out.section("insights", Background, || library::insights(app));
+    out.section("search", Live, || library::search(app));
+    out.section("storage", Live, || library::storage(app));
+    out.section("recovery", Background, || library::recovery(app));
 }
 
 /// The dictation indicator state, for the native indicator window.

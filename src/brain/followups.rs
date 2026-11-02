@@ -4,6 +4,71 @@ use sha2::{Digest, Sha256};
 fn actions(items: &[Item]) -> impl Iterator<Item = &Item> {
     items.iter().filter(|i| i.kind == Kind::Action)
 }
+
+/// Generated action items the user has kept in the document's notes. An item
+/// whose paragraph was removed or rewritten is no longer exported, so only
+/// wording the user has seen and left in place leaves the app.
+pub fn reviewed(session: &crate::history::Session) -> Vec<Item> {
+    let Some(draft) = &session.generated_summary else {
+        return Vec::new();
+    };
+    let blocks: Vec<&str> = session
+        .personal_notes
+        .split("
+
+")
+        .map(str::trim)
+        .filter(|block| !block.is_empty())
+        .collect();
+    let mut kept: Vec<Item> = Vec::new();
+    for item in actions(&draft.items) {
+        let text = item.text.trim();
+        if !text.is_empty()
+            && blocks.contains(&text)
+            && !kept.iter().any(|existing| existing.text.trim() == text)
+        {
+            kept.push(item.clone());
+        }
+    }
+    kept
+}
+
+/// Number of exportable follow-ups, without copying them.
+pub fn reviewed_count(session: &crate::history::Session) -> usize {
+    let Some(draft) = &session.generated_summary else {
+        return 0;
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    for item in actions(&draft.items) {
+        let text = item.text.trim();
+        if !text.is_empty()
+            && !seen.contains(&text)
+            && session
+                .personal_notes
+                .split("
+
+")
+                .any(|block| block.trim() == text)
+        {
+            seen.push(text);
+        }
+    }
+    seen.len()
+}
+
+/// A calendar timestamp (`YYYYMMDDTHHMMSSZ`) for Unix milliseconds.
+pub fn utc_stamp(ms: u64) -> anyhow::Result<String> {
+    let time = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)?;
+    Ok(format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        time.year(),
+        u8::from(time.month()),
+        time.day(),
+        time.hour(),
+        time.minute(),
+        time.second()
+    ))
+}
 pub fn markdown(items: &[Item]) -> String {
     actions(items)
         .map(|i| {
@@ -145,8 +210,49 @@ mod tests {
                 .unwrap()
                 .contains("BEGIN:VALARM\r\n")
         );
+        assert_eq!(utc_stamp(1_767_225_600_000).unwrap(), "20260101T000000Z");
         let mut folded = String::new();
         line(&mut folded, &"é".repeat(100));
         assert!(folded.split("\r\n").all(|l| l.len() <= 75));
+    }
+
+    #[test]
+    fn only_action_items_still_in_the_notes_are_reviewed() {
+        let item = |kind, text: &str| Item {
+            kind,
+            text: text.into(),
+            section: 1,
+            sources: vec![],
+        };
+        let mut session = crate::history::Session::new(crate::history::Kind::Call);
+        session.generated_summary = Some(crate::brain::Draft {
+            schema: 1,
+            source_id: session.id.clone(),
+            source_hash: String::new(),
+            model: String::new(),
+            sections: 1,
+            elapsed_ms: 0,
+            items: vec![
+                item(Kind::Fact, "The launch moved to Friday."),
+                item(Kind::Action, "Send the checklist to Casey."),
+                item(Kind::Action, "Book the review room."),
+                item(Kind::Action, "Send the checklist to Casey."),
+            ],
+            title: None,
+        });
+        session.personal_notes =
+            "The launch moved to Friday.
+
+Send the checklist to Casey.
+
+Book a room, any room."
+                .into();
+        let reviewed = reviewed(&session);
+        assert_eq!(reviewed.len(), 1);
+        assert_eq!(reviewed[0].text, "Send the checklist to Casey.");
+        assert_eq!(reviewed_count(&session), 1);
+        session.generated_summary = None;
+        assert!(reviewed(&session).is_empty());
+        assert_eq!(reviewed_count(&session), 0);
     }
 }
