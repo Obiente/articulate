@@ -257,7 +257,9 @@ export function StorageSettings({ controls }) {
 
 function restoreSummary(restore) {
   const parts = [
-    `Restored ${plural(restore.added, "new item", "new items")}${restore.updated ? ` and updated ${plural(restore.updated, "item", "items")}` : ""} from ${plural(restore.sessions_in_archive, "item", "items")} in the backup.`,
+    restore.added || restore.updated
+      ? `Restored ${plural(restore.added, "new item", "new items")}${restore.updated ? ` and updated ${plural(restore.updated, "item", "items")}` : ""} from ${plural(restore.sessions_in_archive, "item", "items")} in the backup.`
+      : `Checked ${plural(restore.sessions_in_archive, "item", "items")} in the backup. Everything was already on this device.`,
   ];
   if (restore.newer_in_backup)
     parts.push(

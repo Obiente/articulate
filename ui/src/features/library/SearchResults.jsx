@@ -40,7 +40,14 @@ const kindLabel = (kind) =>
 // Debounced full-text search state for a library page.
 export function useLibrarySearch({ act, search, defaultKind }) {
   const [query, setQuery] = useState(""),
-    [filters, setFilters] = useState({ ...emptyFilters, kind: defaultKind });
+    [filters, setFilters] = useState({ ...emptyFilters, kind: defaultKind }),
+    [page, setPage] = useState(defaultKind);
+  // Each page starts with its own empty search.
+  if (page !== defaultKind) {
+    setPage(defaultKind);
+    setQuery("");
+    setFilters({ ...emptyFilters, kind: defaultKind });
+  }
   const actRef = useRef(act);
   actRef.current = act;
   const scheduler = useMemo(
