@@ -170,3 +170,9 @@ Capture drains independently of preview work. The microphone ring and backlog li
 Sound-cue output is drained concurrently with the external process, bounded to 64 KiB while excess bytes are discarded. Three consecutive failures disable cues; successful processing resets that count. Jobs batch up to 24 seconds per speaker to reduce process/model startup overhead. A resident worker protocol has not been established for the bundled executable.
 
 Clipboard writes create an invisible message-only owner on the calling thread, retry briefly when contended, and close the clipboard before destroying that owner. Manual check: copy a synthetic transcript while another app is foreground, paste into a disposable document, and confirm the text and line breaks. Hold the clipboard open in a test utility to confirm bounded retries and the busy message, then release it and copy again. Confirm no visible window appears and repeated copies do not accumulate window handles. This check changes the clipboard and is separate from automated tests.
+
+## Synthetic inference benchmark
+
+Run `articulate --bench [--model path] [--seconds N] [--json out.json]` with an installed GGUF model. Seconds defaults to 5 and is bounded to 1 through 30. No download occurs. Missing model files produce a readable error.
+
+The command measures model loading and one inference pass for CPU and Vulkan separately, reporting unavailable backends without aborting the report. Input is synthetic 16 kHz mono silence, so timings are a smoke benchmark, not an accuracy measurement or representative speech throughput. Real-time factor is inference seconds divided by input seconds; values below 1 are faster than real time. The JSON has schema version 1, app version, synthetic audio identifier, duration and per-backend measurements. It excludes model paths, device names and transcripts. Model inference itself may print native diagnostics to stderr; share only the JSON report.

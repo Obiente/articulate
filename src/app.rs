@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::Ordering,
+        Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::{Duration, Instant},
@@ -34,6 +35,8 @@ mod transcript_editor;
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
+    close_to_tray: bool,
+    start_with_windows: bool,
     automatic_update_checks: bool,
     cpu: bool,
     insert: bool,
@@ -92,6 +95,8 @@ fn default_quick_note_hotkey() -> platform::Hotkey {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            close_to_tray: false,
+            start_with_windows: false,
             automatic_update_checks: true,
             cpu: false,
             insert: false,
@@ -199,6 +204,7 @@ pub struct App {
     busy: bool,
     ready: bool,
     downloading: Option<f32>,
+    model_cancels: std::collections::HashMap<model::ModelId, Arc<AtomicBool>>,
     status: String,
     backend: String,
     speech_languages: Vec<String>,
@@ -539,6 +545,7 @@ impl App {
             busy: false,
             ready: false,
             downloading: None,
+            model_cancels: Default::default(),
             status: "Choose a model to get started".into(),
             backend: String::new(),
             speech_languages: Vec::new(),
@@ -1441,6 +1448,7 @@ impl App {
         self.updater.poll();
         self.poll_saved_search();
         self.polish_poll();
+        self.desktop_assort_poll();
         self.brain_poll();
         self.notetaker_poll_filing();
         self.preview();
@@ -1472,12 +1480,15 @@ impl App {
 
     fn download(&mut self) {
         self.downloading = Some(0.0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.model_cancels
+            .insert(model::ModelId::Speech, cancel.clone());
         self.status = "Downloading the speech model...".into();
         let tx = self.event_tx.clone();
 
         std::thread::spawn(move || {
             let mut last = Instant::now();
-            let result = model::download(|p| {
+            let result = model::download_cancellable(&cancel, |p| {
                 if last.elapsed() > Duration::from_millis(100) {
                     let _ = tx.send(Event::Progress(p));
 
@@ -2240,6 +2251,7 @@ mod tests {
                 busy: false,
                 ready: true,
                 downloading: None,
+                model_cancels: Default::default(),
                 status: String::new(),
                 backend: "CPU".into(),
                 speech_languages: vec!["en".into(), "nl".into()],

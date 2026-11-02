@@ -82,7 +82,12 @@ export function SettingsPage({ state, act }) {
       <DictationSettings controls={controls} />
       <AudioSettings controls={controls} />
       <DiscordSettings controls={controls} />
-      <ModelSettings controls={controls} />
+      <ModelSettings
+        controls={{
+          ...controls,
+          send: (command) => void act(command).catch(() => {}),
+        }}
+      />
       <UpdateSettings controls={controls} />
       <Text c="dimmed" size="sm" className="secondary-privacy">
         <ShieldCheck size={17} />

@@ -265,6 +265,29 @@ pub fn delete_model(id: ModelId) -> Result<()> {
     crate::polish::invalidate_install_state();
     Ok(())
 }
+
+pub fn acquire_path(path: &std::path::Path) -> ModelLease {
+    let canonical = path.canonicalize().ok();
+    let id = [
+        ModelId::Speech,
+        ModelId::Verifier,
+        ModelId::Speaker,
+        ModelId::SoundCues,
+        ModelId::Polish,
+        ModelId::Notes,
+    ]
+    .into_iter()
+    .find(|id| {
+        let managed = managed_path(*id);
+        path == managed
+            || canonical
+                .as_ref()
+                .is_some_and(|path| managed.canonicalize().ok().as_ref() == Some(path))
+    })
+    .unwrap_or(ModelId::Speech);
+    acquire(id)
+}
+
 #[cfg(test)]
 mod management_tests {
     use super::*;

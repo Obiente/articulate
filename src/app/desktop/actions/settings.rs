@@ -26,6 +26,9 @@ pub(crate) enum Action {
         discord_auto_connect: Option<bool>,
         discord_auto_transcribe: Option<bool>,
         vencord_auto_update: Option<bool>,
+        close_to_tray: Option<bool>,
+        start_with_windows: Option<bool>,
+        automatic_update_checks: Option<bool>,
     },
 }
 
@@ -47,6 +50,9 @@ struct Preferences {
     discord_auto_connect: Option<bool>,
     discord_auto_transcribe: Option<bool>,
     vencord_auto_update: Option<bool>,
+    close_to_tray: Option<bool>,
+    start_with_windows: Option<bool>,
+    automatic_update_checks: Option<bool>,
 }
 
 impl Preferences {
@@ -58,6 +64,15 @@ impl Preferences {
                 std::mem::swap(value, current);
             }
         }
+        swap(
+            &mut self.automatic_update_checks,
+            &mut settings.automatic_update_checks,
+        );
+        swap(&mut self.close_to_tray, &mut settings.close_to_tray);
+        swap(
+            &mut self.start_with_windows,
+            &mut settings.start_with_windows,
+        );
         swap(&mut self.cpu, &mut settings.cpu);
         swap(&mut self.model_path, &mut settings.model_path);
         swap(
@@ -112,6 +127,9 @@ impl App {
             discord_auto_connect,
             discord_auto_transcribe,
             vencord_auto_update,
+            close_to_tray,
+            start_with_windows,
+            automatic_update_checks,
         } = action;
         let mut preferences = Preferences {
             cpu,
@@ -129,6 +147,9 @@ impl App {
             discord_auto_connect,
             discord_auto_transcribe,
             vencord_auto_update,
+            close_to_tray,
+            start_with_windows,
+            automatic_update_checks,
         };
         self.desktop_validate_settings(&preferences, hotkey.as_ref(), quick_note_hotkey.as_ref())?;
         let reload_model = preferences
@@ -142,9 +163,26 @@ impl App {
                 .model_path
                 .as_ref()
                 .is_some_and(|path| *path != self.settings.model_path);
+        let executable = std::env::current_exe().map_err(|e| e.to_string())?;
+        let previous_startup = self.settings.start_with_windows;
+        if let Some(enabled) = start_with_windows {
+            crate::startup::configure(&crate::startup::WindowsRunKey, enabled, &executable)?;
+        }
         preferences.exchange(&mut self.settings);
         if let Err(error) = self.save_preferences() {
             preferences.exchange(&mut self.settings);
+            if start_with_windows.is_some() {
+                crate::startup::configure(
+                    &crate::startup::WindowsRunKey,
+                    previous_startup,
+                    &executable,
+                )
+                .map_err(|rollback| {
+                    format!(
+                        "Could not save preferences: {error}. Startup rollback failed: {rollback}"
+                    )
+                })?;
+            }
             return Err(format!("Could not save preferences: {error}"));
         }
         if learn_corrections == Some(false) {

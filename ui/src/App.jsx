@@ -510,7 +510,11 @@ export function App() {
               binding={binding}
             />
           ) : page === "vocabulary" ? (
-            <VocabularyPage dictionary={state.dictionary} act={act} />
+            <VocabularyPage
+              dictionary={state.dictionary}
+              review={state.assort}
+              act={act}
+            />
           ) : page === "snippets" ? (
             <SnippetsPage macros={state.macros} act={act} />
           ) : page === "insights" ? (

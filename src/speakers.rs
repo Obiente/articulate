@@ -23,6 +23,7 @@ pub struct Turn {
 }
 pub struct Tracker {
     session: Session,
+    _lease: crate::model::ModelLease,
     anchors: Vec<Anchor>,
     next: i32,
 }
@@ -48,6 +49,7 @@ impl Tracker {
     }
 
     pub fn new(cpu: bool) -> Result<Self> {
+        let lease = crate::model::acquire(crate::model::ModelId::Speaker);
         let model = Model::load_with(
             path(),
             &ModelOptions {
@@ -61,6 +63,7 @@ impl Tracker {
         })?;
         Ok(Self {
             session,
+            _lease: lease,
             anchors: Vec::new(),
             next: 1,
         })

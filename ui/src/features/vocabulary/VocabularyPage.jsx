@@ -1,3 +1,4 @@
+import { VocabularyReview } from "./VocabularyReview.jsx";
 import { useState } from "react";
 import {
   ActionIcon,
@@ -26,7 +27,7 @@ import { formatCount } from "../../lib/format.js";
 
 const emptyEntry = { heard: "", wanted: "", app: "", cues: "" };
 
-export function VocabularyPage({ dictionary, act }) {
+export function VocabularyPage({ dictionary, act, review }) {
   const [search, setSearch] = useState("");
   const [editor, setEditor] = useState(null);
   const [deletion, setDeletion] = useState(null);
@@ -80,6 +81,7 @@ export function VocabularyPage({ dictionary, act }) {
       >
         Your names, terms, and spellings. Remembered wherever you dictate.
       </Heading>
+      <VocabularyReview review={review} act={act} />
       <Paper className="secondary-tip" withBorder radius="lg">
         <ThemeIcon size={42} radius="md" variant="light">
           <BookOpen size={23} />

@@ -60,20 +60,20 @@ impl App {
                 active.push(Download { name, cancellable });
             }
         };
-        add(self.downloading.is_some(), "speech model", false);
+        add(self.downloading.is_some(), "speech model", true);
         add(
             self.verifier_downloading.is_some(),
             "second speech model",
-            false,
+            true,
         );
         add(
             self.speakers_downloading.is_some(),
             "speaker identification",
-            false,
+            true,
         );
-        add(self.context_progress.is_some(), "audio context", false);
+        add(self.context_progress.is_some(), "audio context", true);
         add(
-            self.desktop_notes_status("")["downloading"].as_bool() == Some(true),
+            self.desktop_notes_status("").downloading,
             "notes model",
             true,
         );

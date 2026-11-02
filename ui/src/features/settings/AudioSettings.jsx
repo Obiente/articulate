@@ -69,6 +69,14 @@ export function AudioSettings({ controls }) {
             </Button>
           )}
         </SettingRow>
+        {models.verifier_working && (
+          <Button
+            variant="subtle"
+            onClick={() => action("model_download_cancel", { id: "verifier" })}
+          >
+            Cancel download
+          </Button>
+        )}
         <SetupStatus
           busy={models.verifier_working}
           message={models.verifier_status}

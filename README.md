@@ -44,7 +44,7 @@ Optional, off-by-default meeting detection can notice Microsoft Teams, Zoom and 
 
 ## Updates and privacy
 
-Articulate checks for a release on launch and once a day while open. Update notices appear throughout the workspace. Downloads remain your choice, are verified against the GitHub asset's SHA-256 digest, and install after recording has finished and pending history saves have completed. Models and saved sessions survive updates.
+Articulate checks for a release on launch and once a day while open by default. Turn off Automatic update checks in Settings to disable both; Check for updates remains available. Update notices appear throughout the workspace. Downloads remain your choice, are verified against the GitHub asset's SHA-256 digest, and install after recording has finished and pending history saves have completed. Models and saved sessions survive updates.
 
 Speech runs locally after models are downloaded. Model downloads contact Hugging Face; app update checks and downloads contact GitHub. The Discord companion uses a mutually authenticated loopback connection. Participant pictures are fetched from Discord's CDN over HTTPS and cached locally in a bounded folder; this can be turned off in Settings. Text is never sent for transcription or correction. Saved text, notes, preferences and models live under `%LOCALAPPDATA%\TranscribeLocal`; audio is not saved, and temporary audio left by an interrupted call analysis is removed at the next start. History and preferences can optionally be encrypted for your Windows account. Uninstalling keeps this local data.
 
@@ -61,3 +61,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for local builds and checks, and [SECURIT
 Tauri with React and Mantine is the only application interface built from this source. See the [desktop UI guide](docs/desktop-ui.md) for preview and build commands, available screens, and remaining feature migration work. Previously published releases are unchanged.
 
 Articulate is licensed under **AGPL-3.0-or-later**, following [Obiente's open-source commitment](https://github.com/Obiente/.github/blob/main/profile/README.md). You may use, modify, and redistribute it under those terms; it comes without warranty. Included Assort weights carry their own model cards and license notices. Bundled fonts, icons, runtimes and Rust dependencies retain their own notices. Separately downloaded Qwen weights are Apache-2.0; Sortformer weights use the NVIDIA Open Model License; Nemotron 3.5 ASR weights use OpenMDW-1.1. See [LICENSE](LICENSE), [visual asset notices](assets/LICENSES.md), and the `licenses/` directory inside each binary distribution.
+
+### Local model and startup controls
+
+Settings lists downloaded models with their sizes, local paths and in-use state. Delete asks for confirmation and refuses models held by an active engine or transfer. Select a different speech model or exit to release a loaded speech model. Downloads offer Cancel. Browse selects a custom GGUF file; manual path entry is also available.
+
+Use Polish on a finished dictation to compare the safe baseline and proposed edit. Apply accepts the preview; Keep original or Cancel leaves the text unchanged. Vocabulary offers a bounded review of the latest dictation, with sentence context and preference scores. Choose one spelling explicitly, then review again for another choice.
+
+The tray offers Show, Start/Stop dictation, Start call capture and Quit. Quit saves pending edits through the normal close flow. Close to tray and Start with Windows are optional and off by default. Starting at login opens in the tray.

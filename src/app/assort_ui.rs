@@ -63,7 +63,7 @@ impl super::App {
         self.polish.assort = ReviewState::default();
     }
 
-    pub(super) fn desktop_assort_status(&mut self) -> serde_json::Value {
+    pub(super) fn desktop_assort_poll(&mut self) {
         let state = &mut self.polish.assort;
         if state.utterance != self.utterance
             || state.raw != self.raw
@@ -83,9 +83,18 @@ impl super::App {
                 Err(error) => state.status = error,
             }
         }
-        serde_json::json!({"working":state.task.is_some(), "status":state.status,
-            "candidates":state.review.as_ref().map(|r| &r.request.candidates),
-            "scores":state.review.as_ref().map(|r| &r.scores)})
+    }
+    pub(super) fn desktop_assort_status(&self) -> ReviewStatus<'_> {
+        let state = &self.polish.assort;
+        ReviewStatus {
+            working: state.task.is_some(),
+            status: &state.status,
+            candidates: state
+                .review
+                .as_ref()
+                .map(|r| r.request.candidates.as_slice()),
+            scores: state.review.as_ref().map(|r| r.scores.as_slice()),
+        }
     }
 
     pub(super) fn desktop_assort_apply(
@@ -93,7 +102,7 @@ impl super::App {
         index: usize,
         saved_spelling: bool,
     ) -> Result<(), String> {
-        self.desktop_assort_status();
+        self.desktop_assort_poll();
         if self.brain_working()
             || self.preview_inflight
             || self.integration_inflight
@@ -187,6 +196,14 @@ impl Configuration {
             limits: limits.trim().into(),
         })
     }
+}
+
+#[derive(Serialize)]
+pub(crate) struct ReviewStatus<'a> {
+    working: bool,
+    status: &'a str,
+    candidates: Option<&'a [crate::correction_context::Candidate]>,
+    scores: Option<&'a [crate::correction_context::Score]>,
 }
 
 #[cfg(test)]

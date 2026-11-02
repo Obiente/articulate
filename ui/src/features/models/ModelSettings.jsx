@@ -1,3 +1,5 @@
+import { invoke } from "@tauri-apps/api/core";
+import { ModelManager } from "./ModelManager.jsx";
 import { useState } from "react";
 import {
   Badge,
@@ -30,9 +32,11 @@ export function ModelSettings({ controls }) {
     controls;
   const { pending, patch, action } = controls;
   const [customModel, setCustomModel] = useState("");
+  const [pickerError, setPickerError] = useState("");
   return (
     <>
       <SettingsSection id="settings-models" icon={Sparkle} title="Models">
+        <ModelManager controls={controls} />
         <Paper withBorder radius="lg" className="secondary-settings-card">
           <SettingRow
             title={
@@ -117,6 +121,27 @@ export function ModelSettings({ controls }) {
               ? `Current model: ${models.model_name}`
               : "Use your own compatible GGUF speech model."}
           </Text>
+          <Button
+            mt="sm"
+            variant="default"
+            disabled={state.preview || modelBusy || busy}
+            onClick={async () => {
+              setPickerError("");
+              try {
+                const path = await invoke("desktop_model_file");
+                if (path) setCustomModel(path);
+              } catch (error) {
+                setPickerError(String(error));
+              }
+            }}
+          >
+            Browse for GGUF file
+          </Button>
+          {pickerError && (
+            <Text c="red" role="alert">
+              {pickerError}
+            </Text>
+          )}
           <TextInput
             mt="md"
             label="Custom model file"
@@ -141,6 +166,14 @@ export function ModelSettings({ controls }) {
         <Paper withBorder radius="lg" className="secondary-download">
           <Group justify="space-between" mb="sm">
             <Text fw={500}>Downloading speech model</Text>
+            <Button
+              variant="subtle"
+              onClick={() =>
+                controls.send({ type: "model_download_cancel", id: "speech" })
+              }
+            >
+              Cancel download
+            </Button>
             <Text c="dimmed" size="sm">
               {Math.round(state.downloading * 100)}%
             </Text>
@@ -307,6 +340,19 @@ export function ModelSettings({ controls }) {
                 : "Download · 259 MB"}
             </Button>
           </SettingRow>
+          {models.context_progress != null && (
+            <Button
+              variant="subtle"
+              onClick={() =>
+                controls.send({
+                  type: "model_download_cancel",
+                  id: "sound_cues",
+                })
+              }
+            >
+              Cancel download
+            </Button>
+          )}
           <SetupStatus
             busy={models.context_progress != null}
             message={models.context_status}
@@ -352,6 +398,16 @@ export function ModelSettings({ controls }) {
               </Button>
             )}
           </SettingRow>
+          {models.speakers_progress != null && (
+            <Button
+              variant="subtle"
+              onClick={() =>
+                controls.send({ type: "model_download_cancel", id: "speaker" })
+              }
+            >
+              Cancel download
+            </Button>
+          )}
           <SetupStatus
             busy={models.speakers_working}
             message={models.speakers_status}

@@ -98,13 +98,16 @@ fn snapshot_sections_have_a_locked_shape() {
             set(&["notes", "selected_notes", "call_notes", "note_notes"]),
         ),
         ("settings", set(&["settings", "microphones", "outputs"])),
-        ("models", set(&["model_status", "downloading"])),
+        (
+            "models",
+            set(&["model_status", "downloading", "managed_models", "cleanup"]),
+        ),
         ("discord", set(&["discord"])),
         ("updater", set(&["updater"])),
         ("overlay", set(&["overlay"])),
         ("history", set(&["history"])),
         ("document_body", set(&["selected_body"])),
-        ("vocabulary", set(&["dictionary", "macros"])),
+        ("vocabulary", set(&["dictionary", "macros", "assort"])),
         ("insights", set(&["insights"])),
     ]
     .into_iter()
@@ -187,6 +190,9 @@ fn snapshot_sections_have_a_locked_shape() {
             "discord_auto_transcribe",
             "discord_companion",
             "vencord_auto_update",
+            "close_to_tray",
+            "start_with_windows",
+            "automatic_update_checks",
         ])
     );
     assert_eq!(
@@ -664,4 +670,100 @@ fn stale_editor_cannot_delete_same_phrase_in_a_different_scope() {
     })));
     assert!(result.is_err());
     assert_eq!(app.settings.macros[0].app.as_deref(), Some("editor.exe"));
+}
+
+#[test]
+fn model_review_shapes_are_locked() {
+    let (app, _) = app();
+    let state = app.desktop_snapshot();
+    assert_eq!(
+        keys(&state["cleanup"]),
+        set(&["installed", "working", "status", "progress", "preview"])
+    );
+    assert_eq!(
+        keys(&state["assort"]),
+        set(&["working", "status", "candidates", "scores"])
+    );
+    assert_eq!(
+        keys(&state["notes"]),
+        set(&[
+            "ready",
+            "acceleration_installed",
+            "working",
+            "status",
+            "progress",
+            "download_status",
+            "download_progress",
+            "downloading"
+        ])
+    );
+    assert_eq!(
+        keys(&state["managed_models"][0]),
+        set(&["id", "installed", "disk_size", "path", "in_use"])
+    );
+    assert!(
+        state["settings"]["automatic_update_checks"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(state["settings"]["close_to_tray"], false);
+    assert_eq!(state["settings"]["start_with_windows"], false);
+}
+#[test]
+fn leased_models_cannot_be_deleted_through_renderer() {
+    let (mut app, _) = app();
+    for id in [
+        model::ModelId::Speech,
+        model::ModelId::Verifier,
+        model::ModelId::Speaker,
+        model::ModelId::SoundCues,
+        model::ModelId::Polish,
+        model::ModelId::Notes,
+    ] {
+        let _lease = model::acquire(id);
+        assert!(
+            app.desktop_action(action(json!({"type":"model_delete", "id":id})))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn review_actions_validate_fields_and_cancel_without_changing_text() {
+    let (mut app, _) = app();
+    app.text = "Synthetic dictation.".into();
+    for kind in ["polish_cancel", "assort_cancel"] {
+        app.desktop_action(action(json!({"type":kind}))).unwrap();
+        assert_eq!(app.text, "Synthetic dictation.");
+    }
+    assert!(
+        serde_json::from_value::<Action>(
+            json!({"type":"assort_apply","index":-1,"saved_spelling":true})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<Action>(json!({"type":"model_delete","id":"unknown"})).is_err()
+    );
+    app.desktop_action(action(json!({"type":"settings_patch","automatic_update_checks":false,"close_to_tray":true,"start_with_windows":true}))).unwrap();
+    assert!(!app.settings.automatic_update_checks);
+    assert!(app.settings.close_to_tray);
+    assert!(app.settings.start_with_windows);
+}
+
+#[test]
+fn model_cancellation_targets_the_requested_transfer() {
+    let (mut app, _) = app();
+    let speech = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let verifier = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.model_cancels
+        .insert(model::ModelId::Speech, speech.clone());
+    app.model_cancels
+        .insert(model::ModelId::Verifier, verifier.clone());
+    app.desktop_action(action(
+        json!({"type":"model_download_cancel", "id":"verifier"}),
+    ))
+    .unwrap();
+    assert!(verifier.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!speech.load(std::sync::atomic::Ordering::Relaxed));
 }
