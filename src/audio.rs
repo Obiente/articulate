@@ -181,6 +181,32 @@ struct Capture {
     error: Arc<AtomicBool>,
 }
 
+impl Capture {
+    fn write<T: cpal::SizedSample>(&mut self, data: &[T])
+    where
+        f32: cpal::FromSample<T>,
+    {
+        if self.limit.load(Ordering::Relaxed) || self.error.load(Ordering::Relaxed) {
+            return;
+        }
+        // No heap allocation, mutex, I/O or inference in the audio callback.
+        let mut peak = 0.0f32;
+        let mut added = 0;
+        for frame in data.chunks_exact(self.channels) {
+            let mono =
+                frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>() / self.channels as f32;
+            peak = peak.max(mono.abs());
+            if self.producer.try_push(mono).is_err() {
+                self.limit.store(true, Ordering::Relaxed);
+                break;
+            }
+            added += 1;
+        }
+        self.count.fetch_add(added, Ordering::Relaxed);
+        self.meter.store(peak.to_bits(), Ordering::Relaxed);
+    }
+}
+
 fn build_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -193,26 +219,7 @@ where
     let error = capture.error.clone();
     Ok(device.build_input_stream(
         config,
-        move |data: &[T], _| {
-            if capture.limit.load(Ordering::Relaxed) || capture.error.load(Ordering::Relaxed) {
-                return;
-            }
-            // No heap allocation, mutex, I/O or inference in the audio callback.
-            let mut peak = 0.0f32;
-            let mut added = 0;
-            for frame in data.chunks_exact(capture.channels) {
-                let mono = frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>()
-                    / capture.channels as f32;
-                peak = peak.max(mono.abs());
-                if capture.producer.try_push(mono).is_err() {
-                    capture.limit.store(true, Ordering::Relaxed);
-                    break;
-                }
-                added += 1;
-            }
-            capture.count.fetch_add(added, Ordering::Relaxed);
-            capture.meter.store(peak.to_bits(), Ordering::Relaxed);
-        },
+        move |data: &[T], _| capture.write(data),
         move |_| {
             error.store(true, Ordering::Relaxed);
         },
@@ -465,6 +472,25 @@ pub fn check_microphone(selected: Option<&str>, seconds: u32) -> Result<AudioChe
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+    #[test]
+    fn overflow_keeps_prefix_and_stops_accepting_after_the_gap() {
+        let (producer, mut consumer) = HeapRb::<f32>::new(3).split();
+        let mut capture = Capture {
+            producer,
+            channels: 1,
+            count: Arc::new(AtomicUsize::new(0)),
+            meter: Arc::new(AtomicU32::new(0)),
+            limit: Arc::new(AtomicBool::new(false)),
+            error: Arc::new(AtomicBool::new(false)),
+        };
+        capture.write(&[0.1f32, 0.2, 0.3, 0.4]);
+        assert!(capture.limit.load(Ordering::Relaxed));
+        assert!(!capture.error.load(Ordering::Relaxed));
+        assert_eq!(capture.count.load(Ordering::Relaxed), 3);
+        assert_eq!(consumer.pop_iter().collect::<Vec<_>>(), vec![0.1, 0.2, 0.3]);
+        capture.write(&[0.5f32]);
+        assert!(consumer.try_pop().is_none());
+    }
     #[test]
     fn interruption_distinguishes_backpressure_from_device_failure() {
         assert!(interruption(false, false).is_none());
