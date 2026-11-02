@@ -72,10 +72,48 @@ impl InstallRequest {
     }
 }
 
-#[derive(Default)]
 pub struct State {
     pub status: Status,
     pending: Option<Receiver<Event>>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        static CLEANUP: std::sync::Once = std::sync::Once::new();
+        CLEANUP.call_once(|| {
+            let _ = prune_downloads(&crate::model::data_dir().join("updates"), None);
+        });
+        Self {
+            status: Status::Idle,
+            pending: None,
+        }
+    }
+}
+
+/// Call before starting update work; preserve only the directory of the pending installer.
+pub fn prune_downloads(root: &std::path::Path, pending: Option<&std::path::Path>) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if pending == Some(path.as_path()) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                continue;
+            }
+        }
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
 }
 
 enum Event {

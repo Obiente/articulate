@@ -1,6 +1,8 @@
 //! Reviewed, source-linked summaries generated entirely on this device.
 //! Citation validation proves provenance, not that a generated claim is true.
 mod consolidate;
+#[allow(dead_code)]
+pub mod followups;
 #[allow(
     dead_code,
     reason = "Preserve bounded saved-transcript search for React search controls"

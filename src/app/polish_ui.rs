@@ -25,7 +25,8 @@ impl Context {
 impl App {
     pub(super) fn desktop_cleanup_status(&self) -> serde_json::Value {
         serde_json::json!({"installed":crate::polish::profile_installed(crate::polish::ModelProfile::Polish),
-            "working":self.polish.job.is_some(),"status":self.polish.status,"progress":self.polish.fraction})
+            "working":self.polish.job.is_some(),"status":self.polish.status,"progress":self.polish.fraction,
+            "preview":self.polish.preview.as_ref().map(|p| serde_json::json!({"original":p.original,"source":p.source,"text":p.text,"blocked":p.blocked,"cleanup_only":p.cleanup_only}))})
     }
 
     pub(super) fn desktop_cleanup_download(&mut self) -> Result<(), String> {
@@ -41,6 +42,8 @@ impl App {
     }
 
     pub(super) fn desktop_cleanup_cancel(&mut self) {
+        self.polish.preview = None;
+        self.polish.context = None;
         if let Some(job) = &self.polish.job {
             job.cancel();
         }
@@ -124,7 +127,7 @@ impl App {
         dead_code,
         reason = "Local polish controller retained for the Tauri editing flow"
     )]
-    fn polish_start(&mut self) {
+    pub(super) fn polish_start(&mut self) {
         if !self.polish_idle() || self.macro_used.is_some() || self.polish.job.is_some() {
             return;
         }
@@ -159,7 +162,7 @@ impl App {
         dead_code,
         reason = "Local polish controller retained for the Tauri editing flow"
     )]
-    fn polish_apply(&mut self) {
+    pub(super) fn polish_apply(&mut self) {
         let valid = self.polish_idle()
             && self
                 .polish

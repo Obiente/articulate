@@ -34,6 +34,7 @@ mod transcript_editor;
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
+    automatic_update_checks: bool,
     cpu: bool,
     insert: bool,
     entries: Vec<Entry>,
@@ -77,6 +78,7 @@ fn default_quick_note_hotkey() -> platform::Hotkey {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            automatic_update_checks: true,
             cpu: false,
             insert: false,
             entries: Vec::new(),
