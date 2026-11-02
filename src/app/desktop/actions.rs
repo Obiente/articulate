@@ -24,7 +24,7 @@ pub(crate) enum Action {
     Capture(capture::Action),
     Output(output::Action),
     Vocabulary(vocabulary::Action),
-    Settings(settings::Action),
+    Settings(Box<settings::Action>),
     Models(models::Action),
     Discord(discord::Action),
     Updates(updates::Action),
@@ -47,7 +47,7 @@ const FEATURES: &[(&str, Parser)] = &[
         vocabulary::Action::deserialize(value).map(Action::Vocabulary)
     }),
     ("settings", |value| {
-        settings::Action::deserialize(value).map(Action::Settings)
+        settings::Action::deserialize(value).map(|action| Action::Settings(Box::new(action)))
     }),
     ("models", |value| {
         models::Action::deserialize(value).map(Action::Models)
@@ -110,7 +110,7 @@ impl App {
             Action::Capture(action) => self.desktop_capture_action(action),
             Action::Output(action) => output::run(action),
             Action::Vocabulary(action) => self.desktop_vocabulary_action(action),
-            Action::Settings(action) => self.desktop_settings_action(action),
+            Action::Settings(action) => self.desktop_settings_action(*action),
             Action::Models(action) => self.desktop_models_action(action),
             Action::Discord(action) => self.desktop_discord_action(action),
             Action::Updates(action) => self.desktop_updates_action(action),

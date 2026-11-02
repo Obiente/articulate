@@ -627,6 +627,7 @@ mod win {
         send_text(expected, text, false, line_break, same_field)
     }
 
+    #[allow(dead_code, reason = "Compatibility wrapper for default line breaks")]
     pub fn replace_selection(
         expected: Target,
         text: &str,
