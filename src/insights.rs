@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use time::{Date, Duration, OffsetDateTime, UtcOffset};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// Unknown fields from newer versions are ignored so their records stay readable.
+#[serde(default)]
 pub struct DictationMetrics {
     /// Captured audio sample duration; not recognition or UI processing time.
     pub audio_duration_ms: Option<u64>,
@@ -64,6 +65,42 @@ struct Record {
     app: Option<String>,
 }
 
+/// The few fields Insights needs from one saved record. Cached by the history
+/// index so refreshing Insights does not read every transcript again.
+#[derive(Clone, Debug)]
+pub(crate) struct Sample {
+    pub id: String,
+    pub kind: Kind,
+    pub created_ms: u64,
+    pub updated_ms: u64,
+    /// Words in the retained text, used only when the raw count is unknown.
+    pub text_words: u64,
+    pub metrics: DictationMetrics,
+}
+
+impl From<&Session> for Sample {
+    fn from(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            kind: session.kind,
+            created_ms: session.created_ms,
+            updated_ms: session.updated_ms,
+            text_words: if session.kind == Kind::Dictation
+                && session.metrics.recognized_words.is_none()
+            {
+                session
+                    .text
+                    .split_whitespace()
+                    .filter(|word| word.chars().any(char::is_alphanumeric))
+                    .count() as u64
+            } else {
+                0
+            },
+            metrics: session.metrics.clone(),
+        }
+    }
+}
+
 pub(crate) struct Aggregate {
     now_ms: u64,
     today: Date,
@@ -87,58 +124,53 @@ impl Aggregate {
         }
     }
 
-    pub(crate) fn push(&mut self, session: &Session) {
-        let Some(time) = timestamp(session.created_ms) else {
+    /// Aggregate a cached per-record sample without reading the full record.
+    pub(crate) fn push_sample(&mut self, sample: &Sample) {
+        let Some(time) = timestamp(sample.created_ms) else {
             return;
         };
         let offset = UtcOffset::local_offset_at(time).ok();
         self.dates_use_utc |= offset.is_none();
         self.push_on(
-            session,
+            sample,
             time.to_offset(offset.unwrap_or(UtcOffset::UTC)).date(),
         );
     }
 
-    fn push_on(&mut self, session: &Session, day: Date) {
-        if session.kind != Kind::Dictation || session.created_ms > self.now_ms {
+    fn push_on(&mut self, sample: &Sample, day: Date) {
+        if sample.kind != Kind::Dictation || sample.created_ms > self.now_ms {
             return;
         }
-        let words = session.metrics.recognized_words.unwrap_or_else(|| {
-            session
-                .text
-                .split_whitespace()
-                .filter(|word| word.chars().any(char::is_alphanumeric))
-                .count() as u64
-        });
+        let words = sample.metrics.recognized_words.unwrap_or(sample.text_words);
         if self
             .records
-            .get(&session.id)
-            .is_some_and(|old| old.updated_ms > session.updated_ms)
+            .get(&sample.id)
+            .is_some_and(|old| old.updated_ms > sample.updated_ms)
         {
             return;
         }
         let measured = match (
-            session.metrics.recognized_words,
-            session.metrics.audio_duration_ms,
+            sample.metrics.recognized_words,
+            sample.metrics.audio_duration_ms,
         ) {
             (Some(words), Some(ms)) if words > 0 && ms > 0 => Some((words, ms)),
             _ => None,
         };
-        let app = session
+        let app = sample
             .metrics
             .app
             .as_deref()
             .and_then(|app| crate::dictionary::app_scope(app).ok().flatten());
         self.records.insert(
-            session.id.clone(),
+            sample.id.clone(),
             Record {
-                updated_ms: session.updated_ms,
+                updated_ms: sample.updated_ms,
                 day,
                 words,
                 measured,
                 app,
-                dictionary_replacements: session.metrics.dictionary_replacements,
-                cleanup_edits: session.metrics.cleanup_edits,
+                dictionary_replacements: sample.metrics.dictionary_replacements,
+                cleanup_edits: sample.metrics.cleanup_edits,
             },
         );
     }
@@ -257,11 +289,14 @@ mod tests {
         let mut a = aggregate(date(2026, 9, 20));
         let mut first = dictation(60, Some(60_000));
         first.text = "macro expansion ".repeat(500);
-        a.push_on(&first, date(2026, 9, 20));
-        a.push_on(&dictation(60, Some(30_000)), date(2026, 9, 20));
+        a.push_on(&Sample::from(&first), date(2026, 9, 20));
+        a.push_on(
+            &Sample::from(&dictation(60, Some(30_000))),
+            date(2026, 9, 20),
+        );
         let mut legacy = Session::new(Kind::Dictation);
         legacy.text = "three retained words".into();
-        a.push_on(&legacy, date(2026, 9, 20));
+        a.push_on(&Sample::from(&legacy), date(2026, 9, 20));
         let r = a.finish();
         assert_eq!(r.words, 123);
         assert_eq!(r.sessions, 3);
@@ -274,9 +309,9 @@ mod tests {
         for kind in [Kind::Call, Kind::Note] {
             let mut s = dictation(200, Some(1000));
             s.kind = kind;
-            a.push_on(&s, date(2026, 9, 20));
+            a.push_on(&Sample::from(&s), date(2026, 9, 20));
         }
-        a.push_on(&dictation(10, None), date(2026, 9, 20));
+        a.push_on(&Sample::from(&dictation(10, None)), date(2026, 9, 20));
         let r = a.finish();
         assert_eq!(r.words, 10);
         assert_eq!(r.sessions, 1);
@@ -287,13 +322,13 @@ mod tests {
         let mut a = aggregate(date(2026, 9, 20));
         let mut s = dictation(10, None);
         s.updated_ms = 1;
-        a.push_on(&s, date(2026, 9, 20));
+        a.push_on(&Sample::from(&s), date(2026, 9, 20));
         s.metrics.recognized_words = Some(12);
         s.updated_ms = 2;
-        a.push_on(&s, date(2026, 9, 20));
+        a.push_on(&Sample::from(&s), date(2026, 9, 20));
         s.updated_ms = 0;
         s.metrics.recognized_words = Some(99);
-        a.push_on(&s, date(2026, 9, 20));
+        a.push_on(&Sample::from(&s), date(2026, 9, 20));
         let r = a.finish();
         assert_eq!((r.sessions, r.words), (1, 12));
     }
@@ -301,7 +336,7 @@ mod tests {
     fn streaks_cross_month_year_and_allow_today_not_started() {
         let mut a = aggregate(date(2027, 1, 2));
         for day in [date(2026, 12, 30), date(2026, 12, 31), date(2027, 1, 1)] {
-            a.push_on(&dictation(2, None), day);
+            a.push_on(&Sample::from(&dictation(2, None)), day);
         }
         let r = a.finish();
         assert_eq!((r.current_streak, r.longest_streak), (3, 3));
@@ -309,7 +344,7 @@ mod tests {
         assert_eq!(r.days.last().unwrap().date, "2027-01-02");
         assert_eq!(r.days.last().unwrap().words, 0);
         let mut a = aggregate(date(2027, 1, 3));
-        a.push_on(&dictation(2, None), date(2027, 1, 1));
+        a.push_on(&Sample::from(&dictation(2, None)), date(2027, 1, 1));
         assert_eq!(a.finish().current_streak, 0);
     }
     #[test]
@@ -320,7 +355,7 @@ mod tests {
         let mut a = aggregate(date(2026, 1, 1));
         let mut s = dictation(1, None);
         s.metrics.app = Some("C:/private/editor.exe".into());
-        a.push_on(&s, day);
+        a.push_on(&Sample::from(&s), day);
         let r = a.finish();
         assert!(r.apps[0].app.is_none());
         assert_eq!(r.current_streak, 1);
@@ -330,14 +365,14 @@ mod tests {
         let mut a = aggregate(date(2026, 9, 20));
         let mut s = dictation(10, None);
         s.updated_ms = 1;
-        a.push_on(&s, date(2026, 9, 20));
+        a.push_on(&Sample::from(&s), date(2026, 9, 20));
         s.metrics.recognized_words = Some(0);
         s.updated_ms = 2;
-        a.push_on(&s, date(2026, 9, 20));
+        a.push_on(&Sample::from(&s), date(2026, 9, 20));
         assert_eq!(a.finish().sessions, 0);
         let mut a = aggregate(date(2026, 9, 20));
         a.now_ms = 1;
-        a.push_on(&dictation(2, None), date(2026, 9, 20));
+        a.push_on(&Sample::from(&dictation(2, None)), date(2026, 9, 20));
         assert_eq!(a.finish().words, 0);
     }
 }
