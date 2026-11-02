@@ -369,6 +369,18 @@ mod win {
         }
         Ok(None)
     }
+    fn receive_action(
+        rx: &Receiver<Action>,
+        observing: bool,
+        since_poll: Duration,
+    ) -> Result<Action, mpsc::RecvTimeoutError> {
+        if observing {
+            rx.recv_timeout(Duration::from_millis(300).saturating_sub(since_poll))
+        } else {
+            rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        }
+    }
+
     pub fn run(rx: Receiver<Action>, emit: impl Fn(Event)) {
         // COM objects stay on this MTA worker. A slow provider never blocks the UI/audio thread.
         let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
@@ -379,7 +391,7 @@ mod win {
         let mut watch: Option<Watch> = None;
         let mut polled = Instant::now();
         loop {
-            match rx.recv_timeout(Duration::from_millis(50)) {
+            match receive_action(&rx, armed.is_some() || watch.is_some(), polled.elapsed()) {
                 Ok(Action::Cancel) => {
                     armed = None;
                     insertion_failure = None;
@@ -520,6 +532,25 @@ mod win {
     #[cfg(test)]
     mod live_tests {
         use super::*;
+
+        #[test]
+        fn idle_commands_disconnect_and_observation_deadlines_wake_the_worker() {
+            let (tx, rx) = mpsc::channel();
+            let waiting = std::thread::spawn(move || receive_action(&rx, false, Duration::ZERO));
+            tx.send(Action::Cancel).unwrap();
+            assert!(matches!(waiting.join().unwrap(), Ok(Action::Cancel)));
+
+            let (tx, rx) = mpsc::channel::<Action>();
+            assert!(matches!(
+                receive_action(&rx, true, Duration::from_millis(300)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(tx);
+            assert!(matches!(
+                receive_action(&rx, false, Duration::ZERO),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
+        }
 
         #[test]
         #[ignore = "Interactive: focus an empty disposable TextPattern field; this test replaces its dictated text repeatedly"]

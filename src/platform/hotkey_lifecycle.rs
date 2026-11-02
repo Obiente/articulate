@@ -8,6 +8,9 @@ pub(super) struct Lifecycle {
 }
 
 impl Lifecycle {
+    pub(super) fn needs_poll(&self) -> bool {
+        self.pressed || !self.armed
+    }
     pub(super) fn register(&mut self, any_bound_key_down: bool) -> bool {
         let released = self.pressed;
         self.pressed = false;
@@ -39,6 +42,17 @@ impl Lifecycle {
 mod tests {
     use super::*;
 
+    #[test]
+    fn release_polling_continues_until_gesture_is_rearmed() {
+        let mut state = Lifecycle::default();
+        assert!(state.needs_poll());
+        state.register(false);
+        assert!(!state.needs_poll());
+        state.press();
+        assert!(state.needs_poll());
+        assert!(state.poll(false, false));
+        assert!(!state.needs_poll());
+    }
     #[test]
     fn held_at_registration_never_starts_without_a_new_press() {
         let mut state = Lifecycle::default();

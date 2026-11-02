@@ -23,6 +23,9 @@ struct Voice {
     start: f64,
     end: f64,
     pcm: Vec<f32>,
+    converted: Vec<f32>,
+    converted_input: usize,
+    converter: crate::audio::StreamingResampler,
 }
 
 struct Boundary {
@@ -65,7 +68,7 @@ impl Window {
             + self
                 .voices
                 .iter()
-                .map(|voice| voice.pcm.len())
+                .map(|voice| voice.pcm.len() + voice.converted.len())
                 .sum::<usize>())
             * 4
     }
@@ -188,6 +191,9 @@ impl Window {
                     start: start.max(self.start),
                     end: start.max(self.start),
                     pcm: Vec::new(),
+                    converted: Vec::new(),
+                    converted_input: 0,
+                    converter: crate::audio::StreamingResampler::new(frame.rate)?,
                 });
                 self.voices.len() - 1
             }
@@ -264,9 +270,16 @@ impl Window {
         // returns text without word timestamps.
         let remote = self
             .voices
-            .iter()
+            .iter_mut()
             .map(|voice| {
-                let mut pcm = crate::audio::resample(&voice.pcm, voice.rate)?;
+                voice
+                    .converter
+                    .append(&voice.pcm[voice.converted_input..], &mut voice.converted)?;
+                voice.converted_input = voice.pcm.len();
+                if finalizing {
+                    voice.converter.finish(&mut voice.converted)?;
+                }
+                let mut pcm = voice.converted.clone();
                 // consume() has already admitted all audio through this boundary.
                 // A callback that stopped sending is silence through that time,
                 // not an indefinitely unfinished turn.
@@ -456,6 +469,7 @@ pub(super) fn run(
     let mut lost_packets = 0;
     let mut pending = VecDeque::new();
     let mut window = Window::default();
+    let mut refresh_seconds = REFRESH_SECONDS;
     let mut cursor = 0.0;
     let result = (|| -> Result<()> {
         loop {
@@ -499,7 +513,8 @@ pub(super) fn run(
             );
             let ready = if stopping { now } else { (now - 0.25).max(0.0) };
             let remaining = (MAX_SECONDS - (cursor - window.start)).max(0.0);
-            if stopping || ready >= cursor + REFRESH_SECONDS.min(remaining) {
+            if stopping || ready >= cursor + refresh_seconds.min(remaining) {
+                let decode_started = Instant::now();
                 let end = ready.min(cursor + remaining);
                 if end <= cursor {
                     break;
@@ -516,6 +531,9 @@ pub(super) fn run(
                     update(Update::AudioGap(lost));
                 }
                 window.mic.extend(mic.take_until(end)?);
+                if mic.gaps > 0 {
+                    update(Update::AudioGap(lost_packets + mic.gaps));
+                }
                 let rows = window.decode_context(
                     end,
                     |pcm, complete| {
@@ -526,8 +544,10 @@ pub(super) fn run(
                         }
                     },
                     &mut context,
-                    stopping,
+                    stopping || window.endpoint(end),
                 )?;
+                refresh_seconds =
+                    (decode_started.elapsed().as_secs_f64() * 1.25).clamp(REFRESH_SECONDS, 12.0);
                 window.rows = rows;
                 cursor = end;
                 if window.endpoint(end) || (stopping && cursor >= now) {

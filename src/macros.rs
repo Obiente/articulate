@@ -211,3 +211,114 @@ mod tests {
         assert!(validate("signature", "{text}{text}", "").is_err());
     }
 }
+
+/// Settings and state for explicit whole-segment editing, disabled by default.
+#[allow(
+    dead_code,
+    reason = "Backend API awaiting settings and text pipeline wiring"
+)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct EditingSettings {
+    pub spoken_editing_commands: bool,
+}
+
+#[allow(dead_code, reason = "Backend API awaiting text pipeline wiring")]
+#[derive(Default)]
+pub struct DictationEditor {
+    segments: Vec<String>,
+    undo: Vec<Vec<String>>,
+}
+#[allow(dead_code, reason = "Backend API awaiting text pipeline wiring")]
+impl DictationEditor {
+    /// Call exactly once per finalized segment, before applying bang macros.
+    pub fn apply(&mut self, segment: &str, settings: &EditingSettings) -> String {
+        let command = segment
+            .trim()
+            .trim_end_matches(['.', '!', '?'])
+            .trim()
+            .to_ascii_lowercase();
+        if settings.spoken_editing_commands && command == "undo that" {
+            if let Some(previous) = self.undo.pop() {
+                self.segments = previous;
+            }
+        } else {
+            self.undo.push(self.segments.clone());
+            if self.undo.len() > 32 {
+                self.undo.remove(0);
+            }
+            match (settings.spoken_editing_commands, command.as_str()) {
+                (true, "scratch that" | "delete that") => {
+                    self.segments.pop();
+                }
+                (true, "new line") => self.segments.push("\n".into()),
+                (true, "new paragraph") => self.segments.push("\n\n".into()),
+                _ => self.segments.push(segment.into()),
+            }
+        }
+        self.text()
+    }
+    pub fn text(&self) -> String {
+        let mut text = String::new();
+        for segment in &self.segments {
+            if !text.is_empty() && !text.ends_with('\n') && !segment.starts_with('\n') {
+                text.push(' ');
+            }
+            text.push_str(segment);
+        }
+        text
+    }
+}
+#[cfg(test)]
+mod editing_tests {
+    use super::*;
+    #[test]
+    fn disabled_and_ambiguous_commands_are_literal() {
+        for phrase in [
+            "new line",
+            "Please add a new line",
+            "scratch that idea",
+            "I said undo that",
+            "\"new line\"",
+            "new line, please",
+        ] {
+            let mut editor = DictationEditor::default();
+            assert_eq!(editor.apply(phrase, &EditingSettings::default()), phrase);
+        }
+        for phrase in [
+            "Please add a new line",
+            "scratch that idea",
+            "I said undo that",
+            "\"new line\"",
+            "new line, please",
+        ] {
+            assert_eq!(
+                DictationEditor::default().apply(
+                    phrase,
+                    &EditingSettings {
+                        spoken_editing_commands: true
+                    }
+                ),
+                phrase
+            );
+        }
+    }
+    #[test]
+    fn editing_and_undo_preserve_segment_boundaries() {
+        let mut e = DictationEditor::default();
+        let settings = EditingSettings {
+            spoken_editing_commands: true,
+        };
+        for s in ["First.", "New line.", "Second.", "new paragraph", "Third."] {
+            e.apply(s, &settings);
+        }
+        assert_eq!(e.text(), "First.\nSecond.\n\nThird.");
+        assert_eq!(e.apply("Scratch that!", &settings), "First.\nSecond.\n\n");
+        assert_eq!(e.apply("undo that", &settings), "First.\nSecond.\n\nThird.");
+        e.apply("delete that", &settings);
+        assert_eq!(
+            e.apply("Replacement.", &settings),
+            "First.\nSecond.\n\nReplacement."
+        );
+    }
+}

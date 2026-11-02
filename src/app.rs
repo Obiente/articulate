@@ -201,6 +201,7 @@ pub struct App {
     utterance: u64,
     preview_inflight: bool,
     preview_audio_seconds: f32,
+    capture_interruption: Option<String>,
     pending_final: Option<Vec<f32>>,
     cleanup_count: usize,
     microphones: Vec<String>,
@@ -407,6 +408,7 @@ impl App {
             utterance: 0,
             preview_inflight: false,
             preview_audio_seconds: 0.0,
+            capture_interruption: None,
             pending_final: None,
             cleanup_count: 0,
             microphones: audio::input_devices(),
@@ -490,7 +492,15 @@ impl App {
             self.last_seconds = recording.seconds() as u64;
             self.dictation_metrics.audio_duration_ms =
                 Some((f64::from(recording.seconds()) * 1000.0) as u64);
-            let result = recording.stop();
+            let result = recording.stop().map(|captured| {
+                self.capture_interruption = captured.interruption.map(str::to_owned);
+                if self.capture_interruption.is_some() {
+                    self.target = None;
+                    self.insertion_cancel.cancel();
+                    self.integration_pending = None;
+                }
+                captured.pcm
+            });
             if self.settings.audio_feedback {
                 crate::audio_cues::play(crate::audio_cues::Cue::Stopped);
             }
@@ -535,6 +545,7 @@ impl App {
                     self.history.dictation = None;
                     self.history.dictation_deleted = false;
                     self.status = format!("Listening on {}", recording.device);
+                    self.capture_interruption = None;
                     self.recording = Some(recording);
                     if self.settings.audio_feedback {
                         crate::audio_cues::play(crate::audio_cues::Cue::Started);
@@ -662,6 +673,7 @@ impl App {
     }
 
     fn cancel_dictation(&mut self) {
+        self.capture_interruption = None;
         self.cancel.cancel();
         self.insertion_cancel.cancel();
         self.pending_final = None;
@@ -688,6 +700,7 @@ impl App {
         reason = "Audio import controller retained for the Tauri file import flow"
     )]
     fn transcribe(&mut self, pcm: Vec<f32>) {
+        self.capture_interruption = None;
         self.history_save_dictation();
         self.history.dictation = None;
         self.history.dictation_deleted = false;
@@ -766,6 +779,22 @@ impl App {
     }
 
     fn preview(&mut self) {
+        #[cfg(windows)]
+        if crate::platform::devices::take_changed() {
+            self.microphones = audio::input_devices();
+            self.outputs = call_capture::outputs();
+        }
+        if let Some(recording) = self.recording.as_mut() {
+            recording.drain();
+        }
+        if self
+            .recording
+            .as_ref()
+            .is_some_and(|r| r.full.load(Ordering::Relaxed) || r.failed.load(Ordering::Relaxed))
+        {
+            self.toggle(None);
+            return;
+        }
         if self.preview_inflight || self.busy {
             return;
         }
@@ -787,7 +816,10 @@ impl App {
                 }
             }
             let seconds = recording.window_seconds();
-            if seconds >= 1.2 && seconds - self.preview_audio_seconds >= 0.8 {
+            if seconds >= 1.2
+                && seconds - self.preview_audio_seconds
+                    >= self.elapsed.unwrap_or(0.8).clamp(0.8, 8.0) * 1.25
+            {
                 self.preview_audio_seconds = seconds;
                 match recording.snapshot() {
                     Ok(pcm) => self.submit(pcm, false),
@@ -862,6 +894,7 @@ impl App {
                     calls::Update::AudioContext(row) => {
                         if self.call_context.len() < 4096 {
                             crate::sensevoice::apply(&mut self.call_rows, &row);
+                            crate::sensevoice::apply_existing(&mut self.call_committed, &row);
                             self.call_context.push(row);
                             self.history_call_changed();
                         }
@@ -882,7 +915,10 @@ impl App {
                             self.history_call_changed();
                         }
                     }
-                    calls::Update::Rows(rows) => {
+                    calls::Update::Rows(mut rows) => {
+                        for annotation in &self.call_context {
+                            crate::sensevoice::apply_existing(&mut rows, annotation);
+                        }
                         if self.is_note_capture() {
                             // Keep source identities and timestamps immutable so
                             // live note updates can reuse earlier model sections.
@@ -890,19 +926,16 @@ impl App {
                         } else {
                             calls::append_rows(&mut self.call_committed, rows);
                         }
-                        for annotation in &self.call_context {
-                            crate::sensevoice::apply(&mut self.call_committed, annotation);
-                        }
                         self.call_rows.clone_from(&self.call_committed);
                         self.refresh_call_notes();
                         self.history_call_changed();
                     }
-                    calls::Update::Preview(rows) => {
+                    calls::Update::Preview(mut rows) => {
+                        for annotation in &self.call_context {
+                            crate::sensevoice::apply_existing(&mut rows, annotation);
+                        }
                         self.call_rows.clone_from(&self.call_committed);
                         calls::append_rows(&mut self.call_rows, rows);
-                        for annotation in &self.call_context {
-                            crate::sensevoice::apply(&mut self.call_rows, annotation);
-                        }
                         self.refresh_call_notes();
                         self.history_call_changed();
                     }
@@ -1032,6 +1065,11 @@ impl App {
                     self.elapsed = Some(elapsed);
                     if !final_pass {
                         self.publish_live_preview();
+                        continue;
+                    }
+                    if let Some(message) = self.capture_interruption.take() {
+                        self.status = message;
+                        self.history_save_dictation();
                         continue;
                     }
                     // Resolve from speech, before dictionary rules, and never rewrite literal templates.
@@ -1939,6 +1977,7 @@ mod tests {
                 utterance: 1,
                 preview_inflight: true,
                 preview_audio_seconds: 0.0,
+                capture_interruption: None,
                 pending_final: None,
                 cleanup_count: 0,
                 microphones: Vec::new(),
@@ -2190,6 +2229,25 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_final_preserves_text_and_reports_incomplete() {
+        let (mut app, _) = app();
+        app.capture_interruption = Some("Incomplete transcript: microphone interrupted".into());
+        app.target = None;
+        app.busy = true;
+        app.event_tx
+            .send(Event::Text(
+                Ok("Valid captured prefix.".into()),
+                0.2,
+                1,
+                true,
+            ))
+            .unwrap();
+        app.receive();
+        assert_eq!(app.text, "Valid captured prefix.");
+        assert!(app.status.starts_with("Incomplete transcript"));
+        assert!(!app.busy);
+    }
+    #[test]
     fn stale_preview_cannot_replace_new_utterance() {
         let (mut app, _rx) = app();
         app.utterance = 2;
@@ -2205,6 +2263,7 @@ mod tests {
     #[test]
     fn explicit_cancel_does_not_restart_pending_final_or_publish_late_chunks() {
         let (mut app, commands) = app();
+        app.capture_interruption = Some("Interrupted capture".into());
         let (tx, actions) = mpsc::channel();
         app.integration_tx = tx;
         app.busy = true;
@@ -2213,6 +2272,7 @@ mod tests {
         app.text = "Visible preview".into();
         let cancelled_id = app.utterance;
         app.cancel_dictation();
+        assert!(app.capture_interruption.is_none());
         assert!(app.cancel.is_cancelled() && app.insertion_cancel.is_cancelled());
         assert!(matches!(
             actions.try_recv().unwrap(),

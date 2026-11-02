@@ -163,6 +163,19 @@ impl Drop for Temporary {
         let _ = fs::remove_file(&self.0);
     }
 }
+fn read_output(reader: &mut impl Read) -> std::io::Result<String> {
+    let mut output = Vec::new();
+    let mut block = [0u8; 4096];
+    loop {
+        let count = reader.read(&mut block)?;
+        if count == 0 {
+            break;
+        }
+        let keep = count.min(65536usize.saturating_sub(output.len()));
+        output.extend_from_slice(&block[..keep]);
+    }
+    Ok(String::from_utf8_lossy(&output).into_owned())
+}
 fn analyze(pcm: &[f32], cancel: &AtomicBool) -> Result<String> {
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = crate::model::data_dir().join("audio-context-temp");
@@ -205,11 +218,17 @@ fn analyze(pcm: &[f32], cancel: &AtomicBool) -> Result<String> {
         command.creation_flags(0x08000000 | 0x00004000); // Hidden, below normal priority.
     }
     let mut child = command.spawn().context("Could not start audio context")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("Missing audio context output")?;
+    let reader = std::thread::spawn(move || read_output(&mut stdout));
     let start = Instant::now();
     loop {
-        if cancel.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(8) {
+        if cancel.load(Ordering::Relaxed) || start.elapsed() > Duration::from_secs(24) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = reader.join();
             anyhow::bail!("Audio context took too long. Transcription continues normally.");
         }
         if let Some(status) = child.try_wait()? {
@@ -221,14 +240,10 @@ fn analyze(pcm: &[f32], cancel: &AtomicBool) -> Result<String> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let mut output = String::new();
-    child
-        .stdout
-        .take()
-        .context("Missing audio context output")?
-        .take(65536)
-        .read_to_string(&mut output)?;
-    Ok(output)
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("Audio context output reader stopped"))?
+        .map_err(Into::into)
 }
 
 pub struct Worker {
@@ -236,6 +251,7 @@ pub struct Worker {
     rx: mpsc::Receiver<Result<Row, String>>,
     cancel: Arc<AtomicBool>,
     pending: usize,
+    failures: usize,
     notice: Option<String>,
 }
 impl Worker {
@@ -276,6 +292,7 @@ impl Worker {
             rx,
             cancel,
             pending: 0,
+            failures: 0,
             notice: spawned.err().map(|e| e.to_string()),
         })
     }
@@ -287,14 +304,14 @@ impl Worker {
         if pcm.iter().any(|x| !x.is_finite()) || !pcm.iter().any(|x| x.abs() >= 0.000_1) {
             return;
         }
-        for (i, chunk) in pcm.chunks(8 * 16000).enumerate() {
+        for (i, chunk) in pcm.chunks(24 * 16000).enumerate() {
             if chunk.len() < 1600 {
                 continue;
             }
             let mut row = row.clone();
             row.text.clear();
             row.cues.clear();
-            row.start_ms += i as u64 * 8000;
+            row.start_ms += i as u64 * 24000;
             row.end_ms = row.end_ms.min(row.start_ms + chunk.len() as u64 / 16);
             if row.end_ms <= row.start_ms {
                 continue;
@@ -314,11 +331,18 @@ impl Worker {
         for result in self.rx.try_iter() {
             self.pending = self.pending.saturating_sub(1);
             match result {
-                Ok(row) if !row.cues.is_empty() => update(Update::AudioContext(row)),
-                Ok(_) => (),
+                Ok(row) => {
+                    self.failures = 0;
+                    if !row.cues.is_empty() {
+                        update(Update::AudioContext(row));
+                    }
+                }
                 Err(error) => {
-                    self.pending = 0;
-                    self.cancel.store(true, Ordering::Relaxed);
+                    self.failures += 1;
+                    if self.failures >= 3 {
+                        self.pending = 0;
+                        self.cancel.store(true, Ordering::Relaxed);
+                    }
                     self.notice = Some(error);
                 }
             }
@@ -352,6 +376,13 @@ impl Drop for Worker {
 }
 
 pub fn apply(rows: &mut Vec<Row>, annotation: &Row) {
+    if !apply_existing(rows, annotation) {
+        crate::calls::append_rows(rows, vec![annotation.clone()]);
+    }
+}
+
+/// Attach to an existing speech row without promoting provisional cues to committed text.
+pub fn apply_existing(rows: &mut [Row], annotation: &Row) -> bool {
     if let Some(row) = rows.iter_mut().find(|row| {
         row.microphone == annotation.microphone
             && row.discord == annotation.discord
@@ -364,8 +395,9 @@ pub fn apply(rows: &mut Vec<Row>, annotation: &Row) {
                 row.cues.push(cue.clone());
             }
         }
+        true
     } else {
-        crate::calls::append_rows(rows, vec![annotation.clone()]);
+        false
     }
 }
 
@@ -489,5 +521,52 @@ mod tests {
         assert_eq!(restored[1].cues, rows[1].cues);
         let old = r#"{"start_ms":0,"end_ms":10,"microphone":true,"speakers":[],"discord":null,"text":"Old recording"}"#;
         assert!(serde_json::from_str::<Row>(old).unwrap().cues.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+    #[test]
+    fn output_limit_still_drains_the_entire_pipe() {
+        let mut input = std::io::Cursor::new(vec![b'x'; 200000]);
+        assert_eq!(read_output(&mut input).unwrap().len(), 65536);
+        assert_eq!(input.position(), 200000);
+    }
+    #[test]
+    fn transient_failures_reset_after_success() {
+        let (tx, _jobs) = mpsc::sync_channel(8);
+        let (results, rx) = mpsc::channel();
+        let mut worker = Worker {
+            tx,
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            pending: 0,
+            failures: 0,
+            notice: None,
+        };
+        for _ in 0..2 {
+            results.send(Err("temporary".into())).unwrap();
+        }
+        worker.poll(&mut |_| {});
+        assert!(!worker.cancel.load(Ordering::Relaxed));
+        results
+            .send(Ok(Row {
+                cues: Vec::new(),
+                start_ms: 0,
+                end_ms: 1000,
+                microphone: true,
+                speakers: Vec::new(),
+                discord: None,
+                text: String::new(),
+            }))
+            .unwrap();
+        worker.poll(&mut |_| {});
+        assert_eq!(worker.failures, 0);
+        for _ in 0..3 {
+            results.send(Err("temporary".into())).unwrap();
+        }
+        worker.poll(&mut |_| {});
+        assert!(worker.cancel.load(Ordering::Relaxed));
     }
 }
