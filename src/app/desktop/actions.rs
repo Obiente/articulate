@@ -10,6 +10,7 @@ use crate::app::App;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::Value;
 
+pub(super) mod calls;
 pub(super) mod capture;
 pub(super) mod discord;
 pub(super) mod library;
@@ -28,6 +29,7 @@ pub(crate) enum Action {
     Models(models::Action),
     Discord(discord::Action),
     Updates(updates::Action),
+    Calls(calls::Action),
 }
 
 type Parser = fn(&Value) -> Result<Action, serde_json::Error>;
@@ -57,6 +59,9 @@ const FEATURES: &[(&str, Parser)] = &[
     }),
     ("updates", |value| {
         updates::Action::deserialize(value).map(Action::Updates)
+    }),
+    ("calls", |value| {
+        calls::Action::deserialize(value).map(Action::Calls)
     }),
 ];
 
@@ -98,6 +103,7 @@ impl Action {
     pub(crate) fn run_outside_controller(&self) -> Option<Result<(), String>> {
         match self {
             Self::Output(action) => output::run_outside_controller(action),
+            Self::Calls(action) => calls::run_outside_controller(action),
             _ => None,
         }
     }
@@ -114,6 +120,7 @@ impl App {
             Action::Models(action) => self.desktop_models_action(action),
             Action::Discord(action) => self.desktop_discord_action(action),
             Action::Updates(action) => self.desktop_updates_action(action),
+            Action::Calls(action) => self.desktop_calls_action(action),
         }
     }
 }

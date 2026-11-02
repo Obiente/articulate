@@ -319,6 +319,8 @@ impl StreamingResampler {
         Ok(())
     }
 }
+/// Test fixtures only; recordings are decoded with `crate::media`.
+#[cfg(test)]
 pub fn resample(input: &[f32], rate: u32) -> Result<Vec<f32>> {
     let mut converter = StreamingResampler::new(rate)?;
     let mut output = Vec::new();
@@ -327,6 +329,8 @@ pub fn resample(input: &[f32], rate: u32) -> Result<Vec<f32>> {
     Ok(output)
 }
 
+/// Test fixtures only; recordings are decoded with `crate::media`.
+#[cfg(test)]
 pub fn read_wav(path: impl AsRef<std::path::Path>) -> Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(path).context("Could not read WAV file")?;
     let spec = reader.spec();

@@ -33,6 +33,10 @@ anyhow = "1"
 cpal = "0.16"
 image = { version = "0.25", default-features = false, features = ["png"] }
 hound = "3.5"
+# Imported recordings: pure Rust demuxers and decoders (no Opus or video codecs).
+symphonia = { version = "0.6.1", default-features = false, features = ["aac", "alac", "flac", "mp3", "pcm", "vorbis", "isomp4", "mkv", "ogg", "wav"] }
+# Optional retained call audio is stored as FLAC segments, encoded in pure Rust.
+flacenc = { version = "0.5.1", default-features = false }
 ringbuf = "0.4"
 rubato = "0.16"
 serde = { version = "1", features = ["derive"] }

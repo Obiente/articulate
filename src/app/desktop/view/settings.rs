@@ -27,6 +27,7 @@ pub(crate) struct SettingsView<'a> {
     discord_auto_transcribe: bool,
     discord_companion: bool,
     vencord_auto_update: bool,
+    keep_call_audio: bool,
 }
 
 #[derive(Serialize)]
@@ -59,6 +60,7 @@ pub(crate) fn settings(app: &App) -> Settings<'_> {
             discord_auto_transcribe: settings.discord_auto_transcribe,
             discord_companion: settings.discord_companion,
             vencord_auto_update: settings.vencord_auto_update,
+            keep_call_audio: settings.keep_call_audio,
         },
         microphones: &app.microphones,
         outputs: &app.outputs,

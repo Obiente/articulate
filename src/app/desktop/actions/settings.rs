@@ -26,6 +26,7 @@ pub(crate) enum Action {
         discord_auto_connect: Option<bool>,
         discord_auto_transcribe: Option<bool>,
         vencord_auto_update: Option<bool>,
+        keep_call_audio: Option<bool>,
     },
 }
 
@@ -47,6 +48,7 @@ struct Preferences {
     discord_auto_connect: Option<bool>,
     discord_auto_transcribe: Option<bool>,
     vencord_auto_update: Option<bool>,
+    keep_call_audio: Option<bool>,
 }
 
 impl Preferences {
@@ -85,6 +87,7 @@ impl Preferences {
             &mut self.vencord_auto_update,
             &mut settings.vencord_auto_update,
         );
+        swap(&mut self.keep_call_audio, &mut settings.keep_call_audio);
     }
 }
 
@@ -112,6 +115,7 @@ impl App {
             discord_auto_connect,
             discord_auto_transcribe,
             vencord_auto_update,
+            keep_call_audio,
         } = action;
         let mut preferences = Preferences {
             cpu,
@@ -129,6 +133,7 @@ impl App {
             discord_auto_connect,
             discord_auto_transcribe,
             vencord_auto_update,
+            keep_call_audio,
         };
         self.desktop_validate_settings(&preferences, hotkey.as_ref(), quick_note_hotkey.as_ref())?;
         let reload_model = preferences

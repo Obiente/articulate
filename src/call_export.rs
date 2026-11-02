@@ -17,6 +17,38 @@ pub enum Format {
 /// Export a snapshot. Empty rows are omitted; subtitle formats additionally
 /// omit invalid/zero-duration ranges because they cannot form valid cues.
 pub fn export(rows: &[Row], names: &[String], format: Format) -> String {
+    export_with(rows, names, &[], format)
+}
+
+/// Write one interruption marker where the format allows it. SubRip has no
+/// comment syntax, so markers are left out rather than shown as captions.
+fn interruption(result: &mut String, gap: &calls::Interruption, format: Format) {
+    let message = single_line(&gap.message());
+    match format {
+        Format::Text => {
+            let _ = writeln!(result, "[{message}]\n");
+        }
+        Format::Markdown => {
+            let _ = writeln!(result, "> *{}*\n", markdown(&message));
+        }
+        // A NOTE block may sit between cues and cannot contain "-->".
+        Format::WebVtt => {
+            let _ = writeln!(result, "NOTE {}\n", message.replace("-->", "->"));
+        }
+        Format::Srt => {}
+    }
+}
+
+/// Export a snapshot with timestamped audio interruptions between turns.
+pub fn export_with(
+    rows: &[Row],
+    names: &[String],
+    interruptions: &[calls::Interruption],
+    format: Format,
+) -> String {
+    let mut gaps: Vec<&calls::Interruption> = interruptions.iter().collect();
+    gaps.sort_by_key(|gap| gap.start_ms);
+    let mut gaps = gaps.into_iter().peekable();
     let mut rows: Vec<_> = rows
         .iter()
         .filter(|r| !r.text.trim().is_empty() || !r.cues.is_empty())
@@ -29,6 +61,9 @@ pub fn export(rows: &[Row], names: &[String], format: Format) -> String {
         _ => String::new(),
     };
     for (index, row) in rows.iter().enumerate() {
+        while let Some(gap) = gaps.next_if(|gap| gap.start_ms <= row.start_ms) {
+            interruption(&mut result, gap, format);
+        }
         let label = calls::label(row, names);
         let label = if label.trim().is_empty() {
             "Uncertain speaker".to_owned()
@@ -70,6 +105,9 @@ pub fn export(rows: &[Row], names: &[String], format: Format) -> String {
                 );
             }
         }
+    }
+    for gap in gaps {
+        interruption(&mut result, gap, format);
     }
     result
 }
@@ -131,7 +169,12 @@ pub fn session(session: &Session, format: Format) -> anyhow::Result<String> {
         session.rows.clone()
     };
     if matches!(format, Format::Srt | Format::WebVtt) {
-        return Ok(export(&rows, &session.speaker_names, format));
+        return Ok(export_with(
+            &rows,
+            &session.speaker_names,
+            &session.interruptions,
+            format,
+        ));
     }
     let markdown_format = format == Format::Markdown;
     let heading = |text: &str, level: &str| {
@@ -228,7 +271,12 @@ pub fn session(session: &Session, format: Format) -> anyhow::Result<String> {
             );
         } else {
             let _ = writeln!(result, "{}\n", heading("Transcript", "##"));
-            let body = export(&rows, &session.speaker_names, format);
+            let body = export_with(
+                &rows,
+                &session.speaker_names,
+                &session.interruptions,
+                format,
+            );
             result.push_str(body.strip_prefix("# Call transcript\n\n").unwrap_or(&body));
         }
     }
@@ -472,5 +520,41 @@ mod tests {
         let output = export(&rows, &names, Format::Markdown);
         assert!(output.contains("**\\*Morgan\\***"));
         assert!(output.contains("\\[click\\](url)\n\\# heading \\<script\\> \\*\\*bold\\*\\*"));
+    }
+
+    #[test]
+    fn interruptions_appear_between_turns_where_the_format_allows() {
+        use crate::calls::interruptions::{Cause, Source};
+        let rows = [
+            row(0, 4000, &[1], "Before the gap."),
+            row(9000, 12000, &[1], "After the gap."),
+        ];
+        let gaps = [
+            calls::Interruption::new(5000, 8000, Source::Microphone, Cause::DeviceLost),
+            calls::Interruption::new(20000, 21000, Source::Processing, Cause::FellBehind),
+        ];
+        let names = calls::empty_speaker_names();
+        let marker = "Audio interrupted 00:05–00:08: microphone disconnected";
+        for format in [Format::Text, Format::Markdown, Format::WebVtt] {
+            let output = export_with(&rows, &names, &gaps, format);
+            let at = output
+                .find(marker)
+                .unwrap_or_else(|| panic!("{format:?}: {output}"));
+            // Markdown escapes the full stop, so search without it.
+            assert!(output.find("Before the gap").unwrap() < at);
+            assert!(at < output.find("After the gap").unwrap());
+            assert!(output.contains("transcription fell behind"), "{format:?}");
+        }
+        let vtt = export_with(&rows, &names, &gaps, Format::WebVtt);
+        assert!(vtt.contains(&format!("NOTE {marker}")));
+        // Cue numbers still count turns only.
+        assert!(vtt.contains("\n2\n00:00:09.000 --> 00:00:12.000"));
+        let srt = export_with(&rows, &names, &gaps, Format::Srt);
+        assert!(!srt.contains("interrupted"));
+        let mut session = Session::new(Kind::Call);
+        session.rows = rows.to_vec();
+        session.interruptions = gaps.to_vec();
+        let markdown = super::session(&session, Format::Markdown).unwrap();
+        assert!(markdown.contains(&format!("> *{marker}*")));
     }
 }

@@ -76,6 +76,8 @@ pub(crate) struct SessionMeta<'a> {
     is_collection: bool,
     can_receive_sources: bool,
     sources: Vec<SourceView<'a>>,
+    #[serde(flatten)]
+    calls: super::calls::SessionCalls<'a>,
 }
 
 impl<'a> SessionMeta<'a> {
@@ -102,6 +104,7 @@ impl<'a> SessionMeta<'a> {
                     preview: preview(&source.text),
                 })
                 .collect(),
+            calls: super::calls::SessionCalls::new(session),
         }
     }
 }

@@ -7,6 +7,7 @@
 use super::publish::{Cadence, Collector};
 use crate::app::App;
 
+pub(super) mod calls;
 pub(super) mod capture;
 pub(super) mod discord;
 pub(super) mod library;
@@ -39,10 +40,12 @@ pub(super) fn collect(app: &App, out: &mut Collector<'_>) {
     out.section("discord", Live, || discord::discord(app));
     out.section("updater", Live, || updates::updater(app));
     out.section("overlay", Live, || shell::overlay_section(app));
+    out.section("call_tools", Live, || calls::call_tools(app));
     out.section("history", Background, || library::history(app));
     out.section("document_body", Background, || library::document_body(app));
     out.section("vocabulary", Background, || settings::vocabulary(app));
     out.section("insights", Background, || library::insights(app));
+    out.section("people", Background, || calls::people(app));
 }
 
 /// The dictation indicator state, for the native indicator window.

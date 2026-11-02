@@ -60,6 +60,23 @@ export const actionCatalog = Object.freeze({
   update_check: {},
   update_download: {},
   update_install: { document: true },
+  // Conversations and speakers
+  speaker_rename: { document: true, preview: true },
+  speaker_merge: { document: true, preview: true },
+  speaker_reassign: { document: true, preview: true },
+  speaker_undo: { document: true, preview: true },
+  person_save: { preview: true },
+  person_delete: { preview: true },
+  people_clear: { preview: true },
+  audio_import_choose: { preview: true },
+  audio_import_start: { preview: true },
+  audio_import_cancel: { preview: true },
+  audio_import_dismiss: { preview: true },
+  audio_play: { preview: true },
+  audio_stop: { preview: true },
+  audio_delete: { document: true, preview: true },
+  transcript_rebuild: { document: true, preview: true },
+  transcript_restore: { document: true, preview: true },
 });
 
 export const changesDocument = (type) => Boolean(actionCatalog[type]?.document);
@@ -128,7 +145,32 @@ const validators = {
     if (!action.heard?.trim() || !action.wanted?.trim())
       throw Error("Fill in both words or phrases");
   },
+  speaker_rename(action) {
+    validSpeakerName(action.name);
+  },
+  speaker_reassign(action) {
+    if (!Array.isArray(action.rows) || !action.rows.length)
+      throw Error("Select at least one turn.");
+    if ((action.speaker === undefined) === (action.name === undefined))
+      throw Error("Choose one speaker or type a new name.");
+    if (action.name !== undefined) validSpeakerName(action.name);
+  },
+  person_save(action) {
+    validSpeakerName(action.name);
+  },
 };
+
+// Names chosen for speakers. Messages match the native controller's.
+export function validSpeakerName(name) {
+  const clean = (name ?? "").split(/\s+/u).filter(Boolean).join(" ");
+  if (!clean || [...clean].length > 80)
+    throw Error("Use a name from 1 to 80 characters.");
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(clean))
+    throw Error("Use a name without control characters.");
+  if (["you", "other audio", "uncertain speaker"].includes(clean.toLowerCase()))
+    throw Error("Choose a different name; that label is reserved.");
+  return clean;
+}
 
 // Validate an action before it reaches either transport.
 export function prepareAction(action) {

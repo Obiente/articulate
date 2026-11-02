@@ -1,5 +1,5 @@
 use crate::{
-    audio, call_capture, calls, classification, cleanup, discord, engine, model, speakers,
+    call_capture, classification, cleanup, discord, engine, file_pipeline, model, speakers,
 };
 use anyhow::{Context, Result};
 use std::{path::PathBuf, time::Instant};
@@ -40,7 +40,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     if args.iter().any(|a| a == "--help") {
         println!(
-            "Articulate\n\nNo arguments: open app\n--verify-assort-models: verify bundled classifiers\n--verify-native-audio-payload: verify the Discord audio payload\n--devices: list inference devices\n--transcribe <audio.wav> [--model <model.gguf>] [--language <code>] [--cpu] [--repeat <N>] [--live] [--live-primary] [--verify]\n--call-file <audio.wav> [--cpu]: transcribe remote audio with speaker labels\n--capture-check: check microphone and output capture for three seconds\n--discord-check [--seconds <1-60>] [--port <debugger port>]: check local Discord speaker metadata without recording audio\n--download-model: download and verify default model\n--download-verifier: download and verify optional Nemotron ASR model\n\nAudio and transcripts never leave this computer. Model download needs internet."
+            "Articulate\n\nNo arguments: open app\n--verify-assort-models: verify bundled classifiers\n--verify-native-audio-payload: verify the Discord audio payload\n--devices: list inference devices\n--transcribe <audio> [--model <model.gguf>] [--language <code>] [--cpu] [--repeat <N>] [--live] [--live-primary] [--verify]\n--call-file <audio> [--cpu]: transcribe remote audio with speaker labels\n    Audio: WAV, MP3, M4A, FLAC, Ogg Vorbis, or the audio track of MP4/MKV\n--capture-check: check microphone and output capture for three seconds\n--discord-check [--seconds <1-60>] [--port <debugger port>]: check local Discord speaker metadata without recording audio\n--download-model: download and verify default model\n--download-verifier: download and verify optional Nemotron ASR model\n\nAudio and transcripts never leave this computer. Model download needs internet."
         );
         return Ok(());
     }
@@ -68,20 +68,22 @@ pub fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if let Some(i) = args.iter().position(|a| a == "--call-file") {
-        let remote = audio::read_wav(args.get(i + 1).context("Supply a remote-audio WAV")?)?;
+        let remote = file_pipeline::read_mono(std::path::Path::new(
+            args.get(i + 1).context("Supply a remote-audio file")?,
+        ))?;
         let token = transcribe_cpp::CancelToken::new();
         let cpu = args.iter().any(|a| a == "--cpu");
         let mut engine = engine::Engine::load(&model::default_path(), cpu, &token)?;
-        let mut tracker = speakers::Tracker::new(cpu)?;
-        for (window, pcm) in remote.chunks(8 * 16000).enumerate() {
-            let rows = calls::process_window(
-                &mut engine,
-                &mut tracker,
-                &vec![0.0; pcm.len()],
-                pcm,
-                window as u64 * 8000,
-                true,
-            )?;
+        // The same windows as an imported conversation, one JSON line each.
+        let mut call = file_pipeline::Call::new(Some(speakers::Tracker::new(cpu)?));
+        for pcm in remote.chunks(8 * 16000) {
+            let rows = call.push(&mut engine, &[], pcm)?;
+            if !rows.is_empty() {
+                println!("{}", serde_json::to_string(&rows)?);
+            }
+        }
+        let rows = call.finish(&mut engine)?;
+        if !rows.is_empty() {
             println!("{}", serde_json::to_string(&rows)?);
         }
         return Ok(());
@@ -99,7 +101,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if let Some(i) = args.iter().position(|a| a == "--transcribe") {
         let input = args
             .get(i + 1)
-            .context("Supply a WAV file after --transcribe")?;
+            .context("Supply an audio file after --transcribe")?;
         let model = args
             .iter()
             .position(|a| a == "--model")
@@ -131,7 +133,7 @@ pub fn run(args: &[String]) -> Result<()> {
             .transpose()?
             .unwrap_or(1);
         anyhow::ensure!((1..=20).contains(&repeat), "Repeat count must be 1 to 20");
-        let pcm = audio::read_wav(input)?;
+        let pcm = file_pipeline::read_mono(std::path::Path::new(input))?;
         let started = Instant::now();
         let cancel = transcribe_cpp::CancelToken::new();
         let mut engine = engine::Engine::load_with_language(
@@ -160,11 +162,10 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         for run in 0..repeat {
             let started = Instant::now();
-            let text = if args.iter().any(|a| a == "--verify") {
-                engine.transcribe_final(&pcm)?
-            } else {
-                engine.transcribe(&pcm)?
-            };
+            // The same windows as an imported dictation.
+            let mut dictation = file_pipeline::Dictation::new(args.iter().any(|a| a == "--verify"));
+            dictation.push(&mut engine, &pcm)?;
+            let text = dictation.finish(&mut engine)?;
             println!(
                 "{}",
                 serde_json::json!({"text": text, "backend": engine.backend, "audio_ms": pcm.len() * 1000 / 16000, "load_ms": load_ms, "transcribe_ms": started.elapsed().as_millis(), "run": run + 1})

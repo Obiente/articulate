@@ -601,6 +601,11 @@ impl App {
             self.settings.encrypt_at_rest = previous;
             return Err(error.to_string());
         }
+        // Known people follow the same protection; retained audio is
+        // migrated with the history files.
+        if let Err(error) = self.call_tools.people.set_protection(enabled) {
+            log::warn!("{error:#}");
+        }
         self.history.protection = None;
         match &self.history.worker {
             Some(worker) => {
@@ -723,6 +728,7 @@ impl App {
                 passphrase,
                 settings,
                 library,
+                include_audio: false,
             });
         }
         Ok(())

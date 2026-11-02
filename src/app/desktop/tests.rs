@@ -102,6 +102,8 @@ fn snapshot_sections_have_a_locked_shape() {
         ("discord", set(&["discord"])),
         ("updater", set(&["updater"])),
         ("overlay", set(&["overlay"])),
+        ("call_tools", set(&["audio_import", "playback"])),
+        ("people", set(&["people", "people_error"])),
         ("history", set(&["history"])),
         ("document_body", set(&["selected_body"])),
         ("vocabulary", set(&["dictionary", "macros"])),
@@ -129,6 +131,10 @@ fn snapshot_sections_have_a_locked_shape() {
         "is_collection",
         "can_receive_sources",
         "sources",
+        "interruptions",
+        "speaker_undo",
+        "audio",
+        "transcript_versions",
     ]);
     assert_eq!(keys(&state["selected"]), session_meta);
     assert_eq!(keys(&state["call_session"]), session_meta);
@@ -144,6 +150,7 @@ fn snapshot_sections_have_a_locked_shape() {
         "end_ms",
         "speaker",
         "speaker_labels",
+        "speaker_keys",
         "text",
         "cues",
         "provisional",
@@ -187,6 +194,7 @@ fn snapshot_sections_have_a_locked_shape() {
             "discord_auto_transcribe",
             "discord_companion",
             "vencord_auto_update",
+            "keep_call_audio",
         ])
     );
     assert_eq!(
