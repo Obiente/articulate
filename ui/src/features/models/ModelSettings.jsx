@@ -32,6 +32,7 @@ export function ModelSettings({ controls }) {
     controls;
   const { pending, patch, action } = controls;
   const [customModel, setCustomModel] = useState("");
+  const [pickerError, setPickerError] = useState("");
   return (
     <>
       <SettingsSection id="settings-models" icon={Sparkle} title="Models">
@@ -125,16 +126,22 @@ export function ModelSettings({ controls }) {
             variant="default"
             disabled={state.preview || modelBusy || busy}
             onClick={async () => {
+              setPickerError("");
               try {
                 const path = await invoke("desktop_model_file");
                 if (path) setCustomModel(path);
               } catch (error) {
-                window.alert(String(error));
+                setPickerError(String(error));
               }
             }}
           >
             Browse for GGUF file
           </Button>
+          {pickerError && (
+            <Text c="red" role="alert">
+              {pickerError}
+            </Text>
+          )}
           <TextInput
             mt="md"
             label="Custom model file"

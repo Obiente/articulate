@@ -119,6 +119,36 @@ mod tests {
         assert_eq!(parse(&["--seconds".into(), "2".into()]).unwrap().seconds, 2);
     }
     #[test]
+    fn explicit_paths_and_missing_model_are_handled_without_inference() {
+        let directory = std::env::temp_dir().join(format!(
+            "articulate-bench-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let model = directory.join("missing.gguf");
+        let output = directory.join("report.json");
+        let args = vec![
+            "--model".into(),
+            model.to_string_lossy().into_owned(),
+            "--json".into(),
+            output.to_string_lossy().into_owned(),
+        ];
+        let options = parse(&args).unwrap();
+        assert_eq!(options.model, Some(model));
+        assert_eq!(options.json, Some(output.clone()));
+        assert!(
+            run(&args)
+                .unwrap_err()
+                .to_string()
+                .contains("No model is installed")
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
     fn report_has_no_paths_or_transcripts() {
         let report = Report {
             schema_version: 1,

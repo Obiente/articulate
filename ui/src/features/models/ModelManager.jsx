@@ -35,14 +35,14 @@ export function ModelManager({ controls }) {
     speaker: models.speakers_progress,
     sound_cues: models.context_progress,
     polish: models.cleanup_progress,
-    notes: state.notes?.progress,
+    notes: state.notes?.download_progress,
   };
   const working = {
     speech: state.downloading != null,
     verifier: models.verifier_working,
     speaker: models.speakers_working,
     sound_cues: models.context_progress != null,
-    polish: models.cleanup_working,
+    polish: models.cleanup_working && !models.cleanup_installed,
     notes: state.notes?.downloading,
   };
   const cancel = (id) =>

@@ -245,6 +245,18 @@ mod tests {
     }
 
     #[test]
+    fn preview_contract_excludes_runtime_details() {
+        let (mut app, _) = super::super::tests::app();
+        prepared_preview(&mut app);
+        let status = serde_json::to_value(app.desktop_cleanup_status()).unwrap();
+        let preview = status["preview"].as_object().unwrap();
+        assert_eq!(preview.len(), 5);
+        for key in ["original", "source", "text", "blocked", "cleanup_only"] {
+            assert!(preview.contains_key(key));
+        }
+    }
+
+    #[test]
     fn cancelling_discards_a_completed_preview() {
         let (mut app, _) = super::super::tests::app();
         prepared_preview(&mut app);

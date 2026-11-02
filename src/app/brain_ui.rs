@@ -217,6 +217,7 @@ impl App {
             progress: state.and_then(|s| s.progress),
             download_status: &self.brain.download_status,
             downloading: self.brain.download.is_some(),
+            download_progress: self.brain.download_progress,
         }
     }
 
@@ -722,6 +723,7 @@ pub(crate) struct NotesStatus<'a> {
     progress: Option<f32>,
     download_status: &'a str,
     pub downloading: bool,
+    download_progress: Option<f32>,
 }
 
 #[cfg(test)]

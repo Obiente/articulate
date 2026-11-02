@@ -30,7 +30,7 @@ impl App {
                 }
             }
             Action::ModelDelete { id } => {
-                if !self.desktop_active_downloads().is_empty() {
+                if !self.desktop_active_downloads().is_empty() || self.polish_working() {
                     return Err("Finish or cancel downloads before deleting a model.".into());
                 }
                 model::delete_model(id).map_err(|e| e.to_string())?;

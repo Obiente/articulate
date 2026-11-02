@@ -693,6 +693,7 @@ fn model_review_shapes_are_locked() {
             "status",
             "progress",
             "download_status",
+            "download_progress",
             "downloading"
         ])
     );
@@ -748,4 +749,21 @@ fn review_actions_validate_fields_and_cancel_without_changing_text() {
     assert!(!app.settings.automatic_update_checks);
     assert!(app.settings.close_to_tray);
     assert!(app.settings.start_with_windows);
+}
+
+#[test]
+fn model_cancellation_targets_the_requested_transfer() {
+    let (mut app, _) = app();
+    let speech = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let verifier = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.model_cancels
+        .insert(model::ModelId::Speech, speech.clone());
+    app.model_cancels
+        .insert(model::ModelId::Verifier, verifier.clone());
+    app.desktop_action(action(
+        json!({"type":"model_download_cancel", "id":"verifier"}),
+    ))
+    .unwrap();
+    assert!(verifier.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!speech.load(std::sync::atomic::Ordering::Relaxed));
 }

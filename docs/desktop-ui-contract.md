@@ -156,7 +156,7 @@ nonactivating overlay follow capture acknowledgements and stop boundaries,
 independently of renderer updates. They never imply that final transcription
 or persistence has completed.
 
-`notes`, `selected_notes`, `call_notes` and `note_notes` share one shape: `{ ready, acceleration_installed, working, status, progress, download_status, downloading }`. `notes` follows the selected document, or the current call when nothing is selected; the others are scoped to the selected document, the current call and the current spoken note.
+`notes`, `selected_notes`, `call_notes` and `note_notes` share one shape: `{ ready, acceleration_installed, working, status, progress, download_status, download_progress, downloading }`. `notes` follows the selected document, or the current call when nothing is selected; the others are scoped to the selected document, the current call and the current spoken note.
 
 Discord snapshots distinguish `listener_started` from fresh `connected`
 membership, with `in_voice`, `audio_ready`, `pairing_state`, `automatic_status`,
@@ -198,4 +198,4 @@ exposed in the renderer. There is no legacy UI build.
 
 `assort` is `{working: boolean, status: string, candidates: null|Candidate[], scores: null|Score[]}`. A candidate contains `entry`, `proposed` and `context`; a score contains `candidate` (index) and `replace_score` (uncalibrated preference). `assort_start {app?: string}`, `assort_apply {index, saved_spelling}` and `assort_cancel` never apply automatically. Applying a choice ends that review; review again for another choice against the updated text.
 
-The four notes status values are typed as `{ready, acceleration_installed, working, status, progress, download_status, downloading}`. Existing field names and nullability are preserved.
+The four notes status values are typed as `{ready, acceleration_installed, working, status, progress, download_status, download_progress, downloading}`. Existing field names and nullability are preserved; `download_progress` adds a nullable download fraction.
