@@ -73,7 +73,9 @@ export function MeetingIndicator({ indicator }) {
     <div className="meeting-indicator" role="status">
       <Record size={16} weight="fill" />
       <span>{indicator.title}</span>
-      {indicator.status && <small>{indicator.status}</small>}
+      {indicator.status && !indicator.status.startsWith(indicator.title) && (
+        <small>{indicator.status}</small>
+      )}
     </div>
   );
 }
