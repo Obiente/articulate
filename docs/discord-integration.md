@@ -5,22 +5,32 @@ Articulate offers an optional connection to the user-enabled local debugger in t
 ## Connect the desktop client
 
 1. In Articulate's **Calls > Setup**, choose **Relaunch Discord**, then **Relaunch and connect**. This disconnects any active Discord call. Articulate preserves its current transcript and capture session.
-2. Articulate finds the latest stable client beneath `$env:LOCALAPPDATA`, closes only matching installed Discord processes, and opens it with `--remote-debugging-port=9222 --remote-debugging-address=127.0.0.1`. This runs in the background without modifying installed files. Articulate connects automatically afterward.
-3. Rejoin your Discord voice channel. The card shows current participants and who is speaking. If Discord is already running with debugging enabled, use **Connect** without relaunching. **Manual connection** also retains the copyable PowerShell command; quit Discord completely before running it.
+2. Articulate finds the latest installed client beneath `$env:LOCALAPPDATA`, closes only matching installed Discord processes, and opens it with `--remote-debugging-port=<random port> --remote-debugging-address=127.0.0.1`. The port is chosen at random from the dynamic range for every launch and remembered only in Articulate's local settings. This runs in the background without modifying installed files. Articulate connects automatically afterward.
+3. Rejoin your Discord voice channel. The card shows current participants and who is speaking. If Discord is already running with debugging enabled, use **Connect** without relaunching; a manual launch uses port 9222 unless Articulate chose one. **Manual connection** also retains the copyable PowerShell command; quit Discord completely before running it.
 4. Select the output device Discord uses and start call capture. The microphone remains **You**. Names are used only where the activity evidence is sufficiently consistent; uncertain sections keep acoustic labels.
-5. Disconnect in Articulate when finished. This stops its observer; it does not disable Discord's debugger. Quit Discord and reopen it normally to remove debugging access.
+5. When finished, choose **Restart Discord without the debugger**. Articulate offers this after a capture ends and when you switch to the companion. Disconnecting alone stops Articulate's observer but leaves Discord's debugger open until Discord is restarted normally.
 
-The debugger grants broad access to the local Discord renderer. Keep it on loopback, do not forward the port, and enable it only when wanted. Articulate does not read messages, account tokens, or account storage, and does not modify Discord's installed files or substitute its native audio callbacks. No Discord developer application or approved RPC scope is needed for this route. Discord itself still requires its normal network connection for calls.
+**Stable, PTB and Canary.** Articulate recognises `Discord`, `DiscordPTB` and `DiscordCanary` installations and their renderers at `discord.com`, `ptb.discord.com` and `canary.discord.com`. With several editions installed, stable is used unless you choose another edition in Settings; two test editions without stable need an explicit choice before relaunching.
+
+**Why a port and not a pipe.** Articulate launches Discord itself, so Chromium's `--remote-debugging-pipe` was considered: it is supported by Electron on Windows (the protocol runs over C-runtime file descriptors 3 and 4, which a parent supplies through the `STARTUPINFO` handle block that Node and Puppeteer also populate). It was rejected because Electron quits the application when that pipe disconnects, so closing or crashing Articulate would end the user's Discord call, and because the pipe speaks the browser-level session protocol rather than the page endpoint used here. The debugger therefore stays on a loopback TCP port, chosen at random for each launch and closed again by a normal restart.
+
+While the debugger is open, **any program running under your Windows account can read or control that Discord window**, including messages and account storage, until Discord is restarted normally. Articulate shows this notice while it knows the debugger is open. Keep it on loopback, do not forward the port, and enable it only when wanted. Articulate itself does not read messages, account tokens, or account storage, and does not modify Discord's installed files or substitute its native audio callbacks. No Discord developer application or approved RPC scope is needed for this route. Discord itself still requires its normal network connection for calls.
 
 Names and activity are held in bounded process memory. Copied or saved transcripts contain the display-name labels. A speaking indicator supplies metadata, not participant-separated audio: simultaneous speech remains overlap, and unrelated sounds from the same output device cannot reliably be assigned to a Discord participant. Timing alignment and real-world accuracy require controlled-call validation; local speech recognition remains fallible.
 
 Developers can check connectivity without capturing audio:
 
 ```powershell
-.\target\release\articulate.exe --discord-check --seconds 10
+.\target\release\articulate.exe --discord-check --seconds 10 --port 9222
 ```
 
-The check prints aggregate counts, not names or account IDs.
+The check prints aggregate counts, not names or account IDs. `--port` defaults to 9222; pass the port Articulate reports in Settings after a relaunch.
+
+## Meeting detection for Teams, Zoom and Google Meet
+
+Articulate can also notice meetings in other applications and offer, or start, a transcript the same way it does for Discord voice channels. This is **off by default** and enabled per application in Settings, with a choice between **Ask before starting** and **Start automatically**. Detection combines two local signals: the application's process is running, and that process holds an active Windows audio capture session. Google Meet is detected through a browser process holding the microphone, which any other web call would also do, so it is labelled best-effort. Both the start and the end are debounced (three seconds of evidence to start, five seconds without it to finish) so brief glitches never start or finish a transcript.
+
+Detection only produces events. Starting a transcript goes through the same path as Discord's automatic capture, using mixed microphone and output audio without participant separation, and a transcript you finish manually is not restarted until the meeting ends. Every prompt and start carries this reminder: *Recording a meeting may require the consent of everyone taking part. Tell the other participants that a transcript is being made and check the rules that apply where you and they are.*
 
 ## What StreamKit actually does
 

@@ -40,7 +40,7 @@ pub fn run(args: &[String]) -> Result<()> {
     }
     if args.iter().any(|a| a == "--help") {
         println!(
-            "Articulate\n\nNo arguments: open app\n--verify-assort-models: verify bundled classifiers\n--verify-native-audio-payload: verify the Discord audio payload\n--devices: list inference devices\n--transcribe <audio.wav> [--model <model.gguf>] [--language <code>] [--cpu] [--repeat <N>] [--live] [--live-primary] [--verify]\n--call-file <audio.wav> [--cpu]: transcribe remote audio with speaker labels\n--capture-check: check microphone and output capture for three seconds\n--discord-check [--seconds <1-60>]: check local Discord speaker metadata without recording audio\n--download-model: download and verify default model\n--download-verifier: download and verify optional Nemotron ASR model\n\nAudio and transcripts never leave this computer. Model download needs internet."
+            "Articulate\n\nNo arguments: open app\n--verify-assort-models: verify bundled classifiers\n--verify-native-audio-payload: verify the Discord audio payload\n--devices: list inference devices\n--transcribe <audio.wav> [--model <model.gguf>] [--language <code>] [--cpu] [--repeat <N>] [--live] [--live-primary] [--verify]\n--call-file <audio.wav> [--cpu]: transcribe remote audio with speaker labels\n--capture-check: check microphone and output capture for three seconds\n--discord-check [--seconds <1-60>] [--port <debugger port>]: check local Discord speaker metadata without recording audio\n--download-model: download and verify default model\n--download-verifier: download and verify optional Nemotron ASR model\n\nAudio and transcripts never leave this computer. Model download needs internet."
         );
         return Ok(());
     }
@@ -191,7 +191,18 @@ fn discord_check(args: &[String]) -> Result<()> {
         .transpose()?
         .unwrap_or(10);
     anyhow::ensure!((1..=60).contains(&seconds), "Use 1 to 60 seconds");
-    let connection = discord::Connection::start();
+    let port: u16 = args
+        .iter()
+        .position(|a| a == "--port")
+        .map(|i| {
+            args.get(i + 1)
+                .context("Supply a loopback port after --port")?
+                .parse()
+                .context("Invalid port")
+        })
+        .transpose()?
+        .unwrap_or(discord::DEFAULT_DEBUGGER_PORT);
+    let connection = discord::Connection::start(port);
     let start = Instant::now();
     let mut connected = false;
     let mut peak_participants = 0;
