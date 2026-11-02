@@ -1136,15 +1136,18 @@ impl App {
     }
 }
 
+/// The running probe thread: its result channel and its stop flag.
+type ProbeHandle = (
+    Receiver<Result<Vec<meetings::Evidence>, String>>,
+    Arc<AtomicBool>,
+);
+
 /// Application-side state for meeting detection: the background probe, the
 /// debounced detector and which capture, if any, this feature owns.
 #[derive(Default)]
 pub(super) struct MeetingGlue {
     detector: meetings::Detector,
-    probe: Option<(
-        Receiver<Result<Vec<meetings::Evidence>, String>>,
-        Arc<AtomicBool>,
-    )>,
+    probe: Option<ProbeHandle>,
     probe_error: Option<String>,
     latest: Option<Vec<meetings::Evidence>>,
     pending_start: Option<meetings::App>,
