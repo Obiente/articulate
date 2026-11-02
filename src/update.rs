@@ -595,6 +595,22 @@ fn verify_reader(reader: &mut impl Read, size: u64, digest: &[u8; 32]) -> Result
 mod tests {
     use super::*;
     #[test]
+    fn cleanup_keeps_only_the_pending_installer_directory() {
+        let root = std::env::temp_dir().join(crate::discord::plugin::new_token().unwrap());
+        let pending = root.join("pending");
+        let stale = root.join("stale");
+        fs::create_dir_all(&pending).unwrap();
+        fs::create_dir(&stale).unwrap();
+        fs::write(pending.join("setup.exe"), b"synthetic").unwrap();
+        fs::write(stale.join("setup.part"), b"partial").unwrap();
+        prune_downloads(&root, Some(&pending)).unwrap();
+        assert!(pending.join("setup.exe").exists());
+        assert!(!stale.exists());
+        prune_downloads(&root, None).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir(root).unwrap();
+    }
+    #[test]
     fn signature_switch_preserves_legacy_updates_by_default() {
         let result = verify_manifest(b"", b"", "1.0.0", "setup.exe", 42, &[0; 32]);
         assert_eq!(result.is_err(), cfg!(feature = "signed-updates"));
