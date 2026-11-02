@@ -63,9 +63,14 @@ export const actionCatalog = Object.freeze({
   discord_disconnect: {},
   discord_retry: {},
   discord_relaunch: {},
+  discord_relaunch_normally: { preview: true },
+  discord_rotate_key: { preview: true },
+  discord_forget_pairing: { preview: true },
   companion_detect: {},
   companion_install: {},
   companion_open_installer: {},
+  // Meeting detection
+  meeting_respond: { preview: true },
   // Updates
   update_check: {},
   update_download: {},
@@ -132,6 +137,20 @@ const validators = {
           "This shortcut is reserved for Windows or editing. Choose another chord.",
         );
     }
+    if (
+      action.discord_flavor !== undefined &&
+      !["", "stable", "ptb", "canary"].includes(action.discord_flavor)
+    )
+      throw Error("Choose Discord, Discord PTB or Discord Canary.");
+    if (
+      action.meetings_start !== undefined &&
+      !["ask", "automatic"].includes(action.meetings_start)
+    )
+      throw Error("Choose whether to ask first or start automatically.");
+  },
+  meeting_respond(action) {
+    if (typeof action.accept !== "boolean")
+      throw Error("Choose whether to start the transcript.");
   },
   session_patch(action) {
     if (action.title !== undefined && !validTitle(action.title))

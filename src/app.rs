@@ -74,7 +74,7 @@ struct Settings {
     discord_avatars: bool,
     vencord_source: String,
     vencord_auto_update: bool,
-    meetings: discord_ui::meetings::Settings,
+    meetings: crate::meetings::Settings,
     assort: assort_ui::Configuration,
     polish_style: crate::polish::Style,
     /// Encrypt history and this file with Windows DPAPI for the current user.

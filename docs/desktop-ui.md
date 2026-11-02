@@ -28,7 +28,7 @@ Open `http://127.0.0.1:4173`. This preview uses synthetic documents stored in th
 - Notetaker for personal notes, Conversations for meetings and calls, and Dictation for recent dictations. Saved documents include transcript search and participant labels.
 - Vocabulary and snippets with searchable lists and accessible editing dialogs.
 - Insights calculated from retained local dictations.
-- Settings for shortcuts, hold or toggle behavior, audio devices, automatic cleanup, Discord auto-connect and capture, and local speech and notes models.
+- Settings for shortcuts, hold or toggle behavior, audio devices, automatic cleanup, Discord edition, pairing, pictures, auto-connect and capture, meeting detection for Teams, Zoom and Google Meet, and local speech and notes models.
 
 Document edits save after a short delay. Navigation, note generation and window close drain pending edits first. A failed save keeps changes available for retry. Manual note edits remain protected from automatic generation by the existing Rust controller.
 
@@ -52,13 +52,13 @@ Rust (`src/app/desktop/`):
 | `bridge.rs` | The controller thread, panic isolation, controller health and the close handshake. |
 | `publish.rs` | Section revisions, byte-level change detection, row splices and the shared published state. |
 | `view.rs` | The section registry (`collect`). |
-| `view/*.rs` | Typed views by area: `shell`, `capture` (dictation, calls, spoken notes, live rows), `library` (history, open document, insights), `settings` (preferences, vocabulary), `models`, `discord`, `updates`, `rows`. |
+| `view/*.rs` | Typed views by area: `shell`, `capture` (dictation, calls, spoken notes, live rows), `library` (history, open document, insights), `settings` (preferences, vocabulary), `models`, `discord` (connection, participants, companion), `meetings` (meeting detection), `updates`, `rows`. |
 | `actions.rs` | Routes a renderer action to the feature that declares its `type`. |
-| `actions/*.rs` | One action enum and `App` handler per feature: `library`, `capture`, `output`, `vocabulary`, `settings`, `models`, `discord`, `updates`. |
+| `actions/*.rs` | One action enum and `App` handler per feature: `library`, `capture`, `output`, `vocabulary`, `settings`, `models`, `discord` (including pairing and meeting prompts), `updates`. |
 | `lifecycle.rs` | Shutdown, capture readiness, download guards and document edit locks. |
 | `tests.rs` | Contract tests: section shapes, key ownership and the action list. |
 
-`src/main.rs` registers the IPC commands, forwards published sections as Tauri events, runs the close handshake and the indicator window. `src/diagnostics.rs` owns logging.
+`src/main.rs` registers the IPC commands (including `desktop_discord_avatar`, which serves cached participant pictures to the main window), forwards published sections as Tauri events, runs the close handshake and the indicator window. `src/diagnostics.rs` owns logging.
 
 Frontend (`ui/src/`):
 
@@ -72,7 +72,7 @@ Frontend (`ui/src/`):
 | `hooks/` | Document edit autosave, the close handshake and the list virtualizer. |
 | `components/` | Shared page, dialog and settings-row components. |
 | `lib/format.js` | Dates, durations, shortcuts and language names. |
-| `features/<area>/` | `dictation`, `library`, `notes` (document reader), `calls` (transcript rows, speaker timeline, call setup), `capture`, `vocabulary`, `insights`, `settings`, `discord`, `models`, `updates`, `overlay`. |
+| `features/<area>/` | `dictation`, `library`, `notes` (document reader), `calls` (transcript rows, speaker timeline, call setup), `capture`, `vocabulary`, `insights`, `settings`, `discord` (settings, participant list, the reusable `ParticipantAvatar`), `meetings` (settings section, detection prompt and indicator), `models`, `updates`, `overlay`. |
 
 ### Adding an action
 

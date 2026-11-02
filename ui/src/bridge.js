@@ -41,6 +41,16 @@ export async function action(command) {
   return preview.action(prepared);
 }
 
+// PNG bytes for a `bytes://discord-avatar/...` identifier from the Discord
+// participant list, or null while the picture is not cached yet.
+export async function participantAvatar(uri) {
+  if (!native) return preview.avatar(uri);
+  const bytes = await invoke("desktop_discord_avatar", { uri });
+  const view =
+    bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : (bytes ?? []);
+  return view.length ? view : null;
+}
+
 // The close handshake: acknowledge the request, save edits, then close.
 export async function onCloseRequested(handler) {
   if (!native) return () => {};

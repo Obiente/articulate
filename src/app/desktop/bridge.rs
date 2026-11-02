@@ -45,6 +45,8 @@ const UNVERIFIED: &str =
 
 enum Request {
     Action(Action, Sender<Result<(), String>>),
+    /// A cached participant picture for a `bytes://discord-avatar/...` identifier.
+    Avatar(String, Sender<Option<Vec<u8>>>),
     Shutdown(Sender<Result<(), String>>),
 }
 
@@ -188,6 +190,19 @@ fn running(app: &mut App, requests: &Receiver<Request>, publisher: &mut Publishe
         }
         let (request, reply) = match requests.recv_timeout(POLL_INTERVAL) {
             Ok(Request::Action(action, reply)) => (Some(action), reply),
+            Ok(Request::Avatar(uri, reply)) => {
+                let bytes = catch_unwind(AssertUnwindSafe(|| app.desktop_discord_avatar(&uri)));
+                match bytes {
+                    Ok(bytes) => {
+                        let _ = reply.send(bytes);
+                        continue;
+                    }
+                    Err(panic) => {
+                        let _ = reply.send(None);
+                        return Exit::Failed(panic_message(panic));
+                    }
+                }
+            }
             Ok(Request::Shutdown(reply)) => (None, reply),
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Exit::Quit,
@@ -243,6 +258,9 @@ fn failed(app: &mut App, requests: &Receiver<Request>, publisher: &mut Publisher
         match request {
             Request::Action(_, reply) => {
                 let _ = reply.send(Err(UNAVAILABLE.into()));
+            }
+            Request::Avatar(_, reply) => {
+                let _ = reply.send(None);
             }
             Request::Shutdown(reply) => {
                 match catch_unwind(AssertUnwindSafe(|| app.desktop_shutdown())) {
@@ -465,6 +483,13 @@ impl Bridge {
         response
             .recv()
             .map_err(|_| "The application controller stopped.".to_owned())?
+    }
+
+    /// A cached participant picture, or `None` while it is not available.
+    pub(crate) fn avatar(&self, uri: String) -> Option<Vec<u8>> {
+        let (reply, response) = mpsc::channel();
+        self.sender.try_send(Request::Avatar(uri, reply)).ok()?;
+        response.recv().ok().flatten()
     }
 
     /// Ask the controller to save everything and stop.

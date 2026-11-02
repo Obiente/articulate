@@ -111,6 +111,7 @@ fn snapshot_sections_have_a_locked_shape() {
             set(&["model_status", "downloading", "managed_models", "cleanup"]),
         ),
         ("discord", set(&["discord"])),
+        ("meetings", set(&["meetings"])),
         ("updater", set(&["updater"])),
         ("overlay", set(&["overlay"])),
         ("history", set(&["history"])),
@@ -207,8 +208,80 @@ fn snapshot_sections_have_a_locked_shape() {
             "close_to_tray",
             "start_with_windows",
             "automatic_update_checks",
+            "discord_flavor",
+            "discord_avatars",
+            "meetings_teams",
+            "meetings_zoom",
+            "meetings_meet",
+            "meetings_start",
         ])
     );
+    assert_eq!(
+        keys(&state["discord"]),
+        set(&[
+            "connected",
+            "listener_started",
+            "status",
+            "in_voice",
+            "audio_ready",
+            "audio_status",
+            "audio_message",
+            "participants",
+            "pairing_state",
+            "pairing_key_present",
+            "companion_protocol",
+            "companion_protocol_message",
+            "flavor",
+            "installed_flavors",
+            "debugger_port",
+            "debugger_open",
+            "debugger_notice",
+            "automatic_can_retry",
+            "error",
+            "relaunching",
+            "companion_selected",
+            "automatic_status",
+            "companion",
+        ])
+    );
+    assert_eq!(
+        keys(&state["discord"]["companion"]),
+        set(&[
+            "checked",
+            "installed",
+            "runtime_status",
+            "source_found",
+            "active",
+            "busy",
+            "status",
+            "error",
+            "plugin_status",
+            "can_build",
+            "native_audio",
+            "installer_ready",
+        ])
+    );
+    assert_eq!(
+        keys(&state["meetings"]),
+        set(&[
+            "enabled",
+            "settings",
+            "consent_reminder",
+            "active",
+            "prompt",
+            "owned",
+            "status",
+            "probe_error",
+            "events",
+        ])
+    );
+    assert_eq!(
+        keys(&state["meetings"]["settings"]),
+        set(&["teams", "zoom", "meet", "start"])
+    );
+    assert_eq!(state["meetings"]["settings"]["start"], "ask");
+    assert_eq!(state["discord"]["companion_protocol"], "unknown");
+    assert!(state["discord"].get("meetings").is_none());
     assert_eq!(
         keys(&state["model_status"]),
         set(&[
@@ -393,6 +466,136 @@ fn a_settings_patch_is_validated_completely_before_anything_changes() {
         app.settings.microphone.is_none(),
         "empty selects the default"
     );
+}
+
+#[test]
+fn discord_edition_avatars_and_meeting_settings_are_validated_and_saved() {
+    let (mut app, _) = app();
+    let patch = |value: Value| {
+        let mut object = json!({"type": "settings_patch"});
+        object
+            .as_object_mut()
+            .unwrap()
+            .extend(value.as_object().unwrap().clone());
+        action(object)
+    };
+    // Unknown editions and modes are rejected before anything changes.
+    assert!(
+        app.desktop_action(patch(
+            json!({"discord_flavor": "beta", "meetings_zoom": true})
+        ))
+        .is_err()
+    );
+    assert!(!app.settings.meetings.zoom);
+    assert!(
+        serde_json::from_value::<Action>(
+            json!({"type": "settings_patch", "meetings_start": "always"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<Action>(
+            json!({"type": "settings_patch", "discord_debugger_port": 9222})
+        )
+        .is_err(),
+        "the debugger port is chosen by the relaunch, never by the renderer"
+    );
+    // Editions are accepted when no installation list is known yet.
+    app.desktop_action(patch(json!({"discord_flavor": " Canary "})))
+        .unwrap();
+    assert_eq!(app.settings.discord_flavor, "canary");
+    // The edition is frozen while the debugger is open.
+    app.settings.discord_debugger_port = 51234;
+    let error = app
+        .desktop_action(patch(json!({"discord_flavor": "stable"})))
+        .unwrap_err();
+    assert!(error.contains("debugger"), "{error}");
+    assert_eq!(app.settings.discord_flavor, "canary");
+    app.settings.discord_debugger_port = 0;
+    app.desktop_action(patch(json!({"discord_flavor": ""})))
+        .unwrap();
+    assert_eq!(app.settings.discord_flavor, "");
+    // Meeting preferences and the start mode round-trip through the view.
+    app.desktop_action(patch(json!({
+        "meetings_teams": true,
+        "meetings_meet": true,
+        "meetings_start": "automatic",
+        "discord_avatars": false,
+    })))
+    .unwrap();
+    assert!(app.settings.meetings.teams && app.settings.meetings.meet);
+    assert!(!app.settings.meetings.zoom);
+    assert_eq!(
+        app.settings.meetings.start,
+        crate::meetings::StartMode::Automatic
+    );
+    assert!(!app.settings.discord_avatars);
+    let state = app.desktop_snapshot();
+    assert_eq!(state["settings"]["meetings_teams"], true);
+    assert_eq!(state["settings"]["meetings_start"], "automatic");
+    assert_eq!(state["settings"]["discord_avatars"], false);
+    assert_eq!(state["meetings"]["enabled"], true);
+    assert_eq!(state["meetings"]["settings"]["meet"], true);
+    assert_eq!(state["meetings"]["prompt"], Value::Null);
+    assert!(
+        state["meetings"]["consent_reminder"]
+            .as_str()
+            .unwrap()
+            .contains("consent")
+    );
+    let restored: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
+    assert!(restored.meetings.teams && !restored.discord_avatars);
+}
+
+#[test]
+fn pairing_and_meeting_actions_are_routed_and_guarded() {
+    let (mut app, _) = app();
+    assert!(
+        app.desktop_action(action(json!({"type": "meeting_respond", "accept": true})))
+            .is_err(),
+        "no meeting is waiting"
+    );
+    assert!(
+        serde_json::from_value::<Action>(json!({"type": "meeting_respond"})).is_err(),
+        "an answer is required"
+    );
+    app.settings.discord_pairing_key = crate::discord::plugin::new_token().unwrap();
+    app.settings.discord_companion = true;
+    app.settings.discord_auto_connect = false;
+    let previous = app.settings.discord_pairing_key.clone();
+    app.desktop_action(action(json!({"type": "discord_rotate_key"})))
+        .unwrap();
+    assert_ne!(app.settings.discord_pairing_key, previous);
+    assert!(crate::discord::plugin::valid_token(
+        &app.settings.discord_pairing_key
+    ));
+    assert_eq!(
+        app.desktop_snapshot()["discord"]["pairing_key_present"],
+        true
+    );
+    app.desktop_action(action(json!({"type": "discord_forget_pairing"})))
+        .unwrap();
+    assert!(app.settings.discord_pairing_key.is_empty());
+    assert!(!app.settings.discord_auto_connect);
+    assert!(app.discord.is_none());
+    assert_eq!(
+        app.desktop_snapshot()["discord"]["pairing_key_present"],
+        false
+    );
+    // A recording keeps the key and the Discord process alone.
+    app.call = Some(call_capture::Control::new());
+    for kind in [
+        "discord_rotate_key",
+        "discord_forget_pairing",
+        "discord_relaunch_normally",
+    ] {
+        assert!(
+            app.desktop_action(action(json!({"type": kind}))).is_err(),
+            "{kind}"
+        );
+    }
+    assert!(app.settings.discord_pairing_key.is_empty());
 }
 
 #[test]

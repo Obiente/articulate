@@ -40,6 +40,10 @@ import { InsightsPage } from "./features/insights/InsightsPage.jsx";
 import { LibraryPage } from "./features/library/LibraryPage.jsx";
 import { Reader } from "./features/notes/Reader.jsx";
 import { SettingsPage } from "./features/settings/SettingsPage.jsx";
+import {
+  MeetingIndicator,
+  useMeetingNotices,
+} from "./features/meetings/useMeetingNotices.jsx";
 import { useUpdateNotices } from "./features/updates/useUpdateNotices.jsx";
 import { SnippetsPage } from "./features/vocabulary/SnippetsPage.jsx";
 import { VocabularyPage } from "./features/vocabulary/VocabularyPage.jsx";
@@ -142,6 +146,7 @@ export function App() {
     return () => cancelAnimationFrame(frame);
   }, [page, settingsTarget]);
   const notices = useUpdateNotices({ state, act, showSettingsSection });
+  const meeting = useMeetingNotices({ state, act });
   // Open a saved document in the page and workspace for its kind.
   const open = useCallback(
     async (id) => {
@@ -372,6 +377,7 @@ export function App() {
           ref={contentScroll}
           className={`main-content ${readerPages.includes(page) && workspace !== "library" ? "reader-mode" : ""}`}
         >
+          <MeetingIndicator indicator={meeting} />
           {controller?.state === "failed" && (
             <Alert color="red" title="Articulate stopped working" mb="md">
               {controller.message} Your latest changes could not be verified as

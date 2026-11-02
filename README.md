@@ -40,7 +40,9 @@ The optional [Vencord companion](docs/vencord.md) sends current voice participan
 
 The custom companion includes a [native receive adapter](plugins/discord-native/README.md) for separate participant audio by default. Its synthetic tests pass; real desktop-call validation is still pending. On unsupported clients, mixed output capture can use fresh Discord activity for names without acoustic classification, but cannot reliably separate overlapping voices. The interface distinguishes these audio sources. After pairing, Discord connects automatically; an optional setting starts and finishes transcripts on confirmed call joins and leaves. Stable, PTB and Canary clients are supported. [Connection details →](docs/discord-integration.md)
 
-Optional, off-by-default meeting detection can notice Microsoft Teams, Zoom and (best-effort) Google Meet calls and ask before starting a transcript, or start one automatically, with a reminder to get participants' consent.
+Settings shows the Discord edition to use, warns while Discord runs in debugger mode and offers to relaunch it normally, asks you to update the companion or Articulate when their local protocol versions differ, and lets you rotate or forget the companion pairing key. Voice-channel participants appear with their Discord pictures, which can be turned off.
+
+Optional, off-by-default meeting detection can notice Microsoft Teams, Zoom and (best-effort) Google Meet calls and ask before starting a transcript, or start one automatically, with a reminder to get participants' consent. Each application is enabled separately under **Settings → Meeting detection**; a detected meeting shows a small **Start transcript / Not now** notice, and a running meeting transcript is indicated at the top of the window until the meeting ends.
 
 ## Updates and privacy
 

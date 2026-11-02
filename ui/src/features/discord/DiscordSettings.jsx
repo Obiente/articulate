@@ -1,19 +1,22 @@
 import { useEffect, useState } from "react";
 import {
+  Alert,
   Badge,
   Button,
   Group,
+  Modal,
   Paper,
   Select,
   Stack,
   Text,
 } from "@mantine/core";
-import { Waveform } from "@phosphor-icons/react";
+import { ShieldWarning, Waveform } from "@phosphor-icons/react";
 import {
   SettingRow,
   SettingsSection,
   SetupStatus,
 } from "../../components/SettingRow.jsx";
+import { DiscordParticipants } from "./DiscordParticipants.jsx";
 
 const companionRuntimes = {
   current: {
@@ -47,6 +50,35 @@ const companionRuntimes = {
   },
 };
 
+const editionLabels = {
+  stable: "Discord",
+  ptb: "Discord PTB",
+  canary: "Discord Canary",
+};
+
+// Actions that interrupt a call or invalidate the companion's pairing are
+// confirmed here, with the consequence spelled out.
+const confirmations = {
+  discord_relaunch_normally: {
+    title: "Restart Discord without the debugger?",
+    message:
+      "Discord will close and reopen normally, which disconnects any current voice call. The local debugger port closes with it, so other programs can no longer read or control that Discord window.",
+    action: "Restart Discord",
+  },
+  discord_rotate_key: {
+    title: "Rotate the pairing key?",
+    message:
+      "Articulate generates a new pairing key. Every copy of the old key stops working at once. The current companion picks up the new key from this computer within a few seconds and pairs again by itself; older companions must be updated first.",
+    action: "Rotate key",
+  },
+  discord_forget_pairing: {
+    title: "Forget the companion pairing?",
+    message:
+      "The pairing key is removed and Articulate stops listening for the companion. Nothing can connect with the old key again. Choose Connect later to pair again with a fresh key; the companion must be running in Discord to pick it up.",
+    action: "Forget pairing",
+  },
+};
+
 // Discord connection, companion setup and automatic call capture.
 export function DiscordSettings({ controls }) {
   const { state, settings, busy, capturing, pending, action, toggle } =
@@ -70,18 +102,94 @@ export function DiscordSettings({ controls }) {
   const companionNeedsUpdate =
     companion.runtime_status === "update_required" ||
     companion.plugin_status === "update_available";
+  const protocol = discord.companion_protocol;
+  const installedFlavors = discord.installed_flavors || [];
   const [discordMode, setDiscordMode] = useState(
     settings.discord_companion ? "companion" : "standard",
   );
+  const [confirmation, setConfirmation] = useState(null);
   useEffect(() => {
     setDiscordMode(settings.discord_companion ? "companion" : "standard");
   }, [settings.discord_companion]);
+  const confirming = confirmation
+    ? confirmations[confirmation]
+    : confirmations.discord_rotate_key;
+  const openUpdates = () =>
+    document
+      .getElementById("settings-updates")
+      ?.scrollIntoView({ block: "start", behavior: "smooth" });
   return (
     <SettingsSection
       id="settings-discord"
       icon={Waveform}
       title="Discord calls"
     >
+      {discord.debugger_open && (
+        <Alert
+          color="yellow"
+          variant="light"
+          icon={<ShieldWarning size={20} />}
+          title="Discord is running in debugger mode"
+          mb="md"
+          role="alert"
+        >
+          <Text size="sm">
+            {discord.debugger_notice ||
+              "Any program on this computer can read or control that Discord window until you restart Discord without the debugger."}
+            {discord.debugger_port
+              ? ` The debugger listens on loopback port ${discord.debugger_port}.`
+              : ""}
+          </Text>
+          <Button
+            mt="sm"
+            size="sm"
+            color="yellow"
+            variant="light"
+            loading={
+              discord.relaunching || pending === "discord_relaunch_normally"
+            }
+            disabled={capturing || busy || discord.relaunching}
+            onClick={() => setConfirmation("discord_relaunch_normally")}
+          >
+            Relaunch Discord normally
+          </Button>
+        </Alert>
+      )}
+      {(protocol === "outdated" || protocol === "newer") && (
+        <Alert
+          color={protocol === "outdated" ? "yellow" : "red"}
+          variant="light"
+          title={
+            protocol === "outdated"
+              ? "Update the companion"
+              : "Update Articulate"
+          }
+          mb="md"
+          role="alert"
+        >
+          <Text size="sm">
+            {discord.companion_protocol_message ||
+              (protocol === "outdated"
+                ? "The Discord companion speaks an older protocol. Update it, then restart Discord."
+                : "The Discord companion is newer than this Articulate version.")}
+          </Text>
+          {protocol === "outdated" ? (
+            <Button
+              mt="sm"
+              size="sm"
+              onClick={() => action("companion_install")}
+              loading={companion.busy && pending !== "companion_detect"}
+              disabled={companion.busy || capturing || busy}
+            >
+              Update companion
+            </Button>
+          ) : (
+            <Button mt="sm" size="sm" variant="light" onClick={openUpdates}>
+              Check for app updates
+            </Button>
+          )}
+        </Alert>
+      )}
       <Paper withBorder radius="lg" className="secondary-settings-card">
         <SettingRow
           title="Discord connection"
@@ -131,6 +239,74 @@ export function DiscordSettings({ controls }) {
           </Stack>
         </SettingRow>
         {discord.error && <SetupStatus error={discord.error} />}
+        {discord.connected && (
+          <>
+            <SettingRow
+              title="Voice channel"
+              description={
+                discord.in_voice
+                  ? "Who is in the call right now, and who is speaking."
+                  : "Participants appear here once you join a voice channel."
+              }
+            >
+              <Badge variant="light" color={discord.in_voice ? "mint" : "gray"}>
+                {discord.in_voice ? "In a voice channel" : "Not in a channel"}
+              </Badge>
+            </SettingRow>
+            <DiscordParticipants
+              participants={discord.participants}
+              inVoice={discord.in_voice}
+            />
+          </>
+        )}
+        <SettingRow
+          title="Discord edition"
+          description={
+            installedFlavors.length > 1
+              ? "Which installed Discord to restart and read activity from. Stable is used unless you choose another edition."
+              : installedFlavors.length === 1
+                ? `${editionLabels[installedFlavors[0]] || installedFlavors[0]} is the only installed edition.`
+                : "No Discord installation was found yet. The list updates after Discord is installed or connected."
+          }
+        >
+          <Select
+            aria-label="Discord edition"
+            allowDeselect={false}
+            value={settings.discord_flavor || ""}
+            disabled={
+              busy ||
+              discord.relaunching ||
+              discord.debugger_open ||
+              capturing ||
+              installedFlavors.length === 0
+            }
+            onChange={(value) =>
+              value !== null && controls.patch("discord_flavor", value)
+            }
+            data={[
+              {
+                value: "",
+                label:
+                  installedFlavors.length > 1
+                    ? "Automatic (prefer Discord)"
+                    : "Automatic",
+              },
+              ...installedFlavors.map((id) => ({
+                value: id,
+                label: editionLabels[id] || id,
+              })),
+              ...(settings.discord_flavor &&
+              !installedFlavors.includes(settings.discord_flavor)
+                ? [
+                    {
+                      value: settings.discord_flavor,
+                      label: `${editionLabels[settings.discord_flavor] || settings.discord_flavor} (not found)`,
+                    },
+                  ]
+                : []),
+            ]}
+          />
+        </SettingRow>
         {usingCompanion && (
           <>
             <SettingRow
@@ -138,19 +314,44 @@ export function DiscordSettings({ controls }) {
               description={
                 discord.pairing_state === "waiting"
                   ? "Use the latest companion, then restart Discord. Pairing happens automatically."
-                  : "The companion pairs automatically with Articulate on this computer."
+                  : discord.pairing_key_present
+                    ? "The companion pairs automatically with Articulate on this computer. Rotate the key to lock out every copy of the old one; forget the pairing to stop listening entirely."
+                    : "No pairing key is stored. Connecting creates a fresh key that the companion picks up automatically."
               }
             >
-              <Badge
-                variant="light"
-                color={discord.pairing_state === "paired" ? "mint" : "gray"}
-              >
-                {discord.pairing_state === "paired"
-                  ? "Paired"
-                  : discord.pairing_state === "waiting"
-                    ? "Waiting for companion"
-                    : "Automatic pairing"}
-              </Badge>
+              <Stack gap="xs" align="flex-end">
+                <Badge
+                  variant="light"
+                  color={discord.pairing_state === "paired" ? "mint" : "gray"}
+                >
+                  {discord.pairing_state === "paired"
+                    ? "Paired"
+                    : discord.pairing_state === "waiting"
+                      ? "Waiting for companion"
+                      : "Automatic pairing"}
+                </Badge>
+                <Group gap="xs" justify="flex-end" wrap="wrap">
+                  <Button
+                    variant="default"
+                    size="sm"
+                    loading={pending === "discord_rotate_key"}
+                    disabled={busy || capturing}
+                    onClick={() => setConfirmation("discord_rotate_key")}
+                  >
+                    Rotate pairing key
+                  </Button>
+                  <Button
+                    variant="subtle"
+                    color="red"
+                    size="sm"
+                    loading={pending === "discord_forget_pairing"}
+                    disabled={busy || capturing || !discord.pairing_key_present}
+                    onClick={() => setConfirmation("discord_forget_pairing")}
+                  >
+                    Forget pairing
+                  </Button>
+                </Group>
+              </Stack>
             </SettingRow>
             <SettingRow
               title="Participant audio"
@@ -197,13 +398,14 @@ export function DiscordSettings({ controls }) {
               Check installation
             </Button>
             {(companionNeedsUpdate ||
+              protocol === "outdated" ||
               companion.plugin_status !== "current") && (
               <Button
                 onClick={() => action("companion_install")}
                 loading={companion.busy && pending !== "companion_detect"}
                 disabled={companion.busy || capturing || busy}
               >
-                {companionNeedsUpdate
+                {companionNeedsUpdate || protocol === "outdated"
                   ? "Update companion"
                   : "Install companion"}
               </Button>
@@ -264,6 +466,12 @@ export function DiscordSettings({ controls }) {
           </SettingRow>
         )}
         <SettingRow
+          title="Participant pictures"
+          description="Show Discord profile pictures next to participants. Pictures are fetched from Discord over HTTPS and kept in a small local cache; turn this off to show initials only."
+        >
+          {toggle("discord_avatars", "Show Discord participant pictures")}
+        </SettingRow>
+        <SettingRow
           title="Connect automatically"
           description="Connect to Discord when Articulate is open."
         >
@@ -292,6 +500,35 @@ export function DiscordSettings({ controls }) {
           </Group>
         )}
       </Paper>
+      <Modal
+        opened={Boolean(confirmation)}
+        onClose={() => !pending && setConfirmation(null)}
+        title={confirming.title}
+        centered
+        size="md"
+      >
+        <Text c="dimmed">{confirming.message}</Text>
+        <Group justify="flex-end" mt="xl">
+          <Button
+            variant="default"
+            disabled={Boolean(pending)}
+            onClick={() => setConfirmation(null)}
+          >
+            Cancel
+          </Button>
+          <Button
+            color={
+              confirmation === "discord_forget_pairing" ? "red" : undefined
+            }
+            loading={Boolean(pending)}
+            onClick={async () => {
+              if (await action(confirmation)) setConfirmation(null);
+            }}
+          >
+            {confirming.action}
+          </Button>
+        </Group>
+      </Modal>
     </SettingsSection>
   );
 }
