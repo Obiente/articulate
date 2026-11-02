@@ -5,6 +5,8 @@ import { notifications } from "@mantine/notifications";
 import { native } from "../../bridge.js";
 import { createUpdateNoticeTracker, updateNotices } from "./update-notices.js";
 
+import { shouldCheckUpdates } from "./update-policy.js";
+
 const DAY = 24 * 60 * 60 * 1000;
 
 export function useUpdateNotices({ state, act, showSettingsSection }) {
@@ -21,20 +23,21 @@ export function useUpdateNotices({ state, act, showSettingsSection }) {
 
   // Check once at startup, then daily while the window stays open.
   const ready = Boolean(state?.settings);
+  const enabled = state?.settings?.automatic_update_checks === true;
   useEffect(() => {
-    if (!native || !ready || checked.current) return;
+    if (!native || !ready || !enabled || checked.current) return;
     checked.current = true;
     if (updaterState.current === "idle")
       void act({ type: "update_check" }).catch(() => {});
-  }, [ready, act]);
+  }, [ready, enabled, act]);
   useEffect(() => {
-    if (!native) return;
+    if (!native || !enabled) return;
     const interval = setInterval(() => {
-      if (["idle", "latest", "error"].includes(updaterState.current))
+      if (shouldCheckUpdates(enabled, updaterState.current))
         void act({ type: "update_check" }).catch(() => {});
     }, DAY);
     return () => clearInterval(interval);
-  }, [act]);
+  }, [act, enabled]);
 
   useEffect(() => {
     for (const notice of tracker.current(notices)) {

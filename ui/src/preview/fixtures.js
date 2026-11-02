@@ -178,5 +178,8 @@ export const sampleSettings = {
   discord_auto_transcribe: false,
   discord_companion: true,
   vencord_auto_update: false,
+  automatic_update_checks: true,
+  close_to_tray: false,
+  start_with_windows: false,
   cpu: false,
 };

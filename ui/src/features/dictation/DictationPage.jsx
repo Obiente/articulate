@@ -1,3 +1,4 @@
+import { PolishPanel } from "../polish/PolishPanel.jsx";
 import { useMemo } from "react";
 import { Badge, Button, Group, Kbd } from "@mantine/core";
 import { ArrowUpRight, Copy, Microphone, Stop } from "@phosphor-icons/react";
@@ -87,6 +88,7 @@ export function DictationPage({ state, act, open, settings, binding }) {
               {state.recording ? "LIVE TRANSCRIPT" : "YOUR WORDS, READY TO USE"}
             </div>
             <Group gap="xs">
+              <PolishPanel state={state} act={act} />
               <TranscriptEditor
                 key={state.dictation_session?.id || "latest"}
                 session={state.dictation_session}

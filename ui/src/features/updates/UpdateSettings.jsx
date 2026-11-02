@@ -1,4 +1,4 @@
-import { Button, Group, Paper } from "@mantine/core";
+import { Button, Group, Paper, Switch } from "@mantine/core";
 import { ArrowClockwise, DownloadSimple } from "@phosphor-icons/react";
 import {
   SettingRow,
@@ -18,6 +18,34 @@ export function UpdateSettings({ controls }) {
       title="App updates"
     >
       <Paper withBorder radius="lg" className="secondary-settings-card">
+        <SettingRow
+          title="Keep Articulate in the tray"
+          description="Closing the window hides it. Choose Quit from the tray to save and exit."
+        >
+          {controls.toggle("close_to_tray", "Close to tray")}
+        </SettingRow>
+        <SettingRow
+          title="Start with Windows"
+          description="Open in the tray when you sign in."
+        >
+          {controls.toggle("start_with_windows", "Start with Windows")}
+        </SettingRow>
+        <SettingRow
+          title="Automatic update checks"
+          description="Check on launch and daily while Articulate is open."
+        >
+          <Switch
+            aria-label="Automatic update checks"
+            checked={state.settings.automatic_update_checks === true}
+            disabled={busy}
+            onChange={(event) =>
+              controls.patch(
+                "automatic_update_checks",
+                event.currentTarget.checked,
+              )
+            }
+          />
+        </SettingRow>
         <SettingRow
           title={
             updater.state === "available" || updater.state === "ready"

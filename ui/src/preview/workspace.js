@@ -56,6 +56,22 @@ export function createPreviewWorkspace(storage) {
   let selected = null;
   let sample = {
     preview: true,
+    cleanup: { installed: true, working: false, status: "", preview: null },
+    assort: { working: false, status: "", candidates: null, scores: null },
+    managed_models: [
+      "speech",
+      "verifier",
+      "speaker",
+      "sound_cues",
+      "polish",
+      "notes",
+    ].map((id) => ({
+      id,
+      installed: true,
+      in_use: id === "speech",
+      disk_size: 250000000,
+      path: `models/${id}.gguf`,
+    })),
     ready: true,
     loading: false,
     busy: false,
@@ -69,7 +85,7 @@ export function createPreviewWorkspace(storage) {
     status: "Ready when you are",
     call_status: "Ready to capture a conversation",
     seconds: 0,
-    text: "",
+    text: "Hello Casey can you review the plan",
     original: "",
     call_rows: [],
     note_rows: [],
@@ -154,6 +170,58 @@ export function createPreviewWorkspace(storage) {
   const record = (id) => records.find((s) => s.id === id);
 
   const handlers = {
+    polish_start() {
+      sample.cleanup.preview = {
+        original: sample.text,
+        source: sample.text,
+        text: sample.text + ".",
+        blocked: null,
+        cleanup_only: false,
+      };
+    },
+    polish_apply() {
+      if (sample.cleanup.preview) sample.text = sample.cleanup.preview.text;
+      sample.cleanup.preview = null;
+    },
+    polish_cancel() {
+      sample.cleanup.preview = null;
+    },
+    assort_start() {
+      sample.assort = {
+        working: false,
+        status: "Review suggestions before applying",
+        candidates: [
+          {
+            context: "Please ask casey to review the plan.",
+            entry: { heard: "casey", wanted: "Casey" },
+          },
+        ],
+        scores: [{ candidate: 0, replace_score: 0.82 }],
+      };
+    },
+    assort_apply() {
+      sample.assort = {
+        working: false,
+        status: "Choice saved. Review again for the next choice.",
+        candidates: null,
+        scores: null,
+      };
+    },
+    assort_cancel() {
+      sample.assort = {
+        working: false,
+        status: "Cancelled",
+        candidates: null,
+        scores: null,
+      };
+    },
+    model_delete({ id }) {
+      const model = sample.managed_models.find((m) => m.id === id);
+      if (model.in_use) throw Error("This model is in use");
+      model.installed = false;
+      model.disk_size = 0;
+    },
+
     history_open(action) {
       if (!record(action.id)) throw Error("This note is no longer available.");
       selected = action.id;

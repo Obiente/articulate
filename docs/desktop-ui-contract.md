@@ -1,6 +1,6 @@
 # Desktop UI bridge
 
-The `articulate` binary is a Tauri shell that runs the application controller on one Rust-owned thread. Tauri is the sole interface and requires no feature flag. The renderer never receives audio buffers, native handles, the Discord pairing key or the model folder.
+The `articulate` binary is a Tauri shell that runs the application controller on one Rust-owned thread. Tauri is the sole interface and requires no feature flag. The renderer never receives audio buffers, native handles, the Discord pairing key or arbitrary filesystem contents. Managed model paths are exposed only for the local model manager.
 
 ## State sections
 
@@ -19,13 +19,13 @@ Sections are typed serde views in `src/app/desktop/view/`; the registry is `view
 | `document` | `selected` | Live |
 | `notes` | `notes`, `selected_notes`, `call_notes`, `note_notes` | Live |
 | `settings` | `settings`, `microphones`, `outputs` | Live |
-| `models` | `model_status`, `downloading` | Live |
+| `models` | `model_status`, `downloading`, `managed_models`, `cleanup` | Live |
 | `discord` | `discord` | Live |
 | `updater` | `updater` | Live |
 | `overlay` | `overlay` | Live |
 | `history` | `history` | Background |
 | `document_body` | `selected_body` | Background |
-| `vocabulary` | `dictionary`, `macros` | Background |
+| `vocabulary` | `dictionary`, `macros`, `assort` | Background |
 | `insights` | `insights` | Background |
 
 Live sections are compared every 250 ms. Background sections (large lists and document bodies) are compared about once a second, after every action, and in the same pass whenever `document` changes, so a newly opened document arrives with its body. Comparison serializes the borrowed view into a reused buffer and compares bytes; nothing is sent for unchanged sections.
@@ -185,3 +185,17 @@ Insights contain `words`, `sessions`, `words_per_minute`, `current_streak`, `lon
 The Tauri interface includes model installation, companion setup and application
 updates. Per-app writing-style editing and manual Polish previews are not yet
 exposed in the renderer. There is no legacy UI build.
+
+## Model and review controls
+
+`managed_models` is an array of `{id, installed, disk_size, path, in_use}`. IDs are `speech`, `verifier`, `speaker`, `sound_cues`, `polish`, `notes`. Paths are local display information and must never enter telemetry or shareable reports. `model_delete {id}` rejects leased models. `model_download_cancel {id}` cancels speech, verifier, speaker or sound-cue downloads. Notes and cleanup retain their dedicated cancellation actions.
+
+`desktop_model_file()` opens a native GGUF file dialog outside the controller, returning a path or null. The renderer applies it with the existing validated `settings_patch {model_path}` action.
+
+`settings_patch` additionally accepts `automatic_update_checks`, `close_to_tray`, `start_with_windows`. These booleans are included in `settings`; defaults are true, false, false. Explicit `update_check` remains independent of automatic checks.
+
+`cleanup` is `{installed: boolean, working: boolean, status: string, progress: number|null, preview: null|{original: string, source: string, text: string, blocked: string|null, cleanup_only: boolean}}`. `polish_start`, `polish_apply` and `polish_cancel` use the existing current-utterance checks. Blocked edits cannot apply unless the preview is cleanup-only.
+
+`assort` is `{working: boolean, status: string, candidates: null|Candidate[], scores: null|Score[]}`. A candidate contains `entry`, `proposed` and `context`; a score contains `candidate` (index) and `replace_score` (uncalibrated preference). `assort_start {app?: string}`, `assort_apply {index, saved_spelling}` and `assort_cancel` never apply automatically. Applying a choice ends that review; review again for another choice against the updated text.
+
+The four notes status values are typed as `{ready, acceleration_installed, working, status, progress, download_status, downloading}`. Existing field names and nullability are preserved.

@@ -38,7 +38,15 @@ export const actionCatalog = Object.freeze({
   macro_delete: { preview: true },
   // Settings
   settings_patch: { preview: true },
+  polish_start: { preview: true },
+  polish_apply: { preview: true },
+  polish_cancel: { preview: true },
+  assort_start: { preview: true },
+  assort_apply: { preview: true },
+  assort_cancel: { preview: true },
   // Models
+  model_delete: { preview: true },
+  model_download_cancel: {},
   model_download: {},
   model_load: {},
   summary_download: {},

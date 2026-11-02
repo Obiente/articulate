@@ -108,3 +108,7 @@ distinguishes raw output, light filler/grammar editing, and more extensive clari
 editing. Articulate uses the same broad need as a reference, while retaining an
 explicit local preview for the generative stage. It does not claim equivalent
 model quality or identical behavior.
+
+## Desktop review
+
+Choose **Polish** beside a finished dictation. The dialog shows the safe baseline and a textual diff of the proposed edit. **Apply** saves an allowed preview; **Keep original** and **Cancel** discard it. Blocked previews explain why the edit was rejected; cleanup-only previews can still be applied explicitly. A missing cleanup model offers a download with progress and cancellation.
