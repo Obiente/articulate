@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use std::sync::mpsc::Sender;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LineBreak {
     #[default]
     Enter,
@@ -612,6 +612,7 @@ mod win {
         updates
     }
 
+    #[allow(dead_code, reason = "Compatibility wrapper for default line breaks")]
     pub fn insert(expected: Target, text: &str, same_field: impl Fn() -> bool) -> Result<()> {
         send_text(expected, text, false, LineBreak::Enter, same_field)
     }

@@ -2,6 +2,7 @@ use crate::{dictionary::Entry, platform::Target};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 pub enum Action {
+    LineBreak(crate::platform::LineBreak),
     Arm(u64, Target, bool),
     Preview {
         id: u64,
@@ -141,6 +142,7 @@ mod win {
         target: Target,
         field: IUIAutomationElement,
         live: Option<crate::live::win::Session>,
+        line_break: platform::LineBreak,
     }
     struct Watch {
         target: Target,
@@ -250,6 +252,7 @@ mod win {
             target,
             field,
             live,
+            line_break: platform::LineBreak::Enter,
         })
     }
     fn editable(field: &IUIAutomationElement) -> Result<()> {
@@ -342,7 +345,7 @@ mod win {
             });
         }
         let before = if learn { contents(&armed.field) } else { None };
-        platform::insert(target, text, || {
+        platform::insert_with_line_break(target, text, armed.line_break, || {
             !cancel.is_cancelled() && same(ui, target, &armed.field)
         })?;
         let Some(before) = before else {
@@ -387,6 +390,7 @@ mod win {
         let _com = initialized.then_some(Com);
         let ui = initialized.then(automation).and_then(Result::ok);
         let mut armed: Option<Armed> = None;
+        let mut line_break = platform::LineBreak::Enter;
         let mut insertion_failure: Option<String> = None;
         let mut watch: Option<Watch> = None;
         let mut polled = Instant::now();
@@ -398,12 +402,20 @@ mod win {
                     watch = None;
                 }
                 Ok(Action::StopLearning) => watch = None,
+                Ok(Action::LineBreak(value)) => line_break = value,
                 Ok(Action::Arm(id, target, use_live)) => {
                     watch = None;
                     let result = ui
                         .as_ref()
                         .context("Windows text-field access is unavailable")
-                        .and_then(|ui| arm(ui, id, target, use_live));
+                        .and_then(|ui| arm(ui, id, target, use_live))
+                        .map(|mut armed| {
+                            armed.line_break = line_break;
+                            if let Some(live) = &mut armed.live {
+                                live.line_break = line_break;
+                            }
+                            armed
+                        });
                     insertion_failure = result.as_ref().err().map(|error| format!("{error:#}"));
                     armed = result.ok();
                     if use_live {

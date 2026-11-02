@@ -10,7 +10,7 @@ use crate::app::App;
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::Value;
 
-pub(super) mod capture;
+pub(crate) mod capture;
 pub(super) mod discord;
 pub(super) mod library;
 pub(super) mod models;
