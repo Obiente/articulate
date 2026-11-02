@@ -15,7 +15,7 @@ Built with Rust, Tauri, React and Mantine, with a local C/C++ inference runtime.
 - **Keep the conversation.** Use Conversations to capture meetings from any app, with optional Discord participant tracks. Read speaker turns alongside an editable Notes document, with automatic local updates when the notes model is installed. Notetaker keeps your written and spoken notes together.
 - **Find what matters.** Build [local notes](docs/local-summaries.md) from calls and dictations, then review and edit the document with expandable transcript sources. Search full saved transcripts and personal notes from the sidebar.
 - **See your progress.** [Insights](docs/insights.md) shows retained dictation words, measured pace, vocabulary and cleanup changes, app usage and daily activity. Everything stays on this device.
-- **Return to it later.** Local History keeps transcripts, originals, notes, and speaker names. Search, rename, copy, export, or delete a session.
+- **Return to it later.** Local History keeps transcripts, originals, notes, and speaker names. Search, rename, pin, copy, export, or delete a session. Optional encryption at rest, retention rules, and portable backups are covered in [saved sessions](docs/development.md#saved-sessions).
 - **Review context with Assort.** The included pretrained vocabulary classifier reviews saved spelling choices against the sentence and destination app. Choose **Review vocabulary** without configuring model paths, then review suggestions before applying them. Meeting notes use the separate local language model.
 
 ## Install
@@ -44,7 +44,7 @@ The custom companion includes a [native receive adapter](plugins/discord-native/
 
 Articulate checks for a release on launch and once a day while open. Update notices appear throughout the workspace. Downloads remain your choice, are verified against the GitHub asset's SHA-256 digest, and install after recording has finished and pending history saves have completed. Models and saved sessions survive updates.
 
-Speech runs locally after models are downloaded. Model downloads contact Hugging Face; app update checks and downloads contact GitHub. The Discord companion uses loopback. Participant pictures are fetched from Discord's CDN and cached locally. Text is never sent for transcription or correction. Saved text, notes, preferences and models live under `%LOCALAPPDATA%\TranscribeLocal`; audio is not saved. Uninstalling keeps this local data.
+Speech runs locally after models are downloaded. Model downloads contact Hugging Face; app update checks and downloads contact GitHub. The Discord companion uses loopback. Participant pictures are fetched from Discord's CDN and cached locally. Text is never sent for transcription or correction. Saved text, notes, preferences and models live under `%LOCALAPPDATA%\TranscribeLocal`; audio is not saved, and temporary audio left by an interrupted call analysis is removed at the next start. History and preferences can optionally be encrypted for your Windows account. Uninstalling keeps this local data.
 
 The initial Windows build is **unsigned**, so Windows may show an unknown-publisher warning. Obtain binaries from this repository's Releases page.
 
