@@ -109,10 +109,11 @@ export function Reader({
       end.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   }, [tail, live, follow, tab]);
   const run = (command) => void act(command).catch(() => {});
-  const accepted = (command) => act(command).then(
-    () => true,
-    () => false,
-  );
+  const accepted = (command) =>
+    act(command).then(
+      () => true,
+      () => false,
+    );
   const moveSource = (source, topicId) =>
     setMoving({ ...source, topic_id: topicId ?? null });
   const noteWords = countWords(notes);
@@ -238,7 +239,10 @@ export function Reader({
                   })
                 }
               >
-                <PushPin size={19} weight={session.pinned ? "fill" : "regular"} />
+                <PushPin
+                  size={19}
+                  weight={session.pinned ? "fill" : "regular"}
+                />
               </ActionIcon>
             </Tooltip>
           )}

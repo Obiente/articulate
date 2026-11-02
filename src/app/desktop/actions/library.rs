@@ -26,9 +26,11 @@ impl SearchFilters {
         };
         let speaker = text(self.speaker);
         let app = text(self.app);
-        if [&speaker, &app].into_iter().flatten().any(|value| {
-            value.chars().count() > 160 || value.chars().any(char::is_control)
-        }) {
+        if [&speaker, &app]
+            .into_iter()
+            .flatten()
+            .any(|value| value.chars().count() > 160 || value.chars().any(char::is_control))
+        {
             return Err("Use a speaker or app name of up to 160 characters.".into());
         }
         if let (Some(from), Some(to)) = (self.from_ms, self.to_ms)
@@ -473,7 +475,11 @@ mod tests {
     #[test]
     fn search_reports_highlighted_hits_for_the_current_query_and_filters() {
         let (mut app, directory) = library_app("search");
-        let session = saved_session(&mut app, Kind::Note, "We reviewed the café budget together.");
+        let session = saved_session(
+            &mut app,
+            Kind::Note,
+            "We reviewed the café budget together.",
+        );
         wait(&mut app, "the search index", |app| {
             app.history
                 .worker
@@ -482,10 +488,22 @@ mod tests {
                 .is_some_and(|index| index.is_ready())
         });
         assert!(act(&mut app, json!({"type": "history_search", "query": "café", "filters": {"from_ms": 5, "to_ms": 1}})).unwrap_err().contains("start date"));
-        assert!(act(&mut app, json!({"type": "history_search", "query": "café", "filters": {"colour": "red"}})).is_err());
-        act(&mut app, json!({"type": "history_search", "query": " café ", "filters": {"kind": "note"}})).unwrap();
+        assert!(
+            act(
+                &mut app,
+                json!({"type": "history_search", "query": "café", "filters": {"colour": "red"}})
+            )
+            .is_err()
+        );
+        act(
+            &mut app,
+            json!({"type": "history_search", "query": " café ", "filters": {"kind": "note"}}),
+        )
+        .unwrap();
         assert_eq!(app.desktop_snapshot()["search"]["working"], true);
-        wait(&mut app, "search results", |app| app.saved_search.results.is_some());
+        wait(&mut app, "search results", |app| {
+            app.saved_search.results.is_some()
+        });
         let state = app.desktop_snapshot();
         let search = &state["search"];
         assert_eq!(search["query"], "café");
@@ -496,12 +514,24 @@ mod tests {
         assert_eq!(hit["session_id"], session.id.as_str());
         let excerpt = hit["excerpt"].as_str().unwrap();
         let range = &hit["matches"][0];
-        let (start, end) = (range[0].as_u64().unwrap() as usize, range[1].as_u64().unwrap() as usize);
+        let (start, end) = (
+            range[0].as_u64().unwrap() as usize,
+            range[1].as_u64().unwrap() as usize,
+        );
         assert_eq!(excerpt[start..end].to_lowercase(), "café");
         // Another kind filter finds nothing; clearing removes the results.
-        act(&mut app, json!({"type": "history_search", "query": "café", "filters": {"kind": "call"}})).unwrap();
-        wait(&mut app, "filtered results", |app| !app.saved_search.working());
-        assert_eq!(app.desktop_snapshot()["search"]["results"]["hits"], json!([]));
+        act(
+            &mut app,
+            json!({"type": "history_search", "query": "café", "filters": {"kind": "call"}}),
+        )
+        .unwrap();
+        wait(&mut app, "filtered results", |app| {
+            !app.saved_search.working()
+        });
+        assert_eq!(
+            app.desktop_snapshot()["search"]["results"]["hits"],
+            json!([])
+        );
         act(&mut app, json!({"type": "history_search", "query": ""})).unwrap();
         assert_eq!(app.desktop_snapshot()["search"]["results"], Value::Null);
         finish(app, &directory);
@@ -512,15 +542,29 @@ mod tests {
         let (mut app, directory) = library_app("pin");
         let session = saved_session(&mut app, Kind::Note, "Keep this one.");
         app.history.selected = Some(session.clone());
-        act(&mut app, json!({"type": "session_pin", "id": session.id, "pinned": true})).unwrap();
+        act(
+            &mut app,
+            json!({"type": "session_pin", "id": session.id, "pinned": true}),
+        )
+        .unwrap();
         assert_eq!(app.desktop_snapshot()["selected"]["pinned"], true);
         wait(&mut app, "the pinned summary", |app| {
-            app.history.items.iter().any(|item| item.id == session.id && item.pinned)
+            app.history
+                .items
+                .iter()
+                .any(|item| item.id == session.id && item.pinned)
         });
         assert_eq!(app.desktop_snapshot()["history"][0]["pinned"], true);
-        act(&mut app, json!({"type": "session_pin", "id": session.id, "pinned": false})).unwrap();
+        act(
+            &mut app,
+            json!({"type": "session_pin", "id": session.id, "pinned": false}),
+        )
+        .unwrap();
         wait(&mut app, "the unpinned summary", |app| {
-            app.history.items.iter().any(|item| item.id == session.id && !item.pinned)
+            app.history
+                .items
+                .iter()
+                .any(|item| item.id == session.id && !item.pinned)
         });
         finish(app, &directory);
     }
@@ -533,13 +577,32 @@ mod tests {
         dictation.text = "No recorded timing here.".into();
         app.history.selected = Some(dictation.clone());
         let state = app.desktop_snapshot();
-        assert!(state["selected"]["subtitles_unavailable"].as_str().unwrap().contains("timing"));
+        assert!(
+            state["selected"]["subtitles_unavailable"]
+                .as_str()
+                .unwrap()
+                .contains("timing")
+        );
         assert_eq!(state["selected"]["follow_ups"], 0);
-        let refused = act(&mut app, json!({"type": "session_export", "id": dictation.id, "format": "srt"})).unwrap_err();
+        let refused = act(
+            &mut app,
+            json!({"type": "session_export", "id": dictation.id, "format": "srt"}),
+        )
+        .unwrap_err();
         assert!(refused.contains("timing"), "{refused}");
         assert!(!app.history.storage.dialog_open);
-        assert!(act(&mut app, json!({"type": "session_export", "id": "missing", "format": "text"})).is_err());
-        act(&mut app, json!({"type": "session_export", "id": dictation.id, "format": "markdown"})).unwrap();
+        assert!(
+            act(
+                &mut app,
+                json!({"type": "session_export", "id": "missing", "format": "text"})
+            )
+            .is_err()
+        );
+        act(
+            &mut app,
+            json!({"type": "session_export", "id": dictation.id, "format": "markdown"}),
+        )
+        .unwrap();
         assert!(app.history.storage.dialog_open);
         app.history_poll();
         assert!(!app.history.storage.dialog_open);
@@ -552,9 +615,16 @@ mod tests {
         let first = notice["sequence"].as_u64().unwrap();
         // A cancelled dialog leaves no notice.
         app.history.storage.pickers.save_text = |_, _, _, _| Ok(false);
-        act(&mut app, json!({"type": "session_export", "id": dictation.id, "format": "text"})).unwrap();
+        act(
+            &mut app,
+            json!({"type": "session_export", "id": dictation.id, "format": "text"}),
+        )
+        .unwrap();
         app.history_poll();
-        assert_eq!(app.desktop_snapshot()["library_notice"]["sequence"].as_u64(), Some(first));
+        assert_eq!(
+            app.desktop_snapshot()["library_notice"]["sequence"].as_u64(),
+            Some(first)
+        );
         finish(app, &directory);
     }
 
@@ -564,7 +634,12 @@ mod tests {
         let (mut app, directory) = library_app("followups");
         let mut call = Session::new(Kind::Call);
         call.title = "Launch sync".into();
-        let item = |kind, text: &str| Item { kind, text: text.into(), section: 1, sources: vec![] };
+        let item = |kind, text: &str| Item {
+            kind,
+            text: text.into(),
+            section: 1,
+            sources: vec![],
+        };
         call.generated_summary = Some(Draft {
             schema: 1,
             source_id: call.id.clone(),
@@ -574,19 +649,37 @@ mod tests {
             elapsed_ms: 0,
             items: vec![
                 item(ItemKind::Fact, "Launch is on Friday."),
-                item(ItemKind::Action, "Send the release notes, then plan; review."),
+                item(
+                    ItemKind::Action,
+                    "Send the release notes, then plan; review.",
+                ),
             ],
             title: None,
         });
         app.history.selected = Some(call.clone());
-        assert!(act(&mut app, json!({"type": "followups_export", "id": call.id, "format": "markdown"})).unwrap_err().contains("no follow-ups"));
-        call.personal_notes = "Launch is on Friday.\n\nSend the release notes, then plan; review.".into();
+        assert!(
+            act(
+                &mut app,
+                json!({"type": "followups_export", "id": call.id, "format": "markdown"})
+            )
+            .unwrap_err()
+            .contains("no follow-ups")
+        );
+        call.personal_notes =
+            "Launch is on Friday.\n\nSend the release notes, then plan; review.".into();
         app.history.selected = Some(call.clone());
         assert_eq!(app.desktop_snapshot()["selected"]["follow_ups"], 1);
-        act(&mut app, json!({"type": "followups_export", "id": call.id, "format": "markdown"})).unwrap();
+        act(
+            &mut app,
+            json!({"type": "followups_export", "id": call.id, "format": "markdown"}),
+        )
+        .unwrap();
         app.history_poll();
         let (text, extension) = SAVED.with(|saved| saved.borrow().last().cloned()).unwrap();
-        assert_eq!((text.as_str(), extension.as_str()), ("- [ ] Send the release notes, then plan; review.\n", "md"));
+        assert_eq!(
+            (text.as_str(), extension.as_str()),
+            ("- [ ] Send the release notes, then plan; review.\n", "md")
+        );
         assert!(act(&mut app, json!({"type": "followups_export", "id": call.id, "format": "markdown", "reminder_ms": 1})).is_err());
         assert!(act(&mut app, json!({"type": "followups_export", "id": call.id, "format": "ics", "reminder_ms": 1})).unwrap_err().contains("future"));
         let reminder = crate::history::now_ms() + 86_400_000;
@@ -596,7 +689,10 @@ mod tests {
         assert_eq!(extension, "ics");
         assert!(text.contains("SUMMARY:Send the release notes\\, then plan\\; review."));
         assert!(text.contains("DUE:"));
-        assert_eq!(app.desktop_snapshot()["library_notice"]["message"], "Exported 1 follow-up");
+        assert_eq!(
+            app.desktop_snapshot()["library_notice"]["message"],
+            "Exported 1 follow-up"
+        );
         finish(app, &directory);
     }
 
@@ -605,24 +701,54 @@ mod tests {
         let (mut app, directory) = library_app("retention");
         saved_session(&mut app, Kind::Dictation, "Recent words.");
         let policy = json!({"enabled": true, "days": 30, "dictations": true, "calls": false, "notes": false});
-        assert!(act(&mut app, json!({"type": "retention_save", "policy": policy})).unwrap_err().contains("Review"));
-        assert!(act(&mut app, json!({"type": "retention_preview", "policy": {"days": 0}})).is_err());
-        act(&mut app, json!({"type": "retention_preview", "policy": policy})).unwrap();
-        assert_eq!(app.desktop_snapshot()["storage"]["retention_preview_working"], true);
-        wait(&mut app, "the retention preview", |app| app.history.retention_preview.is_some());
+        assert!(
+            act(
+                &mut app,
+                json!({"type": "retention_save", "policy": policy})
+            )
+            .unwrap_err()
+            .contains("Review")
+        );
+        assert!(
+            act(
+                &mut app,
+                json!({"type": "retention_preview", "policy": {"days": 0}})
+            )
+            .is_err()
+        );
+        act(
+            &mut app,
+            json!({"type": "retention_preview", "policy": policy}),
+        )
+        .unwrap();
+        assert_eq!(
+            app.desktop_snapshot()["storage"]["retention_preview_working"],
+            true
+        );
+        wait(&mut app, "the retention preview", |app| {
+            app.history.retention_preview.is_some()
+        });
         let state = app.desktop_snapshot();
         assert_eq!(state["storage"]["retention_preview"]["total"], 0);
         assert_eq!(state["storage"]["retention_preview"]["policy"], policy);
         let mut other = policy.clone();
         other["days"] = json!(31);
         assert!(act(&mut app, json!({"type": "retention_save", "policy": other})).is_err());
-        act(&mut app, json!({"type": "retention_save", "policy": policy})).unwrap();
+        act(
+            &mut app,
+            json!({"type": "retention_save", "policy": policy}),
+        )
+        .unwrap();
         assert!(app.settings.retention.enabled);
         assert_eq!(app.settings.retention.days, 30);
         assert_eq!(app.desktop_snapshot()["storage"]["retention"], policy);
         assert!(app.history.retention_preview.is_none());
         // Turning it off needs no preview.
-        act(&mut app, json!({"type": "retention_save", "policy": {"enabled": false, "days": 30}})).unwrap();
+        act(
+            &mut app,
+            json!({"type": "retention_save", "policy": {"enabled": false, "days": 30}}),
+        )
+        .unwrap();
         assert!(!app.settings.retention.enabled);
         finish(app, &directory);
     }
@@ -631,17 +757,44 @@ mod tests {
     fn encryption_changes_only_through_its_action_and_reports_progress() {
         let (mut app, directory) = library_app("encryption");
         saved_session(&mut app, Kind::Note, "Private words.");
-        assert!(act(&mut app, json!({"type": "settings_patch", "encrypt_at_rest": true})).is_err());
-        act(&mut app, json!({"type": "storage_encryption", "enabled": true})).unwrap();
+        assert!(
+            act(
+                &mut app,
+                json!({"type": "settings_patch", "encrypt_at_rest": true})
+            )
+            .is_err()
+        );
+        act(
+            &mut app,
+            json!({"type": "storage_encryption", "enabled": true}),
+        )
+        .unwrap();
         assert!(app.settings.encrypt_at_rest);
-        assert_eq!(app.desktop_snapshot()["storage"]["encryption_working"], true);
-        assert!(act(&mut app, json!({"type": "storage_encryption", "enabled": false})).is_err());
-        wait(&mut app, "encryption", |app| !app.history.storage.encryption_working);
+        assert_eq!(
+            app.desktop_snapshot()["storage"]["encryption_working"],
+            true
+        );
+        assert!(
+            act(
+                &mut app,
+                json!({"type": "storage_encryption", "enabled": false})
+            )
+            .is_err()
+        );
+        wait(&mut app, "encryption", |app| {
+            !app.history.storage.encryption_working
+        });
         let result = &app.desktop_snapshot()["storage"]["encryption_result"];
         assert_eq!(result["protect"], true);
         assert_eq!(result["error"], Value::Null);
-        act(&mut app, json!({"type": "storage_encryption", "enabled": false})).unwrap();
-        wait(&mut app, "decryption", |app| !app.history.storage.encryption_working);
+        act(
+            &mut app,
+            json!({"type": "storage_encryption", "enabled": false}),
+        )
+        .unwrap();
+        wait(&mut app, "decryption", |app| {
+            !app.history.storage.encryption_working
+        });
         assert!(!app.settings.encrypt_at_rest);
         finish(app, &directory);
     }
@@ -658,12 +811,26 @@ mod tests {
         assert_eq!(app.desktop_snapshot()["storage"]["backup"], "choosing");
         app.history_poll();
         assert_eq!(app.desktop_snapshot()["storage"]["backup"], "idle");
-        assert!(act(&mut app, json!({"type": "backup_create", "passphrase": "short"})).unwrap_err().contains("8 characters"));
+        assert!(
+            act(
+                &mut app,
+                json!({"type": "backup_create", "passphrase": "short"})
+            )
+            .unwrap_err()
+            .contains("8 characters")
+        );
         CHOSEN.with(|path| *path.borrow_mut() = Some(archive.clone()));
-        act(&mut app, json!({"type": "backup_create", "passphrase": "correct horse"})).unwrap();
+        act(
+            &mut app,
+            json!({"type": "backup_create", "passphrase": "correct horse"}),
+        )
+        .unwrap();
         app.history_poll();
         assert_eq!(app.desktop_snapshot()["storage"]["backup"], "working");
-        assert!(act(&mut app, json!({"type": "history_export_markdown"})).is_err(), "one operation at a time");
+        assert!(
+            act(&mut app, json!({"type": "history_export_markdown"})).is_err(),
+            "one operation at a time"
+        );
         wait(&mut app, "the backup", |app| app.history.backup.is_some());
         let state = app.desktop_snapshot();
         let backup = &state["storage"]["backup_result"];
@@ -675,11 +842,15 @@ mod tests {
         let encrypted = app.settings.encrypt_at_rest;
         act(&mut app, json!({"type": "backup_restore", "passphrase": "wrong passphrase", "replace_older": false, "include_settings": true})).unwrap();
         app.history_poll();
-        wait(&mut app, "the failed restore", |app| app.history.restored.is_some());
+        wait(&mut app, "the failed restore", |app| {
+            app.history.restored.is_some()
+        });
         assert!(app.desktop_snapshot()["storage"]["restore_result"]["error"].is_string());
         act(&mut app, json!({"type": "backup_restore", "passphrase": "correct horse", "replace_older": false, "include_settings": true})).unwrap();
         app.history_poll();
-        wait(&mut app, "the restore", |app| app.history.restored.is_some());
+        wait(&mut app, "the restore", |app| {
+            app.history.restored.is_some()
+        });
         let state = app.desktop_snapshot();
         let restored = &state["storage"]["restore_result"];
         assert_eq!(restored["error"], Value::Null, "{restored}");
@@ -693,7 +864,9 @@ mod tests {
         CHOSEN.with(|path| *path.borrow_mut() = Some(folder.clone()));
         act(&mut app, json!({"type": "history_export_markdown"})).unwrap();
         app.history_poll();
-        wait(&mut app, "the Markdown export", |app| app.history.markdown_export.is_some());
+        wait(&mut app, "the Markdown export", |app| {
+            app.history.markdown_export.is_some()
+        });
         let state = app.desktop_snapshot();
         assert_eq!(state["storage"]["markdown_result"]["files"], 1);
         assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1);
@@ -704,15 +877,24 @@ mod tests {
     fn quarantine_actions_need_a_listed_file() {
         let (mut app, directory) = library_app("quarantine");
         act(&mut app, json!({"type": "quarantine_list"})).unwrap();
-        wait(&mut app, "the isolated files", |app| app.history.storage.quarantine_listed);
+        wait(&mut app, "the isolated files", |app| {
+            app.history.storage.quarantine_listed
+        });
         let state = app.desktop_snapshot();
         assert_eq!(state["recovery"]["listed"], true);
         assert_eq!(state["recovery"]["quarantine"], json!([]));
-        for kind in ["quarantine_restore", "quarantine_export", "quarantine_discard"] {
+        for kind in [
+            "quarantine_restore",
+            "quarantine_export",
+            "quarantine_discard",
+        ] {
             assert!(
-                act(&mut app, json!({"type": kind, "file_name": "missing.corrupt-1"}))
-                    .unwrap_err()
-                    .contains("no longer isolated")
+                act(
+                    &mut app,
+                    json!({"type": kind, "file_name": "missing.corrupt-1"})
+                )
+                .unwrap_err()
+                .contains("no longer isolated")
             );
         }
         finish(app, &directory);

@@ -51,8 +51,7 @@ export function ExportMenu({ session, run, disabled }) {
         <Menu.Dropdown>
           <Menu.Label>Export this document</Menu.Label>
           {formats.map(([format, label, extension]) => {
-            const blocked =
-              (format === "srt" || format === "vtt") && subtitles;
+            const blocked = (format === "srt" || format === "vtt") && subtitles;
             return (
               <Menu.Item
                 key={format}
@@ -81,8 +80,8 @@ export function ExportMenu({ session, run, disabled }) {
               : "Export follow-ups"}
             {!count && (
               <Text size="xs" c="dimmed" className="menu-item-reason">
-                Update notes to find action items. Those you keep in your
-                notes can be exported.
+                Update notes to find action items. Those you keep in your notes
+                can be exported.
               </Text>
             )}
           </Menu.Item>
@@ -123,8 +122,8 @@ function FollowUpsDialog({ opened, count, onClose, onExport }) {
       <Stack gap="md">
         <Text c="dimmed" size="sm">
           {count} {count === 1 ? "action item" : "action items"} from this
-          document's notes. Only items still in your notes are included, in
-          your words.
+          document's notes. Only items still in your notes are included, in your
+          words.
         </Text>
         <SegmentedControl
           aria-label="Follow-up format"

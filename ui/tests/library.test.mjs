@@ -45,9 +45,7 @@ test("byte ranges account for multi-byte and astral characters", () => {
   assert.deepEqual(marked(text, [[emoji, emoji + 4]]), ["🎉"]);
   assert.deepEqual(marked(text, [[0, 5]]), ["Café"]);
   // The JavaScript indices differ from the byte offsets after "é".
-  assert.deepEqual(byteRangesToIndices(text, [[start, start + 6]]), [
-    [7, 13],
-  ]);
+  assert.deepEqual(byteRangesToIndices(text, [[start, start + 6]]), [[7, 13]]);
 });
 
 test("ranges inside a character widen to whole characters", () => {
@@ -64,12 +62,7 @@ test("invalid, empty, out-of-range and overlapping ranges are handled", () => {
   assert.deepEqual(byteRangesToIndices(text, null), []);
   assert.deepEqual(byteRangesToIndices("", [[0, 3]]), []);
   assert.deepEqual(
-    byteRangesToIndices(text, [
-      [5, 5],
-      [9, 4],
-      ["x", 3],
-      [3],
-    ]),
+    byteRangesToIndices(text, [[5, 5], [9, 4], ["x", 3], [3]]),
     [],
   );
   assert.deepEqual(byteRangesToIndices(text, [[12, 500]]), [[12, 17]]);
@@ -130,10 +123,7 @@ test("search filters convert local days to inclusive milliseconds", () => {
     "Choose a start date before the end date.",
   );
   assert.equal(filterProblem({ ...emptyFilters, from: "2026-03-02" }), null);
-  assert.equal(
-    activeFilterCount({ ...emptyFilters, kind: "note" }, "note"),
-    0,
-  );
+  assert.equal(activeFilterCount({ ...emptyFilters, kind: "note" }, "note"), 0);
   assert.equal(
     activeFilterCount({ ...emptyFilters, kind: null, speaker: "x" }, "note"),
     2,
@@ -290,7 +280,10 @@ test("turning retention on requires a preview of the same policy", () => {
     retentionStep(saved, draft, { policy: { ...draft, days: 30 } }),
     "preview",
   );
-  assert.equal(retentionStep(saved, draft, { policy: { ...draft } }), "confirm");
+  assert.equal(
+    retentionStep(saved, draft, { policy: { ...draft } }),
+    "confirm",
+  );
   assert.equal(
     retentionStep(saved, draft, { policy: { ...draft }, error: "Failed" }),
     "preview",

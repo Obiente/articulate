@@ -158,7 +158,8 @@ export const sampleQuarantine = [
     modified_ms: now - 3 * 86400000,
     restorable: true,
     title: "Weekly planning call",
-    reason: "The file was cut short while saving. The last complete copy can be restored.",
+    reason:
+      "The file was cut short while saving. The last complete copy can be restored.",
     record: {
       id: "sample-damaged",
       title: "Weekly planning call",
@@ -187,7 +188,8 @@ export const sampleWarnings = [
   {
     id: "sample-locked",
     kind: "unavailable",
-    message: "This history item is temporarily unavailable and will be retried.",
+    message:
+      "This history item is temporarily unavailable and will be retried.",
   },
 ];
 

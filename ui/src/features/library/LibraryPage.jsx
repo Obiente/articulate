@@ -228,10 +228,7 @@ export function LibraryPage({
           <span>{filingStatus}</span>
         </div>
       )}
-      <RecoveryBanner
-        recovery={recovery}
-        onReview={() => setReviewing(true)}
-      />
+      <RecoveryBanner recovery={recovery} onReview={() => setReviewing(true)} />
       <div className="library-tools">
         <span className="section-heading">
           {mode === "call" ? "SAVED CONVERSATIONS" : "SAVED NOTES"}

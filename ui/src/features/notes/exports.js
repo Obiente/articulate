@@ -4,7 +4,12 @@ const pad = (value) => String(value).padStart(2, "0");
 
 // Tomorrow at 9:00 local time, as "YYYY-MM-DDTHH:MM".
 export function defaultReminder(now = new Date()) {
-  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 9);
+  const next = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate() + 1,
+    9,
+  );
   return `${next.getFullYear()}-${pad(next.getMonth() + 1)}-${pad(next.getDate())}T09:00`;
 }
 

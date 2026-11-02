@@ -16,7 +16,6 @@ import { attentionCount } from "./attention.js";
 
 export { attentionCount };
 
-
 const sizeLabel = (bytes) =>
   bytes >= 1024 * 1024
     ? `${(bytes / 1024 / 1024).toFixed(1)} MB`
@@ -88,8 +87,7 @@ export function RecoveryDialog({ opened, onClose, recovery, run }) {
                   <div className="recovery-item-copy">
                     <Text fw={500}>{file.title || "Untitled item"}</Text>
                     <Text size="xs" c="dimmed">
-                      {formatDate(file.modified_ms)} ·{" "}
-                      {sizeLabel(file.bytes)}
+                      {formatDate(file.modified_ms)} · {sizeLabel(file.bytes)}
                       {file.restorable ? "" : " · Can't be restored"}
                     </Text>
                     <Text size="xs" c="dimmed">
@@ -187,11 +185,10 @@ export function RecoveryDialog({ opened, onClose, recovery, run }) {
         </section>
         {unavailable.length > 0 && (
           <Alert variant="light" color="yellow" title="Temporarily unavailable">
-            {unavailable.length}{" "}
-            {unavailable.length === 1 ? "item" : "items"} couldn't be opened
-            right now, often because another app such as antivirus or backup
-            software is using the file. Articulate tries again automatically
-            and never sets these aside.
+            {unavailable.length} {unavailable.length === 1 ? "item" : "items"}{" "}
+            couldn't be opened right now, often because another app such as
+            antivirus or backup software is using the file. Articulate tries
+            again automatically and never sets these aside.
           </Alert>
         )}
         {newer.length > 0 && (

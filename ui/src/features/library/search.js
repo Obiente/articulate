@@ -64,7 +64,8 @@ export function highlightSegments(text, byteRanges) {
   const segments = [];
   let at = 0;
   for (const [start, end] of ranges) {
-    if (start > at) segments.push({ text: text.slice(at, start), match: false });
+    if (start > at)
+      segments.push({ text: text.slice(at, start), match: false });
     segments.push({ text: text.slice(start, end), match: true });
     at = end;
   }

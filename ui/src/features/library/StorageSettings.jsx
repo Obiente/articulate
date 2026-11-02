@@ -21,14 +21,14 @@ import {
 import { formatDate } from "../../lib/format.js";
 import { attentionCount, RecoveryDialog } from "./Recovery.jsx";
 import "./library.css";
-import {
-  defaultPolicy,
-  policyProblem,
-  retentionStep,
-} from "./retention.js";
+import { defaultPolicy, policyProblem, retentionStep } from "./retention.js";
 
 const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
-const kindNames = { dictation: "Dictation", call: "Conversation", note: "Note" };
+const kindNames = {
+  dictation: "Dictation",
+  call: "Conversation",
+  note: "Note",
+};
 
 function encryptionMessage(storage) {
   if (storage.encryption_working)
@@ -164,8 +164,8 @@ export function StorageSettings({ controls }) {
             mb="md"
             title="Reload your speech model"
           >
-            The restored preferences change how speech is recognized. Reload
-            the model to use them.
+            The restored preferences change how speech is recognized. Reload the
+            model to use them.
             <Group mt="sm">
               <Button
                 size="xs"
@@ -428,8 +428,8 @@ function RetentionEditor({ storage, run, busy, pending }) {
         </Group>
         {step === "saved" && saved.enabled && (
           <Text c="dimmed" size="sm" mt="xs">
-            On: items older than {plural(saved.days, "day", "days")} are
-            removed when Articulate starts and once a day.
+            On: items older than {plural(saved.days, "day", "days")} are removed
+            when Articulate starts and once a day.
           </Text>
         )}
       </div>
@@ -449,12 +449,17 @@ function BackupDialog({ opened, onClose, onCreate, busy }) {
   const short = passphrase && [...passphrase].length < 8;
   const mismatch = passphrase && confirm !== passphrase;
   return (
-    <Modal opened={opened} onClose={onClose} title="Back up everything" centered>
+    <Modal
+      opened={opened}
+      onClose={onClose}
+      title="Back up everything"
+      centered
+    >
       <Stack gap="md">
         <Text c="dimmed" size="sm">
-          Add a passphrase to encrypt the backup. You'll need it to restore,
-          and it can't be recovered if you forget it. Without one, anyone with
-          the file can read it.
+          Add a passphrase to encrypt the backup. You'll need it to restore, and
+          it can't be recovered if you forget it. Without one, anyone with the
+          file can read it.
         </Text>
         <PasswordInput
           label="Passphrase (optional)"
@@ -505,8 +510,8 @@ function RestoreDialog({ opened, onClose, onRestore, busy }) {
     >
       <Stack gap="md">
         <Text c="dimmed" size="sm">
-          The whole backup is checked before anything changes. Items you
-          deleted on this device stay deleted.
+          The whole backup is checked before anything changes. Items you deleted
+          on this device stay deleted.
         </Text>
         <PasswordInput
           label="Passphrase"

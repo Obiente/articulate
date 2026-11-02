@@ -108,16 +108,18 @@ pub(crate) struct RestoredSettings {
 /// File dialogs, replaceable in tests so no dialog ever opens there.
 #[derive(Clone, Copy)]
 pub(super) struct Pickers {
-    pub save_text: fn(&str, &str, crate::export_file::Document, Option<&str>) -> anyhow::Result<bool>,
+    pub save_text:
+        fn(&str, &str, crate::export_file::Document, Option<&str>) -> anyhow::Result<bool>,
     pub save_path: fn(crate::export_file::Document, &str, &str) -> anyhow::Result<Option<PathBuf>>,
     pub backup_destination: fn(&str) -> anyhow::Result<Option<PathBuf>>,
     pub backup_source: fn() -> anyhow::Result<Option<PathBuf>>,
     pub folder: fn(&str) -> anyhow::Result<Option<PathBuf>>,
 }
 
-impl Default for Pickers {
-    #[cfg(not(test))]
-    fn default() -> Self {
+impl Pickers {
+    /// The Windows file dialogs.
+    #[cfg_attr(test, allow(dead_code, reason = "Tests never open real file dialogs"))]
+    fn system() -> Self {
         use crate::export_file as files;
         Self {
             save_text: files::save_document,
@@ -126,6 +128,13 @@ impl Default for Pickers {
             backup_source: files::choose_backup_source,
             folder: files::choose_folder,
         }
+    }
+}
+
+impl Default for Pickers {
+    #[cfg(not(test))]
+    fn default() -> Self {
+        Self::system()
     }
     /// Tests cancel every dialog unless they install their own picker.
     #[cfg(test)]
@@ -693,7 +702,10 @@ impl App {
     /// Show a one-time library message.
     pub(super) fn history_notify(&mut self, message: impl Into<String>, error: bool) {
         let storage = &mut self.history.storage;
-        let sequence = storage.notice.as_ref().map_or(1, |notice| notice.sequence + 1);
+        let sequence = storage
+            .notice
+            .as_ref()
+            .map_or(1, |notice| notice.sequence + 1);
         storage.notice = Some(Notice {
             sequence,
             error,
@@ -1170,7 +1182,11 @@ impl App {
                 Ok(true) => app.history_notify(
                     format!(
                         "Exported {count} {}",
-                        if count == 1 { "follow-up" } else { "follow-ups" }
+                        if count == 1 {
+                            "follow-up"
+                        } else {
+                            "follow-ups"
+                        }
                     ),
                     false,
                 ),

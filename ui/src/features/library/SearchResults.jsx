@@ -47,11 +47,13 @@ export function useLibrarySearch({ act, search, defaultKind }) {
     () =>
       createSearchScheduler({
         run: (text, wanted) =>
-          void actRef.current({
-            type: "history_search",
-            query: text,
-            filters: wanted,
-          }).catch(() => {}),
+          void actRef
+            .current({
+              type: "history_search",
+              query: text,
+              filters: wanted,
+            })
+            .catch(() => {}),
       }),
     [],
   );
@@ -161,9 +163,7 @@ export function SearchFilters({
             variant="subtle"
             size="xs"
             disabled={!count}
-            onClick={() =>
-              setFilters({ ...emptyFilters, kind: defaultKind })
-            }
+            onClick={() => setFilters({ ...emptyFilters, kind: defaultKind })}
           >
             Clear filters
           </Button>
@@ -256,8 +256,7 @@ export function SearchResults({
   const results = view.results;
   // Items deleted since the search are hidden.
   const groups = useMemo(
-    () =>
-      groupHits(results?.hits).filter((group) => summaries.has(group.id)),
+    () => groupHits(results?.hits).filter((group) => summaries.has(group.id)),
     [results, summaries],
   );
   return (
@@ -279,8 +278,8 @@ export function SearchResults({
         <div className="search-note" role="status">
           <Info size={16} />
           <span>
-            Your library is still being prepared for search. These results
-            cover your most recent items.
+            Your library is still being prepared for search. These results cover
+            your most recent items.
           </span>
         </div>
       )}

@@ -14,9 +14,11 @@ pub fn reviewed(session: &crate::history::Session) -> Vec<Item> {
     };
     let blocks: Vec<&str> = session
         .personal_notes
-        .split("
+        .split(
+            "
 
-")
+",
+        )
         .map(str::trim)
         .filter(|block| !block.is_empty())
         .collect();
@@ -45,9 +47,11 @@ pub fn reviewed_count(session: &crate::history::Session) -> usize {
             && !seen.contains(&text)
             && session
                 .personal_notes
-                .split("
+                .split(
+                    "
 
-")
+",
+                )
                 .any(|block| block.trim() == text)
         {
             seen.push(text);
@@ -240,16 +244,15 @@ mod tests {
             ],
             title: None,
         });
-        session.personal_notes =
-            "The launch moved to Friday.
+        session.personal_notes = "The launch moved to Friday.
 
 Send the checklist to Casey.
 
 Book a room, any room."
-                .into();
-        let reviewed = reviewed(&session);
-        assert_eq!(reviewed.len(), 1);
-        assert_eq!(reviewed[0].text, "Send the checklist to Casey.");
+            .into();
+        let kept = reviewed(&session);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "Send the checklist to Casey.");
         assert_eq!(reviewed_count(&session), 1);
         session.generated_summary = None;
         assert!(reviewed(&session).is_empty());

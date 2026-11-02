@@ -87,7 +87,10 @@ function excerptAround(text, needle) {
 }
 
 export function searchRecords(records, query, filters = {}) {
-  const needle = query.replace(/^"(.*)"$/, "$1").trim().toLowerCase();
+  const needle = query
+    .replace(/^"(.*)"$/, "$1")
+    .trim()
+    .toLowerCase();
   const hits = [];
   for (const record of [...records].sort(
     (a, b) => b.updated_ms - a.updated_ms,
@@ -206,7 +209,11 @@ export function libraryHandlers(context) {
       }));
   };
   const validPolicy = (policy) => {
-    if (!Number.isInteger(policy?.days) || policy.days < 1 || policy.days > 36500)
+    if (
+      !Number.isInteger(policy?.days) ||
+      policy.days < 1 ||
+      policy.days > 36500
+    )
       throw Error("Choose a retention period between 1 and 36500 days.");
   };
   return {
@@ -315,7 +322,9 @@ export function libraryHandlers(context) {
         );
       if (policy.enabled && !same(preview?.policy, policy))
         throw Error("Review what this policy removes before turning it on.");
-      const removed = policy.enabled ? preview.items.map((item) => item.id) : [];
+      const removed = policy.enabled
+        ? preview.items.map((item) => item.id)
+        : [];
       context.remove(removed);
       context.sample.storage.retention = { ...policy };
       context.sample.storage.retention_preview = null;
@@ -326,15 +335,16 @@ export function libraryHandlers(context) {
     },
     quarantine_list() {
       context.sample.recovery.listed = true;
-      context.sample.recovery.quarantine = context.isolated().map(
-        ({ record: _, ...file }) => file,
-      );
+      context.sample.recovery.quarantine = context
+        .isolated()
+        .map(({ record: _, ...file }) => file);
     },
     quarantine_restore(action) {
       const file = context
         .isolated()
         .find((item) => item.file_name === action.file_name);
-      if (!file) throw Error("This file is no longer isolated. Refresh the list.");
+      if (!file)
+        throw Error("This file is no longer isolated. Refresh the list.");
       if (!file.restorable)
         throw Error("This file doesn't hold a complete item.");
       context.restore(file);
@@ -344,7 +354,8 @@ export function libraryHandlers(context) {
       const file = context
         .isolated()
         .find((item) => item.file_name === action.file_name);
-      if (!file) throw Error("This file is no longer isolated. Refresh the list.");
+      if (!file)
+        throw Error("This file is no longer isolated. Refresh the list.");
       download(
         JSON.stringify(file.record ?? { id: file.id }, null, 2),
         `${file.file_name}.json`,

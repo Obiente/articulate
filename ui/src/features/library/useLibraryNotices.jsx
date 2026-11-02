@@ -17,7 +17,11 @@ export function useLibraryNotices(notice) {
     seen.current = sequence;
     notifications.show(
       notice.error
-        ? { title: "Could not complete that", message: notice.message, color: "red" }
+        ? {
+            title: "Could not complete that",
+            message: notice.message,
+            color: "red",
+          }
         : {
             message: notice.message,
             icon: <Check size={18} />,
