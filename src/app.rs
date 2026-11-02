@@ -72,6 +72,13 @@ struct Settings {
     meetings: discord_ui::meetings::Settings,
     assort: assort_ui::Configuration,
     polish_style: crate::polish::Style,
+    /// Encrypt history and this file with Windows DPAPI for the current user.
+    encrypt_at_rest: bool,
+    /// Optional automatic deletion of old sessions.
+    retention: crate::history::retention::Policy,
+    /// Set when the saved file could not be read, so it is never overwritten.
+    #[serde(skip)]
+    save_blocked: Option<String>,
 }
 fn enabled() -> bool {
     true
@@ -116,6 +123,9 @@ impl Default for Settings {
             meetings: Default::default(),
             assort: Default::default(),
             polish_style: Default::default(),
+            encrypt_at_rest: false,
+            retention: Default::default(),
+            save_blocked: None,
         }
     }
 }
@@ -240,16 +250,31 @@ pub struct App {
     last_seconds: u64,
 }
 
+/// Parse stored preferences in either plaintext or encrypted form.
+fn parse_settings(bytes: Vec<u8>) -> anyhow::Result<Settings> {
+    Ok(serde_json::from_slice(&crate::history::protect::open(
+        bytes,
+    )?)?)
+}
+
 fn save_settings(directory: &std::path::Path, settings: &Settings) -> anyhow::Result<()> {
+    use crate::history::protect;
     use std::io::Write;
     static SAVES: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(reason) = &settings.save_blocked {
+        anyhow::bail!("{reason}");
+    }
     // Serialize replacement within this process. Separate processes never share
     // a temporary file, so a failed save cannot remove another writer's data.
     let _guard = SAVES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::fs::create_dir_all(directory)?;
+    let bytes = protect::seal_if(
+        settings.encrypt_at_rest,
+        serde_json::to_vec_pretty(settings)?,
+    )?;
     let temp = directory.join(format!(
         "settings-{}-{}.tmp",
         std::process::id(),
@@ -259,11 +284,23 @@ fn save_settings(directory: &std::path::Path, settings: &Settings) -> anyhow::Re
         .write(true)
         .create_new(true)
         .open(&temp)?;
+    let main = directory.join("settings.json");
     let result = (|| -> anyhow::Result<()> {
-        file.write_all(&serde_json::to_vec_pretty(settings)?)?;
+        file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, directory.join("settings.json"))?;
+        // Keep the previous good file. A damaged one never replaces a good backup,
+        // and the backup follows the current encryption choice.
+        if let Ok(previous) = std::fs::read(&main)
+            && let Ok(plain) = protect::open(previous)
+            && serde_json::from_slice::<Settings>(&plain).is_ok()
+        {
+            protect::write_atomic(
+                &directory.join("settings.json.bak"),
+                &protect::seal_if(settings.encrypt_at_rest, plain)?,
+            )?;
+        }
+        std::fs::rename(&temp, &main)?;
         Ok(())
     })();
     if result.is_err() {
@@ -272,17 +309,123 @@ fn save_settings(directory: &std::path::Path, settings: &Settings) -> anyhow::Re
     result
 }
 
+/// Load preferences without ever letting a later save destroy unreadable data.
+///
+/// A file that cannot be parsed or decrypted is renamed to
+/// `settings.corrupt-<timestamp>.json` before anything can save, then the last
+/// good `settings.json.bak` is used if there is one. A file that cannot be read
+/// at all (for example, it is locked) blocks saving until restart instead.
+fn load_settings(directory: &std::path::Path) -> (Settings, Option<String>) {
+    let main = directory.join("settings.json");
+    let mut attempt = 0;
+    let bytes = loop {
+        match std::fs::read(&main) {
+            Ok(bytes) => break bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (Settings::default(), None);
+            }
+            // Antivirus, backup and indexing tools hold files briefly.
+            Err(_) if attempt < 4 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(50 * attempt));
+            }
+            Err(e) => {
+                let reason = format!(
+                    "Saved settings could not be read ({e}). Default settings are in use, and changes will not be saved until Articulate restarts so your saved file is not replaced."
+                );
+                return (
+                    Settings {
+                        save_blocked: Some(reason.clone()),
+                        ..Default::default()
+                    },
+                    Some(reason),
+                );
+            }
+        }
+    };
+    let error = match parse_settings(bytes) {
+        Ok(settings) => return (settings, None),
+        Err(error) if error.is::<crate::history::protect::Undecryptable>() => {
+            "they are encrypted for a different Windows account"
+        }
+        Err(_) => "they are damaged",
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut moved = None;
+    for suffix in 0..100 {
+        let name = if suffix == 0 {
+            format!("settings.corrupt-{stamp}.json")
+        } else {
+            format!("settings.corrupt-{stamp}-{suffix}.json")
+        };
+        let target = directory.join(&name);
+        if target.exists() {
+            continue;
+        }
+        if std::fs::rename(&main, &target).is_ok() {
+            moved = Some(name);
+        }
+        break;
+    }
+    let Some(moved) = moved else {
+        let reason = format!(
+            "Saved settings could not be used because {error}. Default settings are in use, and changes will not be saved until Articulate restarts so your saved file is not replaced."
+        );
+        return (
+            Settings {
+                save_blocked: Some(reason.clone()),
+                ..Default::default()
+            },
+            Some(reason),
+        );
+    };
+    match std::fs::read(directory.join("settings.json.bak")).map(parse_settings) {
+        Ok(Ok(settings)) => (
+            settings,
+            Some(format!(
+                "Saved settings could not be used because {error}. They were kept as {moved}, and your previous settings were restored."
+            )),
+        ),
+        _ => (
+            Settings::default(),
+            Some(format!(
+                "Saved settings could not be used because {error}. They were kept as {moved}, and default settings are in use."
+            )),
+        ),
+    }
+}
+
+/// Merge preferences and vocabulary from a restored backup. Machine-specific
+/// and secret settings (pairing key, model and tool paths) are always kept.
+fn merge_restored_settings(
+    current: &Settings,
+    restored: Option<serde_json::Value>,
+    library: Option<&str>,
+) -> anyhow::Result<Settings> {
+    let mut merged = serde_json::to_value(current)?;
+    if let (Some(target), Some(serde_json::Value::Object(source))) = (
+        merged.as_object_mut(),
+        restored.map(crate::history::backup::portable_settings),
+    ) {
+        for (key, value) in source {
+            target.insert(key, value);
+        }
+    }
+    let mut settings: Settings = serde_json::from_value(merged)?;
+    settings.save_blocked = current.save_blocked.clone();
+    if let Some(library) = library {
+        crate::library::parse(library)?.merge(&mut settings.entries, &mut settings.macros);
+        dictionary::deduplicate(&mut settings.entries);
+    }
+    Ok(settings)
+}
+
 impl App {
     fn new() -> Self {
-        let settings_path = model::data_dir().join("settings.json");
-        let (mut settings, warning) = match std::fs::read(&settings_path) {
-            Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
-                Ok(s) => (s, None),
-                Err(_) => (Settings::default(), Some("Saved settings could not be read. Your previous file has not been changed.".to_owned())),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
-            Err(e) => (Settings::default(), Some(format!("Could not read saved settings: {e}"))),
-        };
+        let (mut settings, warning) = load_settings(&model::data_dir());
         dictionary::deduplicate(&mut settings.entries);
         if settings.model_path.is_empty() {
             settings.model_path = model::default_path().to_string_lossy().into_owned();
@@ -357,7 +500,7 @@ impl App {
             polish: Default::default(),
 
             pending_install: None,
-            history: history_ui::State::start(),
+            history: history_ui::State::start(settings.encrypt_at_rest),
             insights: Default::default(),
             saved_search: Default::default(),
             brain: Default::default(),
@@ -1592,9 +1735,141 @@ mod tests {
             serde_json::from_slice(&std::fs::read(directory.join("settings.json")).unwrap())
                 .unwrap();
         assert!(settings.transcription_language.starts_with("synthetic-"));
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
-        std::fs::remove_file(directory.join("settings.json")).unwrap();
-        std::fs::remove_dir(directory).unwrap();
+        let backup: Settings =
+            serde_json::from_slice(&std::fs::read(directory.join("settings.json.bak")).unwrap())
+                .unwrap();
+        assert!(backup.transcription_language.starts_with("synthetic-"));
+        // Only the file and its previous good copy remain; no shared temporaries.
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn settings_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "articulate-settings-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn unreadable_settings_are_moved_aside_and_never_overwritten() {
+        let directory = settings_directory("corrupt");
+        let damaged = b"{\"insert\": tru".to_vec();
+        std::fs::write(directory.join("settings.json"), &damaged).unwrap();
+        let (settings, warning) = load_settings(&directory);
+        let warning = warning.unwrap();
+        assert!(warning.contains("settings.corrupt-"));
+        assert!(warning.contains("default settings are in use"));
+        assert!(!directory.join("settings.json").exists());
+        let moved: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("settings.corrupt-") && name.ends_with(".json")
+            })
+            .collect();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(std::fs::read(moved[0].path()).unwrap(), damaged);
+        // A later automatic save cannot destroy the damaged original.
+        save_settings(&directory, &settings).unwrap();
+        assert_eq!(std::fs::read(moved[0].path()).unwrap(), damaged);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn damaged_settings_fall_back_to_the_previous_good_copy() {
+        let directory = settings_directory("backup");
+        let first = Settings {
+            transcription_language: "synthetic-first".into(),
+            ..Default::default()
+        };
+        save_settings(&directory, &first).unwrap();
+        let second = Settings {
+            transcription_language: "synthetic-second".into(),
+            ..Default::default()
+        };
+        save_settings(&directory, &second).unwrap();
+        std::fs::write(directory.join("settings.json"), b"\0garbage").unwrap();
+        let (settings, warning) = load_settings(&directory);
+        assert_eq!(settings.transcription_language, "synthetic-first");
+        assert!(warning.unwrap().contains("previous settings were restored"));
+        // A damaged file is never copied over the good backup.
+        std::fs::write(directory.join("settings.json"), b"garbage").unwrap();
+        save_settings(&directory, &settings).unwrap();
+        let backup: Settings =
+            serde_json::from_slice(&std::fs::read(directory.join("settings.json.bak")).unwrap())
+                .unwrap();
+        assert_eq!(backup.transcription_language, "synthetic-first");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn blocked_settings_refuse_to_save() {
+        let directory = settings_directory("blocked");
+        let settings = Settings {
+            save_blocked: Some("Synthetic read failure".into()),
+            ..Default::default()
+        };
+        assert!(save_settings(&directory, &settings).is_err());
+        assert!(!directory.join("settings.json").exists());
+        let (loaded, warning) = load_settings(&directory);
+        assert!(warning.is_none() && loaded.save_blocked.is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encrypted_settings_roundtrip_and_keep_secrets_off_disk() {
+        let directory = settings_directory("encrypted");
+        let settings = Settings {
+            encrypt_at_rest: true,
+            discord_pairing_key: "synthetic-pairing-secret".into(),
+            ..Default::default()
+        };
+        save_settings(&directory, &settings).unwrap();
+        save_settings(&directory, &settings).unwrap();
+        for name in ["settings.json", "settings.json.bak"] {
+            let raw = std::fs::read(directory.join(name)).unwrap();
+            assert!(crate::history::protect::is_sealed(&raw));
+            assert!(!String::from_utf8_lossy(&raw).contains("synthetic-pairing-secret"));
+        }
+        let (loaded, warning) = load_settings(&directory);
+        assert!(warning.is_none());
+        assert!(loaded.encrypt_at_rest);
+        assert_eq!(loaded.discord_pairing_key, "synthetic-pairing-secret");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restored_settings_keep_local_secrets_and_merge_vocabulary() {
+        let current = Settings {
+            discord_pairing_key: "local-secret".into(),
+            model_path: "C:/local/model.gguf".into(),
+            ..Default::default()
+        };
+        let entry = dictionary::validate("Jon", "John").unwrap();
+        let library = crate::library::export(&[entry], &[]).unwrap();
+        let merged = merge_restored_settings(
+            &current,
+            Some(serde_json::json!({
+                "discord_pairing_key": "archived",
+                "model_path": "C:/elsewhere.gguf",
+                "transcription_language": "fr",
+            })),
+            Some(&library),
+        )
+        .unwrap();
+        assert_eq!(merged.discord_pairing_key, "local-secret");
+        assert_eq!(merged.model_path, "C:/local/model.gguf");
+        assert_eq!(merged.transcription_language, "fr");
+        assert_eq!(merged.entries.len(), 1);
     }
 
     fn call_row(speaker: i32, start_ms: u64, text: &str) -> calls::Row {

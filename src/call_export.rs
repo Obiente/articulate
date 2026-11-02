@@ -1,6 +1,9 @@
-//! Portable call transcripts, using the captured row ranges without inventing
+//! Portable transcripts, using the captured row ranges without inventing
 //! word-level timings. Overlapping rows remain overlapping subtitle cues.
-use crate::calls::{self, Row};
+use crate::{
+    calls::{self, Row},
+    history::{Kind, Session},
+};
 use std::fmt::Write;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +72,202 @@ pub fn export(rows: &[Row], names: &[String], format: Format) -> String {
         }
     }
     result
+}
+
+impl Format {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Text => "txt",
+            Self::Markdown => "md",
+            Self::Srt => "srt",
+            Self::WebVtt => "vtt",
+        }
+    }
+
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        match extension.to_ascii_lowercase().as_str() {
+            "txt" => Some(Self::Text),
+            "md" => Some(Self::Markdown),
+            "srt" => Some(Self::Srt),
+            "vtt" => Some(Self::WebVtt),
+            _ => None,
+        }
+    }
+}
+
+/// Export any saved session: calls and spoken notes by turn, dictations and
+/// written notes as one passage. Markdown and text include the title, date,
+/// participants, personal notes and generated notes. Subtitles need timing: a
+/// dictation becomes one cue spanning its recorded audio, and an item with no
+/// recorded timing cannot be exported as subtitles.
+pub fn session(session: &Session, format: Format) -> anyhow::Result<String> {
+    let rows: Vec<Row> = if session.rows.is_empty() {
+        let text = session.text.trim();
+        let duration = session.metrics.audio_duration_ms.unwrap_or(0);
+        if matches!(format, Format::Srt | Format::WebVtt) {
+            anyhow::ensure!(
+                !text.is_empty(),
+                "This item has no transcript to export as subtitles."
+            );
+            anyhow::ensure!(
+                duration > 0,
+                "This item has no recorded timing. Export it as text or Markdown instead."
+            );
+        }
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![Row {
+                cues: Vec::new(),
+                start_ms: 0,
+                end_ms: duration,
+                microphone: true,
+                speakers: Vec::new(),
+                discord: None,
+                text: text.to_owned(),
+            }]
+        }
+    } else {
+        session.rows.clone()
+    };
+    if matches!(format, Format::Srt | Format::WebVtt) {
+        return Ok(export(&rows, &session.speaker_names, format));
+    }
+    let markdown_format = format == Format::Markdown;
+    let heading = |text: &str, level: &str| {
+        if markdown_format {
+            format!("{level} {text}")
+        } else {
+            text.to_owned()
+        }
+    };
+    let mut result = String::new();
+    let title = single_line(&session.title);
+    let title = if title.is_empty() {
+        default_title(session.kind).to_owned()
+    } else {
+        title
+    };
+    let kind = match session.kind {
+        Kind::Dictation => "Dictation",
+        Kind::Call => "Call",
+        Kind::Note => "Note",
+    };
+    let mut details = vec![kind.to_owned(), local_time(session.created_ms)];
+    let duration = session
+        .rows
+        .iter()
+        .map(|row| row.end_ms)
+        .max()
+        .or(session.metrics.audio_duration_ms)
+        .unwrap_or(0);
+    if duration > 0 {
+        details.push(format!("Duration {}", clock(duration)));
+    }
+    let mut participants: Vec<String> = Vec::new();
+    for row in &session.rows {
+        for name in calls::speaker_labels(row, &session.speaker_names) {
+            let name = single_line(&name);
+            if !name.is_empty() && !participants.contains(&name) {
+                participants.push(name);
+            }
+        }
+    }
+    if markdown_format {
+        let _ = writeln!(
+            result,
+            "# {}\n\n{}\n",
+            markdown(&title),
+            details.join(" · ")
+        );
+        if !participants.is_empty() {
+            let names: Vec<String> = participants.iter().map(|name| markdown(name)).collect();
+            let _ = writeln!(result, "Participants: {}\n", names.join(", "));
+        }
+    } else {
+        let _ = writeln!(result, "{title}\n{}", details.join(" · "));
+        if !participants.is_empty() {
+            let _ = writeln!(result, "Participants: {}", participants.join(", "));
+        }
+        result.push('\n');
+    }
+    let personal = session.personal_notes.trim();
+    if !personal.is_empty() {
+        // Personal notes are the user's own writing, so their Markdown is kept.
+        let _ = writeln!(result, "{}\n\n{personal}\n", heading("My notes", "##"));
+    }
+    let generated: Vec<&str> = session
+        .generated_summary
+        .iter()
+        .flat_map(|summary| summary.items.iter().map(|item| item.text.trim()))
+        .filter(|text| !text.is_empty())
+        .collect();
+    if !generated.is_empty() {
+        let _ = writeln!(result, "{}\n", heading("Generated notes", "##"));
+        for item in generated {
+            if markdown_format {
+                let _ = writeln!(result, "- {}", markdown(item));
+            } else {
+                let _ = writeln!(result, "- {item}");
+            }
+        }
+        result.push('\n');
+    }
+    if !rows.is_empty() {
+        if session.rows.is_empty() {
+            let text = rows[0].text.trim();
+            let _ = writeln!(
+                result,
+                "{}\n\n{}",
+                heading("Text", "##"),
+                if markdown_format {
+                    markdown(text)
+                } else {
+                    text.to_owned()
+                }
+            );
+        } else {
+            let _ = writeln!(result, "{}\n", heading("Transcript", "##"));
+            let body = export(&rows, &session.speaker_names, format);
+            result.push_str(body.strip_prefix("# Call transcript\n\n").unwrap_or(&body));
+        }
+    }
+    Ok(result)
+}
+
+pub fn default_title(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Dictation => "Dictation",
+        Kind::Call => "Call transcript",
+        Kind::Note => "Note",
+    }
+}
+
+/// Local date and time, falling back to UTC when the offset is unknown.
+pub fn local_time(ms: u64) -> String {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .ok()
+        .map(|timestamp| {
+            let local = timestamp.to_offset(
+                time::UtcOffset::local_offset_at(timestamp).unwrap_or(time::UtcOffset::UTC),
+            );
+            format!("{} {:02}:{:02}", local.date(), local.hour(), local.minute())
+        })
+        .unwrap_or_else(|| "Date unavailable".into())
+}
+
+fn clock(ms: u64) -> String {
+    let seconds = ms / 1000;
+    if seconds >= 3600 {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
 }
 
 fn timestamp(ms: u64, separator: char) -> String {
@@ -195,6 +394,65 @@ mod tests {
         );
         assert!(export(&rows, &[], Format::Text).contains("No duration"));
         assert_eq!(export(&[], &[], Format::WebVtt), "WEBVTT\n\n");
+    }
+
+    #[test]
+    fn calls_export_title_participants_notes_and_timed_turns() {
+        let mut call = Session::new(Kind::Call);
+        call.title = "Planning *sync*".into();
+        call.speaker_names = vec!["Morgan".into(), "Alex".into(), String::new(), String::new()];
+        call.rows = vec![
+            row(0, 1500, &[1], "Hello."),
+            row(1500, 4000, &[2], "Ship it."),
+        ];
+        call.personal_notes = "- my **own** list".into();
+        let markdown = session(&call, Format::Markdown).unwrap();
+        assert!(markdown.starts_with("# Planning \\*sync\\*\n\nCall · "));
+        assert!(markdown.contains("Duration 0:04"));
+        assert!(markdown.contains("Participants: Morgan, Alex"));
+        assert!(markdown.contains("## My notes\n\n- my **own** list"));
+        assert!(
+            markdown
+                .contains("## Transcript\n\n**Morgan** · 00:00:00.000 to 00:00:01.500\n\nHello\\.")
+        );
+        assert!(!markdown.contains("# Call transcript"));
+        let srt = session(&call, Format::Srt).unwrap();
+        assert!(srt.contains("00:00:01,500 --> 00:00:04,000\nAlex: Ship it."));
+        let vtt = session(&call, Format::WebVtt).unwrap();
+        assert!(vtt.starts_with("WEBVTT\n\n1\n00:00:00.000 --> 00:00:01.500\nMorgan: Hello."));
+        assert!(
+            session(&call, Format::Text)
+                .unwrap()
+                .contains("[00:00:01.500 to 00:00:04.000] Alex")
+        );
+    }
+
+    #[test]
+    fn dictations_export_as_one_timed_passage_and_never_invent_timing() {
+        let mut dictation = Session::new(Kind::Dictation);
+        dictation.title = "Reply".into();
+        dictation.text = "Thanks, see you Thursday.".into();
+        dictation.metrics.audio_duration_ms = Some(2500);
+        let srt = session(&dictation, Format::Srt).unwrap();
+        assert_eq!(
+            srt,
+            "1\n00:00:00,000 --> 00:00:02,500\nYou: Thanks, see you Thursday.\n\n"
+        );
+        let markdown = session(&dictation, Format::Markdown).unwrap();
+        assert!(markdown.contains("## Text\n\nThanks, see you Thursday\\."));
+        dictation.metrics.audio_duration_ms = None;
+        assert!(session(&dictation, Format::WebVtt).is_err());
+        assert!(
+            session(&dictation, Format::Text)
+                .unwrap()
+                .contains("Thanks, see you Thursday.")
+        );
+        let mut note = Session::new(Kind::Note);
+        note.personal_notes = "Only my words.".into();
+        assert!(session(&note, Format::Srt).is_err());
+        let text = session(&note, Format::Markdown).unwrap();
+        assert!(text.starts_with("# Note\n\nNote · "));
+        assert!(text.contains("## My notes\n\nOnly my words."));
     }
 
     #[test]
