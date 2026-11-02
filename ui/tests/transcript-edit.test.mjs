@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { replaceSpelling, suggestSpelling } from "../src/transcript-edit.js";
+import {
+  replaceSpelling,
+  suggestSpelling,
+} from "../src/features/dictation/transcript-edit.js";
 
 test("repeated multiword spelling corrections preserve surrounding prose", () => {
   const before = "Start with a kit. Considering a kit is a sample project.";

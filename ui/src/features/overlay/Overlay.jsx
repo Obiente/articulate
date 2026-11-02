@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
-import { overlaySnapshot } from "./bridge";
+import { onOverlay, overlaySnapshot } from "../../bridge.js";
 import "./overlay.css";
+
+// A slow check in case an update event was missed. Updates are pushed.
+const FALLBACK_INTERVAL = 3000;
 
 export function Overlay() {
   const [state, setState] = useState({
@@ -10,21 +13,33 @@ export function Overlay() {
   });
   useEffect(() => {
     let active = true,
-      timer;
-    async function poll() {
+      timer,
+      unlisten;
+    const show = (next) => {
+      if (active && next) setState(next);
+    };
+    async function refresh() {
       try {
-        const next = await overlaySnapshot();
-        if (active) setState(next);
+        show(await overlaySnapshot());
       } catch {
         /* Native window owns visibility. */
       } finally {
-        if (active) timer = setTimeout(poll, 150);
+        if (active) timer = setTimeout(refresh, FALLBACK_INTERVAL);
       }
     }
-    void poll();
+    onOverlay(show)
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      })
+      .catch(() => {
+        /* The fallback check keeps the indicator current. */
+      });
+    void refresh();
     return () => {
       active = false;
       clearTimeout(timer);
+      unlisten?.();
     };
   }, []);
   return (
