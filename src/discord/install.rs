@@ -670,6 +670,10 @@ fn build(source: &Path, native: bool, progress: &impl Fn(&str)) -> Result<()> {
             "pnpm",
             "install",
             "--frozen-lockfile",
+            // Transitive packages must not run lifecycle scripts on this machine.
+            // The pinned build only needs esbuild, whose Windows binary arrives
+            // as an optional dependency rather than through its postinstall step.
+            "--ignore-scripts",
         ]);
         run(command, source, &log, Duration::from_secs(1800))?;
     }
@@ -897,7 +901,10 @@ fn download(url: &str, expected: &str, destination: &Path, limit: u64) -> Result
         );
         return Ok(());
     }
+    ensure!(url.starts_with("https://"), "Downloads must use HTTPS");
+    // https_only also refuses any redirect to a plain HTTP target.
     let config = ureq::Agent::config_builder()
+        .https_only(true)
         .timeout_global(Some(Duration::from_secs(180)))
         .build();
     let mut response = config
@@ -905,17 +912,74 @@ fn download(url: &str, expected: &str, destination: &Path, limit: u64) -> Result
         .get(url)
         .call()
         .context("The verified download could not be fetched")?;
-    let mut bytes = Vec::new();
-    response
-        .body_mut()
-        .as_reader()
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= limit && hash(&bytes) == expected,
-        "Downloaded file failed size or SHA-256 verification"
-    );
-    write_new(destination, &bytes)
+    if let Some(length) = response.headers().get("Content-Length") {
+        ensure!(
+            length.to_str()?.trim().parse::<u64>()? <= limit,
+            "Downloaded file exceeds its size limit"
+        );
+    }
+    stream_verified(
+        response.body_mut().as_reader(),
+        expected,
+        destination,
+        limit,
+    )
+}
+
+/// Streams bytes to a sibling temporary file while hashing them, then renames
+/// the file into place only when the SHA-256 digest matches. Nothing is held
+/// in memory beyond one buffer, and a failed or oversized download leaves no
+/// file behind. Intended to be replaced by the shared resumable downloader.
+fn stream_verified(
+    mut reader: impl Read,
+    expected: &str,
+    destination: &Path,
+    limit: u64,
+) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("Download destination has no directory")?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Download destination has no name")?;
+    let temporary = parent.join(format!(
+        ".{name}.{}.part",
+        &super::plugin::new_token()?[..16]
+    ));
+    let mut file = fs::File::options()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    let result = (|| -> Result<()> {
+        let mut hasher = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            total += count as u64;
+            ensure!(total <= limit, "Downloaded file exceeds its size limit");
+            hasher.update(&buffer[..count]);
+            file.write_all(&buffer[..count])?;
+        }
+        ensure!(
+            format!("{:x}", hasher.finalize()) == expected,
+            "Downloaded file failed SHA-256 verification"
+        );
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    match result {
+        Ok(()) => fs::rename(&temporary, destination).map_err(Into::into),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
 }
 
 /// Creates a private, pinned source checkout. Does not touch Discord or installed Vencord.
@@ -1079,6 +1143,53 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn verified_downloads_stream_to_a_temporary_file_and_leave_nothing_on_failure() {
+        let fixture = Fixture::new();
+        let bytes: Vec<u8> = (0..200_000_u32).map(|i| (i % 251) as u8).collect();
+        let expected = hash(&bytes);
+        let destination = fixture.0.join("archive.zip");
+        let leftovers = || {
+            fs::read_dir(&fixture.0)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+                .count()
+        };
+        assert!(
+            stream_verified(
+                std::io::Cursor::new(&bytes),
+                &expected,
+                &destination,
+                100_000
+            )
+            .is_err(),
+            "Oversized downloads stop at the limit"
+        );
+        assert!(!destination.exists());
+        assert!(
+            stream_verified(
+                std::io::Cursor::new(&bytes),
+                &"0".repeat(64),
+                &destination,
+                1 << 20
+            )
+            .is_err(),
+            "A digest mismatch never produces the destination"
+        );
+        assert!(!destination.exists());
+        assert_eq!(leftovers(), 0);
+        stream_verified(
+            std::io::Cursor::new(&bytes),
+            &expected,
+            &destination,
+            1 << 20,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(leftovers(), 0);
+    }
+
     #[test]
     fn companion_revision_covers_templates_native_payload_and_preload() {
         let plugin: &[(&str, &[u8])] = &[("index.ts", b"plugin")];
