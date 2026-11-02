@@ -10,7 +10,10 @@ pub(crate) enum Action {
 impl App {
     pub(crate) fn desktop_assort_action(&mut self, action: Action) -> Result<(), String> {
         match action {
-            Action::AssortStart { app } => self.desktop_assort_start(app)?,
+            Action::AssortStart { app } => {
+                let context = app.or_else(|| self.dictation_app.clone());
+                self.desktop_assort_start(context)?;
+            }
             Action::AssortApply {
                 index,
                 saved_spelling,
