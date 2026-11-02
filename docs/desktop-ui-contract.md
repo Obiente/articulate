@@ -27,6 +27,9 @@ Sections are typed serde views in `src/app/desktop/view/`; the registry is `view
 | `document_body` | `selected_body` | Background |
 | `vocabulary` | `dictionary`, `macros` | Background |
 | `insights` | `insights` | Background |
+| `search` | `search` | Live |
+| `storage` | `storage`, `library_notice` | Live |
+| `recovery` | `recovery` | Background |
 
 Live sections are compared every 250 ms. Background sections (large lists and document bodies) are compared about once a second, after every action, and in the same pass whenever `document` changes, so a newly opened document arrives with its body. Comparison serializes the borrowed view into a reused buffer and compares bytes; nothing is sent for unchanged sections.
 
@@ -40,6 +43,7 @@ type Summary = {
   id: string; title: string; kind: "call" | "dictation" | "note";
   created_ms: number; updated_ms: number; preview: string; duration_ms: number;
   topic_id: string | null; is_collection: boolean; can_receive_sources: boolean;
+  pinned: boolean;
 };
 // `selected`, `call_session` and `note_session`: metadata and notes only.
 type SessionMeta = {
@@ -47,6 +51,9 @@ type SessionMeta = {
   audio_packets_lost: number; created_ms: number; updated_ms: number;
   topic_id: string | null; is_collection: boolean; can_receive_sources: boolean;
   sources: { id: string; title: string; kind: string; created_ms: number; preview: string }[];
+  pinned: boolean;
+  follow_ups: number;                    // generated action items still in the notes
+  subtitles_unavailable: string | null;  // why SRT/WebVTT can't be exported
 };
 // `selected_body`: the open document's transcript, sent separately.
 type SessionBody = { id: string; text: string; original: string; rows: Row[] };
@@ -103,6 +110,19 @@ Library and documents (`actions/library.rs`):
 - `session_delete { id }`, `notes_generate { id }`
 - `dictation_edit { id, expected_text, text, correction?: { heard, wanted, cues? } }`
 - `source_move { id, topic_id: string|null, expected_topic_id: string|null }`, `source_file { id }`: move one independent source or retry automatic topic filing.
+- `history_search { query, filters?: { from_ms?, to_ms?, kind?: "call"|"dictation"|"note", speaker?, app? } }`: full-text search; replaces and cancels the previous search. An empty query clears the results. Dates are inclusive creation times. Query problems are reported in `search.error`, not as a rejected action.
+- `session_pin { id, pinned }`: pinned items are kept by retention.
+- `session_export { id, format: "text"|"markdown"|"srt"|"vtt" }`: export an open, captured or selected document. Formats the document can't produce (see `subtitles_unavailable`) are rejected before a dialog opens.
+- `followups_export { id, format: "markdown"|"ics", reminder_ms?: number|null }`: export the document's `follow_ups` as a Markdown checklist or calendar tasks, optionally with a future reminder. Rejected when there are none.
+
+Privacy and storage (`actions/library.rs`):
+
+- `storage_encryption { enabled }`: the only way to change encryption at rest. Progress and the result are in `storage`.
+- `retention_preview { policy }`, `retention_save { policy }` with `policy = { enabled, days, dictations, calls, notes }`. Saving an enabled policy requires a finished preview of exactly that policy; the previewed items are deleted at once and later ones once a day. Saving a disabled policy needs no preview.
+- `quarantine_list`, `quarantine_restore { file_name }`, `quarantine_export { file_name }`, `quarantine_discard { file_name }`: review isolated files from `recovery.quarantine`.
+- `backup_create { passphrase?: string|null }` (8 or more characters when present), `backup_restore { passphrase?, replace_older, include_settings }`, `history_export_markdown`.
+
+Actions that ask for a file or folder (`session_export`, `followups_export`, `quarantine_export`, `backup_create`, `backup_restore`, `history_export_markdown`) resolve once the dialog is open. The dialog runs on its own thread so capture and autosave continue; only one can be open at a time (`storage.dialog_open`). Outcomes arrive as `library_notice` or in the matching `storage` result.
 
 Capture (`actions/capture.rs`):
 
@@ -179,6 +199,44 @@ include `is_collection`, `topic_id`, `can_receive_sources` and a `sources` list;
 source text remains in independently saved sessions. `filing_working` and
 `filing_status` describe automatic organization. Pending filing is persisted for
 retry after restart.
+
+```ts
+type Search = {
+  query: string; working: boolean; error: string | null;
+  filters: { from_ms: number|null; to_ms: number|null; kind: string|null; speaker: string|null; app: string|null };
+  results: null | {
+    query: string; indexed: boolean; partial: boolean; more: boolean;
+    scanned_sessions: number; unreadable_sessions: number;
+    hits: { session_id: string; title: string; kind: string; created_ms: number;
+      field: "title"|"text"|"original"|"personal_notes"|"generated_notes"|"transcript"|"speaker_names";
+      excerpt: string; matches: [number, number][]; // UTF-8 byte ranges within `excerpt`
+      speaker: string|null; start_ms: number|null; end_ms: number|null }[];
+  };
+};
+type Progress = "idle" | "choosing" | "working";
+type Storage = {
+  encrypt_at_rest: boolean; encryption_working: boolean;
+  encryption_result: null | { error: string|null; protect: boolean; changed: number; failed: number };
+  retention: Policy; retention_preview_working: boolean;
+  retention_preview: null | { policy: Policy|null; error: string|null; total: number;
+    items: { id: string; title: string; kind: string; updated_ms: number }[] }; // first 100
+  backup: Progress; backup_result: null | { error: string|null; path: string|null; sessions: number; encrypted: boolean; skipped: number };
+  restore: Progress; restore_result: null | { error: string|null; sessions_in_archive: number; added: number;
+    updated: number; kept_local: number; newer_in_backup: number; deleted_locally: number; failed: number;
+    settings_restored: boolean; shortcuts_changed: boolean; model_reload: boolean };
+  markdown: Progress; markdown_result: null | { error: string|null; folder: string|null; files: number; skipped: number };
+  dialog_open: boolean;
+};
+type LibraryNotice = null | { sequence: number; error: boolean; message: string };
+type Recovery = {
+  warnings: { id: string; kind: "damaged"|"unavailable"|"newer_version"; message: string }[];
+  quarantined: number; listed: boolean;
+  quarantine: { file_name: string; id: string; bytes: number; modified_ms: number;
+    restorable: boolean; title: string|null; reason: string }[];
+};
+```
+
+`search` holds at most 100 hits; `more` reports that the index returned others. `indexed: false` means the full-text index was still being built and a bounded scan of recent files answered instead. `library_notice.sequence` increases with every notice; renderers baseline the first value they see and show each later notice once. A restore that includes preferences keeps this device's encryption and retention choices, registers changed shortcuts again and sets `model_reload` when the speech model's language or processor changed.
 
 Insights contain `words`, `sessions`, `words_per_minute`, `current_streak`, `longest_streak`, `active_days`, `dictionary_replacements`, `cleanup_edits`, `apps: [{app, words, sessions}]` and `days: [{date, words, sessions}]`.
 
