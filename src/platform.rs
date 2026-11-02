@@ -539,7 +539,7 @@ mod win {
                 return;
             }
             'worker: loop {
-                let held = lifecycle.needs_poll();
+                let held = registration.active.is_some() && lifecycle.needs_poll();
                 MsgWaitForMultipleObjects(
                     0,
                     std::ptr::null(),
@@ -578,6 +578,19 @@ mod win {
                         {
                             break 'worker;
                         }
+                    }
+                }
+                // A wake can arrive during message dispatch. Consume its command
+                // before sleeping again, even if its message was already removed.
+                loop {
+                    match wake_rx.try_recv() {
+                        Ok(requested) => {
+                            if !apply(requested, &mut registration, &mut registry, &mut lifecycle) {
+                                break 'worker;
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'worker,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     }
                 }
                 // Drain queued presses before rearming a registration which
