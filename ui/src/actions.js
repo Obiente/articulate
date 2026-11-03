@@ -149,6 +149,11 @@ export function sourceMoveAction(id, topicId, expectedTopicId) {
 // native controller's.
 const validators = {
   settings_patch(action) {
+    if (
+      action.auto_polish !== undefined &&
+      typeof action.auto_polish !== "boolean"
+    )
+      throw Error("Automatic cleanup must be on or off.");
     for (const key of ["hotkey", "quick_note_hotkey"]) {
       const h = action[key];
       if (!h) continue;

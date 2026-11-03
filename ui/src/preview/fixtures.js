@@ -283,6 +283,7 @@ export const sampleSettings = {
   styles: [{ app: "editor.exe", style: "Clean" }],
   recent_dictation_app: "editor.exe",
   clean_speech: true,
+  auto_polish: false,
   insert: true,
   live_insert: true,
   learn_corrections: true,

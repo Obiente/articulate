@@ -5,6 +5,7 @@ pub(crate) mod runtime;
 pub(crate) mod speech;
 mod stamp;
 mod transfer;
+pub(crate) mod vocabulary;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,7 @@ pub struct Request {
     pub source: String,
     pub style: Style,
     pub protected: Vec<String>,
+    pub vocabulary: Vec<vocabulary::Term>,
 }
 
 impl Request {
@@ -83,9 +85,14 @@ pub struct Preview {
 }
 
 fn preview(request: &Request, candidate: String, elapsed_ms: u64) -> Preview {
-    let blocked = guard::check(&request.source, &candidate, &request.protected)
-        .err()
-        .map(|error| error.to_string());
+    let blocked = guard::check_vocabulary(
+        &request.source,
+        &candidate,
+        &request.protected,
+        &request.vocabulary,
+    )
+    .err()
+    .map(|error| error.to_string());
     let cleaned = speech::clean(&request.source, &request.protected);
     let cleanup_only = blocked.is_some() && cleaned != request.source;
     Preview {
@@ -277,6 +284,7 @@ mod tests {
             source: source.into(),
             style: Style::Professional,
             protected: vec![],
+            vocabulary: vec![],
         };
         let result = preview(&request, "The invoice has been paid.".into(), 1);
         assert!(result.blocked.is_some());
@@ -329,6 +337,7 @@ mod tests {
                     source: source.into(),
                     style: Style::Professional,
                     protected: vec![],
+                    vocabulary: vec![],
                 })
                 .unwrap();
             loop {
@@ -365,6 +374,7 @@ mod tests {
             source: "Hello Casey.".into(),
             style: Style::Clear,
             protected: vec![],
+            vocabulary: vec![],
         };
         assert!(request.validate().is_ok());
         assert!(
@@ -448,6 +458,7 @@ mod tests {
                     source: source.into(),
                     style,
                     protected: vec![],
+                    vocabulary: vec![],
                 })
                 .unwrap();
             let started = Instant::now();
@@ -486,6 +497,7 @@ mod tests {
                 source: "Hello.".into(),
                 style: Style::Clear,
                 protected: vec![],
+                vocabulary: vec![],
             })
             .unwrap();
         let start = Instant::now();

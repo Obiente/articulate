@@ -27,7 +27,7 @@ Open **Settings → Audio & models**. Qwen3-ASR 1.7B Q8_0 is a separate download
 
 An optional **751 MB Nemotron 3.5 ASR** download powers faster live dictation previews and adds a second local check for completed short dictations. Qwen still produces the final transcript. The check can replace a writing-system switch when the selected or independently detected language supports that correction; other disagreements keep Qwen's text. Live previews may omit brief fillers and are replaced by the final transcript. [Model comparison and current limits](docs/diarization-and-dual-asr.md).
 
-For optional advanced cleanup, choose **Polish** after dictation or open **Settings > Audio & models > Advanced cleanup**. The Qwen3.5 0.8B Q8 editor and CPU tools download separately (about **852 MB**). Short passages run locally with explicit review. [Editing behavior and limits](docs/local-cleanup.md).
+For optional advanced cleanup, choose **Polish** after dictation or open **Settings > Audio & models > Advanced cleanup**. The Qwen3.5 0.8B Q8 editor and CPU tools download separately (about **852 MB**). Short passages use your vocabulary locally. Review a Polish preview or opt into automatic cleanup before insertion, with a four-second deadline and the current text as fallback. [Editing behavior and limits](docs/local-cleanup.md).
 
 Assort's included models use authored synthetic English training examples. The vocabulary classifier scores existing spelling choices; they do not provide general language understanding or generate new prose. Review their suggestions, especially for unfamiliar names, ambiguous wording, and other languages. [How classification works →](docs/classification.md)
 
