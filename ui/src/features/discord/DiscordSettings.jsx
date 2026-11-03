@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Alert,
   Badge,
@@ -17,6 +17,7 @@ import {
   SetupStatus,
 } from "../../components/SettingRow.jsx";
 import { DiscordParticipants } from "./DiscordParticipants.jsx";
+import { clearParticipantAvatars } from "./ParticipantAvatar.jsx";
 
 const companionRuntimes = {
   current: {
@@ -84,6 +85,14 @@ export function DiscordSettings({ controls }) {
   const { state, settings, busy, capturing, pending, action, toggle } =
     controls;
   const discord = state.discord || {};
+  // Turning pictures off or on drops every cached picture, so nothing stale
+  // is shown and unavailable ones are fetched again.
+  const picturesShown = useRef(settings.discord_avatars);
+  useEffect(() => {
+    if (picturesShown.current === settings.discord_avatars) return;
+    picturesShown.current = settings.discord_avatars;
+    clearParticipantAvatars();
+  }, [settings.discord_avatars]);
   const discordListening = Boolean(discord.listener_started);
   const usingCompanion = Boolean(
     discord.companion_selected ?? settings.discord_companion,

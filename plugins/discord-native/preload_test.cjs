@@ -22,6 +22,12 @@ const pairingKey = Buffer.from("0".repeat(64), "hex"), wrongKey = Buffer.from("1
 let serverKey = pairingKey, handshakes = 0, confirmations = 0, serverSession = null, pendingProof = null;
 let forgetSession = false, transientFailures = 0, upgradeRequired = false, unauthenticatedBodies = 0;
 let agentInstances = 0, agentUsed = 0;
+// The connection the keep-alive agent hands out, and the one that completed
+// the receiver's handshake. Replacing the listener (Articulate restarted, or
+// another process bound the port) yields a new socket object whose server-side
+// session state starts empty, exactly like a real new TCP connection.
+let socketSerial = 0, connection = { id: ++socketSerial }, handshakeSocket = null;
+const replaceListener = () => { connection = { id: ++socketSerial }; pendingProof = null; serverSession = null; };
 class Agent { constructor(options) { agentInstances++; assert.equal(options.keepAlive, true); assert.equal(options.maxSockets, 1); } }
 const source = fs.readFileSync(join(__dirname, "preload.cjs"), "utf8");
 const context = { Buffer, BigInt, Set, Date, JSON, Error, Promise, setTimeout: forbiddenBrowserTimer, clearTimeout: forbiddenBrowserTimer,
@@ -40,8 +46,11 @@ const context = { Buffer, BigInt, Set, Date, JSON, Error, Promise, setTimeout: f
             assert.equal(options.headers.Host, "127.0.0.1:9223");
             assert(options.agent instanceof Agent, "Every request reuses the persistent connection");
             agentUsed++;
-            const req = new EventEmitter(); req.destroy = () => req.emit("close");
+            const req = new EventEmitter(); req.destroy = () => { req.destroyed = true; req.emit("close"); };
+            let ended = false;
             req.end = body => {
+                assert(req.socket, "Nothing may be written before the agent assigned a connection");
+                ended = true;
                 const respond = (status, replyBody) => {
                     const res = new EventEmitter(); res.statusCode = status;
                     callback(res);
@@ -60,19 +69,23 @@ const context = { Buffer, BigInt, Set, Date, JSON, Error, Promise, setTimeout: f
                     assert.match(client_nonce, /^[a-f0-9]{64}$/);
                     const clientNonce = Buffer.from(client_nonce, "hex"), serverNonce = randomBytes(32);
                     const id = randomBytes(16).toString("hex");
-                    pendingProof = { id, proof: createHmac("sha256", pairingKey).update("articulate-companion-v2/client").update(clientNonce).update(serverNonce).digest() };
+                    pendingProof = { id, socket: req.socket, proof: createHmac("sha256", pairingKey).update("articulate-companion-v2/client").update(clientNonce).update(serverNonce).digest() };
                     const serverProof = createHmac("sha256", serverKey).update("articulate-companion-v2/server").update(clientNonce).update(serverNonce).digest("hex");
                     return respond(200, JSON.stringify({ version: 2, session: id, server_nonce: serverNonce.toString("hex"), server_proof: serverProof }));
                 }
                 if (options.path === "/session/confirm") {
                     confirmations++;
+                    assert.equal(req.socket, pendingProof?.socket, "A proof answers the connection that received the server's proof");
                     const { version, session, client_proof } = JSON.parse(body.toString("utf8"));
                     const valid = version === 2 && pendingProof && session === pendingProof.id
                         && timingSafeEqual(Buffer.from(client_proof, "hex"), pendingProof.proof);
                     if (!valid) { pendingProof = null; return respond(403); }
-                    serverSession = pendingProof.id; pendingProof = null;
+                    serverSession = pendingProof.id; handshakeSocket = req.socket; pendingProof = null;
                     return respond(204);
                 }
+                // Application data on a connection other than the one that completed
+                // the handshake has been handed to a listener that never proved the key.
+                assert.equal(req.socket, handshakeSocket, `${options.path} written to an unproven connection`);
                 if (forgetSession) { forgetSession = false; serverSession = null; }
                 if (options.headers.Authorization !== `Articulate-Session ${serverSession}` || !serverSession) {
                     unauthenticatedBodies += body.length; return respond(401);
@@ -113,6 +126,9 @@ const context = { Buffer, BigInt, Set, Date, JSON, Error, Promise, setTimeout: f
                 else if (options.path === "/capture" && deferControl) finishControl = deliver;
                 else deliver(options.path === "/capture" ? controlStatus : options.path === "/diagnostics" ? diagnosticsStatus : audioStatus);
             };
+            // Like Node, the agent assigns a connection asynchronously; the
+            // request body may only follow that assignment.
+            setImmediate(() => { if (!req.destroyed) { req.socket = connection; req.emit("socket", connection); } });
             return req;
         } };
     }
@@ -164,7 +180,8 @@ process.exitCode = 1;
         }
         if (tick % 25 === 0) scheduled.get(250)();
         if (tick % 2 === 0) scheduled.get(20)();
-        await new Promise(resolve => setImmediate(resolve));
+        // Each batch waits one turn for the agent to assign its connection.
+        for (let hop = 0; hop < 3; hop++) await new Promise(resolve => setImmediate(resolve));
     }
     assert.equal(backgroundDrops, 472, "A one-second background timer loses 472 of 600 callbacks");
     assert.equal(nodeDrops, 0);
@@ -328,6 +345,44 @@ process.exitCode = 1;
     assert(report.transport.packets >= 600);
     delete addon.stats;
     assert.equal(api.diagnostics().native, undefined, "Older addons remain compatible");
+
+    // Articulate restarted, so the agent opens a new connection. The cached
+    // session must not be reused there: whatever answers has proven nothing,
+    // so only a fresh handshake is written before the queued audio.
+    const current = tag => { const packet = Buffer.alloc(66); packet.writeBigUInt64LE(8n, 52); packet[64] = tag; return packet; };
+    const handshakesBeforeReplace = handshakes, confirmationsBeforeReplace = confirmations;
+    replaceListener();
+    queue.push(current(128));
+    await context.harness.drain();
+    assert.equal(handshakes, handshakesBeforeReplace + 1);
+    assert.equal(confirmations, confirmationsBeforeReplace + 1);
+    assert.equal(receivedTags.at(-1), 128, "the batch follows the proven handshake on the new connection");
+    assert.equal(unauthenticatedBodies, 70, "no body reached the new listener before it proved the key");
+    assert.equal(api.status().state, "capturing");
+    // Another process bound the port while Articulate was away. It gets a
+    // nonce and nothing else, however eagerly it answers, and capture stops.
+    serverKey = wrongKey; replaceListener();
+    const confirmationsBeforeRogue = confirmations, postsBeforeRogue = posts, stopsBeforeRogue = stopped;
+    queue.push(current(129));
+    await context.harness.drain();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(api.status().state, "audio-transport-unavailable");
+    assert.equal(stopped, stopsBeforeRogue + 1);
+    assert.equal(confirmations, confirmationsBeforeRogue, "an unproven listener never receives a client proof");
+    assert.equal(posts, postsBeforeRogue, "an unproven listener never receives audio");
+    clockMs += 1201;
+    await context.harness.control();
+    assert.equal(api.status().state, "waiting-for-articulate");
+    assert.equal(confirmations, confirmationsBeforeRogue);
+    // Articulate is back on a fresh connection: pairing resumes there.
+    serverKey = pairingKey; replaceListener();
+    await context.harness.control();
+    assert.equal(confirmations, confirmationsBeforeRogue + 1);
+    assert.equal(api.status().state, "capturing");
+    queue.push(current(130));
+    await context.harness.drain();
+    assert.equal(receivedTags.at(-1), 130);
+    assert.equal(unauthenticatedBodies, 70);
     active = false;
     const beforeInactive = stopped;
     await context.harness.control(); assert.equal(api.status().state, "ready");
@@ -341,12 +396,14 @@ process.exitCode = 1;
     assert.equal(armCalls, beforeDisableArms, "A paused GET cannot undo explicit disable");
     assert.equal(api.status().state, "disabled"); assert(stopped >= 3);
     // A newer receiver tells the companion to update instead of being trusted.
+    const handshakesBeforeUpgrade = handshakes, confirmationsBeforeUpgrade = confirmations;
     upgradeRequired = true;
     assert(api.enable("0".repeat(64)));
     await context.harness.control();
     assert.equal(api.status().state, "update-required");
-    assert.equal(handshakes, 4, "Wrong key, pairing, session loss and the version check");
-    assert.equal(confirmations, 2, "Only proven listeners ever receive a client proof");
+    assert.equal(handshakes, handshakesBeforeUpgrade + 1, "The version check is one handshake");
+    assert.equal(confirmations, confirmationsBeforeUpgrade, "Only proven listeners ever receive a client proof");
+    assert.equal(confirmations, 4, "Pairing, session loss, the replaced listener and Articulate's return");
     assert(agentUsed > 0);
     console.log("Renderer handshake, control, PCM, retry, nonce and stopping pass with mocked localhost.");
     process.exitCode = 0;

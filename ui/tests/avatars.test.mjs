@@ -88,3 +88,77 @@ test("the cache gives up after the retry budget and never loads bad URIs", async
   assert.equal(await cache.resolve("https://example.invalid/avatar.png"), null);
   assert.equal(loads, 3, "non-identifier URIs never reach the bridge");
 });
+
+test("an unavailable picture is remembered only briefly, then tried again", async () => {
+  let clock = 0;
+  const answers = [null, new Uint8Array([9])];
+  let loads = 0;
+  const cache = createAvatarCache({
+    load: async () => {
+      loads += 1;
+      return answers.shift() ?? null;
+    },
+    toUrl: (bytes) => `blob:${bytes.length}`,
+    wait: async () => {},
+    retries: [],
+    now: () => clock,
+    unavailableTtl: 1000,
+  });
+  const seen = [];
+  cache.subscribe(valid, (url) => seen.push(url));
+  assert.equal(await cache.resolve(valid), null);
+  assert.equal(loads, 1);
+  assert.equal(cache.peek(valid), null, "trusted while fresh");
+  assert.equal(await cache.resolve(valid), null);
+  assert.equal(loads, 1, "not fetched again while the result is fresh");
+  clock = 1000;
+  assert.equal(cache.peek(valid), undefined, "expired, so unknown again");
+  assert.equal(cache.size(), 0);
+  assert.equal(await cache.resolve(valid), "blob:1");
+  assert.equal(loads, 2);
+  assert.deepEqual(seen, [null, "blob:1"]);
+  assert.equal(cache.peek(valid), "blob:1");
+  clock = 1_000_000;
+  assert.equal(cache.peek(valid), "blob:1", "a real picture never expires");
+});
+
+test("object URLs are revoked once nothing shows them", async () => {
+  const revoked = [];
+  let serial = 0;
+  const cache = createAvatarCache({
+    load: async () => new Uint8Array([1]),
+    toUrl: () => `blob:${(serial += 1)}`,
+    revoke: (url) => revoked.push(url),
+    wait: async () => {},
+    retries: [],
+  });
+  const other = "bytes://discord-avatar/7/0123456789abcdef0123456789abcdef.png";
+  assert.equal(await cache.resolve(valid), "blob:1");
+  cache.forget(valid);
+  assert.deepEqual(revoked, ["blob:1"], "nothing shows it, so it is freed at once");
+  // While a subscriber still shows a picture, forgetting defers revocation
+  // until the subscriber lets go.
+  const unsubscribe = cache.subscribe(valid, () => {});
+  assert.equal(await cache.resolve(valid), "blob:2");
+  cache.forget(valid);
+  assert.deepEqual(revoked, ["blob:1"]);
+  unsubscribe();
+  assert.deepEqual(revoked, ["blob:1", "blob:2"]);
+  // A replacement is announced to subscribers before the old URL is freed.
+  const seen = [];
+  const stop = cache.subscribe(valid, (url) => seen.push(url));
+  assert.equal(await cache.resolve(valid), "blob:3");
+  cache.forget(valid);
+  assert.equal(await cache.resolve(valid), "blob:4");
+  assert.deepEqual(seen, ["blob:3", "blob:4"]);
+  assert.deepEqual(revoked, ["blob:1", "blob:2", "blob:3"]);
+  stop();
+  assert.deepEqual(revoked, ["blob:1", "blob:2", "blob:3"]);
+  // Clearing, for example when pictures are turned off, frees everything.
+  assert.equal(await cache.resolve(other), "blob:5");
+  assert.equal(cache.size(), 2);
+  cache.clear();
+  assert.equal(cache.size(), 0);
+  assert.deepEqual(revoked, ["blob:1", "blob:2", "blob:3", "blob:4", "blob:5"]);
+  assert.equal(await cache.resolve(valid), "blob:6", "a cleared picture loads again");
+});

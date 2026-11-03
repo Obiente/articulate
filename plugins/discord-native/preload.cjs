@@ -15,7 +15,10 @@ try {
     if (!["start", "arm", "poll", "stop"].every(name => typeof addon[name] === "function")) addon = null;
 } catch { /* Unsupported addon loads must not prevent Discord from opening. */ }
 // Protocol version 2: mutual HMAC handshake, then ordered requests over one
-// persistent loopback connection bound to that authenticated session.
+// persistent loopback connection bound to that authenticated session. The
+// session is tied to the socket object that completed the handshake: should
+// the agent ever open another connection, whatever answers there has not
+// proven the key, so nothing but a fresh handshake is written to it.
 const PROTOCOL_VERSION = 2;
 const ENDPOINT = { hostname: "127.0.0.1", port: 9223, host: "127.0.0.1:9223" };
 const SERVER_LABEL = "articulate-companion-v2/server", CLIENT_LABEL = "articulate-companion-v2/client";
@@ -58,10 +61,16 @@ async function publishDiagnostics() {
     finally { body.fill(0); diagnosticsBusy = false; }
 }
 
-function exchange(method, path, body, sessionId) {
+// Sends one request. `bind` names the socket the request must travel on
+// (and the session it carries); with no bound socket the request may open a
+// connection, and the reply records which socket answered. Resolves to
+// { status, body, socket }, { replaced: true } when the agent supplied a
+// different connection and nothing was written, or null without a reply.
+const REPLACED = Object.freeze({ replaced: true });
+function exchange(method, path, body, bind = null) {
     const started = clock(); count("requests");
     return new Promise(resolve => {
-        let finished = false, chunks = [], size = 0, written = false, closed = false, responseReady = false, result = null;
+        let finished = false, chunks = [], size = 0, written = false, closed = false, responseReady = false, result = null, socket = null;
         const settle = () => {
             if (!finished && responseReady && (written || closed)) { finished = true; maximum("max_request_ms", clock() - started); resolve(result); }
         };
@@ -69,13 +78,13 @@ function exchange(method, path, body, sessionId) {
         const headers = { Host: ENDPOINT.host,
             "Content-Type": (method === "GET" || !path.startsWith("/pcm")) ? "application/json" : "application/octet-stream",
             "Content-Length": body.length };
-        if (sessionId) headers.Authorization = `Articulate-Session ${sessionId}`;
+        if (bind?.id) headers.Authorization = `Articulate-Session ${bind.id}`;
         const req = request({ hostname: ENDPOINT.hostname, port: ENDPOINT.port, path, method, agent, headers }, res => {
             res.on("data", chunk => {
                 size += chunk.length;
                 if (size > 65536) { req.destroy(); finish(null); } else chunks.push(chunk);
             });
-            res.on("end", () => finish({ status: res.statusCode, body: Buffer.concat(chunks) }));
+            res.on("end", () => finish({ status: res.statusCode, body: Buffer.concat(chunks), socket }));
             res.on("error", () => { finish(null); req.destroy(); });
         });
         pending.add(req);
@@ -85,7 +94,14 @@ function exchange(method, path, body, sessionId) {
         req.once("finish", () => { written = true; settle(); });
         req.once("close", () => { closed = true; clearTimeout(timer); pending.delete(req); finish(null); });
         req.once("error", () => { finish(null); req.destroy(); });
-        req.end(body);
+        // Nothing is written before the agent has assigned the connection. A
+        // connection other than the bound one belongs to an unproven listener:
+        // the request is dropped unsent and the caller pairs again.
+        req.once("socket", assigned => {
+            if (bind?.socket && assigned !== bind.socket) { finish(REPLACED); req.destroy(); return; }
+            socket = assigned;
+            req.end(body);
+        });
     });
 }
 const hex64 = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
@@ -93,8 +109,8 @@ const hex64 = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value)
 // proof. Nothing that needs the key is sent to a listener that fails that test.
 async function handshake(token) {
     const keyBytes = Buffer.from(token, "hex"), clientNonce = randomBytes(32);
-    const opened = await exchange("POST", "/session", Buffer.from(JSON.stringify({ version: PROTOCOL_VERSION, client_nonce: clientNonce.toString("hex") })), null);
-    if (!opened) return null;
+    const opened = await exchange("POST", "/session", Buffer.from(JSON.stringify({ version: PROTOCOL_VERSION, client_nonce: clientNonce.toString("hex") })));
+    if (!opened || opened.replaced) return null;
     if (opened.status === 426) return "update-required";
     if (opened.status !== 200) return null;
     let reply;
@@ -104,9 +120,11 @@ async function handshake(token) {
     const serverNonce = Buffer.from(reply.server_nonce, "hex");
     const expected = createHmac("sha256", keyBytes).update(SERVER_LABEL).update(clientNonce).update(serverNonce).digest();
     if (!timingSafeEqual(expected, Buffer.from(reply.server_proof, "hex"))) return null;
+    // The proof answers the connection that produced the server's proof and no
+    // other; the session it opens stays bound to that same socket.
     const proof = createHmac("sha256", keyBytes).update(CLIENT_LABEL).update(clientNonce).update(serverNonce).digest("hex");
-    const confirmed = await exchange("POST", "/session/confirm", Buffer.from(JSON.stringify({ version: PROTOCOL_VERSION, session: reply.session, client_proof: proof })), null);
-    return confirmed?.status === 204 ? { id: reply.session, key: token } : null;
+    const confirmed = await exchange("POST", "/session/confirm", Buffer.from(JSON.stringify({ version: PROTOCOL_VERSION, session: reply.session, client_proof: proof })), { socket: opened.socket });
+    return confirmed?.status === 204 ? { id: reply.session, key: token, socket: opened.socket } : null;
 }
 async function ensureSession(token) {
     if (session?.key === token) return session;
@@ -119,13 +137,14 @@ async function ensureSession(token) {
     return session;
 }
 // Sends over the authenticated session, re-pairing once if the receiver no
-// longer recognises it. Returns null when no reply arrived at all.
+// longer recognises it or the connection it was bound to is gone. Returns
+// null when no reply arrived at all.
 async function authenticated(method, path, body, token) {
     for (let attempt = 0; attempt < 2; attempt++) {
         const current = await ensureSession(token);
         if (!current) return null;
-        const reply = await exchange(method, path, body, current.id);
-        if (reply?.status === 401) { if (session === current) session = null; continue; }
+        const reply = await exchange(method, path, body, current);
+        if (reply?.replaced || reply?.status === 401) { if (session === current) session = null; continue; }
         if (reply?.status === 426) { session = null; state = "update-required"; return reply; }
         return reply;
     }

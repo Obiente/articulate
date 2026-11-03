@@ -428,8 +428,8 @@ enum Route {
 enum Auth {
     None,
     Session(String),
-    /// A protocol version 1 companion still sending a bearer key.
-    Legacy,
+    /// A protocol version 1 companion still sending its key outright.
+    Legacy(String),
 }
 
 #[derive(Debug)]
@@ -486,7 +486,9 @@ fn request_head(headers: &str) -> Result<Head> {
     );
     let auth = match fields.get("authorization") {
         None => Auth::None,
-        Some(value) if value.starts_with("Bearer ") => Auth::Legacy,
+        Some(value) if value.starts_with("Bearer ") => {
+            Auth::Legacy(value["Bearer ".len()..].trim().to_owned())
+        }
         Some(value) => {
             let id = value
                 .strip_prefix("Articulate-Session ")
@@ -603,8 +605,17 @@ struct ConfirmRequest {
 fn handle(session: &mut Session, received: Received, server: &Listener) -> Reply {
     let Received { head, body } = received;
     let shared = server.shared;
-    if head.auth == Auth::Legacy {
-        shared.protocol_mismatch("outdated");
+    // Compatibility errors are answered on this connection and close it. They
+    // reach the shared state only as an advisory notice, which never replaces
+    // a paired companion's observation (see `Shared::protocol_mismatch`).
+    if let Auth::Legacy(token) = &head.auth {
+        // A version 1 companion proves itself the old way, by sending the key.
+        // Only a key that matches ours may raise the update notice; any other
+        // client is refused without learning or changing anything.
+        if unhex(token, 32).is_ok_and(|key| constant_time_equal(&key, &server.key)) {
+            shared.protocol_mismatch("outdated");
+        }
+        *session = Session::default();
         return Reply::new(
             "426 Upgrade Required",
             json!({"version": PROTOCOL_VERSION, "min_version": PROTOCOL_VERSION}).to_string(),
@@ -618,11 +629,13 @@ fn handle(session: &mut Session, received: Received, server: &Listener) -> Reply
                 Err(_) => return Reply::new("400 Bad Request", String::new(), true),
             };
             if request.version != PROTOCOL_VERSION {
+                // Unauthenticated, so advisory only while nothing is paired.
                 shared.protocol_mismatch(if request.version < PROTOCOL_VERSION {
                     "outdated"
                 } else {
                     "newer"
                 });
+                *session = Session::default();
                 return Reply::new(
                     "426 Upgrade Required",
                     json!({"version": PROTOCOL_VERSION, "min_version": PROTOCOL_VERSION})
@@ -1264,7 +1277,10 @@ mod tests {
             &format!("Articulate-Session {session}"),
             &format!("Bearer {}", "a".repeat(64)),
         );
-        assert_eq!(request_head(&legacy).unwrap().auth, Auth::Legacy);
+        assert_eq!(
+            request_head(&legacy).unwrap().auth,
+            Auth::Legacy("a".repeat(64))
+        );
     }
 
     #[test]
@@ -1412,7 +1428,24 @@ mod tests {
             connection.snapshot().companion_protocol.as_deref(),
             Some("newer")
         );
-        // A version 1 companion that still sends a bearer key is told to update too.
+        // A version 1 companion that still sends a bearer key is told to update
+        // too, but only a bearer key that matches ours may say so.
+        assert_eq!(legacy_request(address, &"0".repeat(64)), 426);
+        assert_eq!(
+            connection.snapshot().companion_protocol.as_deref(),
+            Some("newer"),
+            "an unknown key changes nothing"
+        );
+        assert_eq!(legacy_request(address, &token), 426);
+        assert_eq!(
+            connection.snapshot().companion_protocol.as_deref(),
+            Some("outdated")
+        );
+        drop(connection);
+    }
+
+    /// One protocol version 1 request with `Authorization: Bearer`.
+    fn legacy_request(address: std::net::SocketAddr, token: &str) -> u16 {
         let mut legacy = TcpStream::connect(address).unwrap();
         legacy
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1427,10 +1460,68 @@ mod tests {
             .unwrap();
         let mut response = String::new();
         legacy.read_to_string(&mut response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 426"));
+        response
+            .strip_prefix("HTTP/1.1 ")
+            .and_then(|rest| rest[..3].parse().ok())
+            .unwrap()
+    }
+
+    #[test]
+    fn compatibility_errors_never_replace_a_paired_companion() {
+        let token = new_token().unwrap();
+        let (connection, address) = listener(&token);
+        let mut client = Client::connect(address);
+        client.handshake(&token).unwrap();
         assert_eq!(
-            connection.snapshot().companion_protocol.as_deref(),
-            Some("outdated")
+            client.voice(voice_body(
+                json!([{"id":"456","name":"Example","speaking":true,"is_self":false}])
+            )),
+            204
+        );
+        let paired = connection.snapshot();
+        assert!(matches!(paired.status, Status::Ready));
+        assert_eq!(paired.companion_protocol.as_deref(), Some("current"));
+        let published = Instant::now();
+        let history = connection.history(published - Duration::from_secs(1), published);
+        assert_eq!(history.len(), 1);
+        assert!(history[0].valid);
+        // Unauthenticated peers speaking the wrong version, an unknown bearer
+        // key and even the real key over the old protocol are refused on their
+        // own connection without touching the paired state.
+        for version in [1, PROTOCOL_VERSION + 1] {
+            let mut other = Client::connect(address);
+            let (status, _) = other.request_parts(
+                "POST",
+                "/session",
+                json!({"version": version, "client_nonce": "1".repeat(64)})
+                    .to_string()
+                    .as_bytes(),
+                None,
+                false,
+            );
+            assert_eq!(status, 426);
+            drop(other); // Lets the receiver finish that connection at once.
+        }
+        assert_eq!(legacy_request(address, &"0".repeat(64)), 426);
+        assert_eq!(legacy_request(address, &token), 426);
+        let snapshot = connection.snapshot();
+        assert!(matches!(snapshot.status, Status::Ready));
+        assert_eq!(snapshot.companion_protocol.as_deref(), Some("current"));
+        let observation = snapshot.observation.expect("the observation survives");
+        assert_eq!(observation.participants.len(), 1);
+        let history = connection.history(published - Duration::from_secs(1), Instant::now());
+        assert_eq!(history.len(), 1, "no gap was recorded");
+        // The paired connection keeps working, including a capture control
+        // response built from that observation.
+        let (status, body) = client.request("GET", "/capture", &[]);
+        assert_eq!(status, 200);
+        assert!(serde_json::from_slice::<Value>(&body).is_ok());
+        thread::sleep(Duration::from_millis(50)); // Clears the snapshot rate limit.
+        assert_eq!(
+            client.voice(voice_body(
+                json!([{"id":"456","name":"Example","speaking":false,"is_self":false}])
+            )),
+            204
         );
         drop(connection);
     }
