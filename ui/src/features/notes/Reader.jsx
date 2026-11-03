@@ -43,6 +43,8 @@ import {
 import { DeleteDocumentDialog, MoveSourceDialog } from "./DocumentDialogs.jsx";
 import { ExportMenu } from "./ExportMenu.jsx";
 
+import { validTitle } from "../../actions.js";
+
 const NO_ROWS = [];
 
 // An open note, conversation or dictation: notes, transcript and sources.
@@ -78,6 +80,7 @@ export function Reader({
     [speakerFilter, setSpeakerFilter] = useState(null),
     [deleting, setDeleting] = useState(false),
     [renaming, setRenaming] = useState(false),
+    [titleDraft, setTitleDraft] = useState(""),
     [follow, setFollow] = useState(true),
     [moving, setMoving] = useState(null);
   const documentNoun =
@@ -167,8 +170,12 @@ export function Reader({
               aria-label="Note title"
               disabled={locked}
               autoFocus
-              value={session?.title || ""}
-              onChange={(e) => onEdit({ title: e.currentTarget.value })}
+              value={titleDraft}
+              onChange={(e) => {
+                const title = e.currentTarget.value;
+                setTitleDraft(title);
+                if (validTitle(title)) onEdit({ title });
+              }}
               onBlur={() => setRenaming(false)}
               onKeyDown={(e) => e.key === "Enter" && setRenaming(false)}
               size="xl"
@@ -177,7 +184,10 @@ export function Reader({
             <button
               className="editable-title"
               disabled={locked}
-              onClick={() => setRenaming(true)}
+              onClick={() => {
+                setTitleDraft(session?.title || "");
+                setRenaming(true);
+              }}
               title="Rename"
             >
               <h1>
@@ -277,7 +287,13 @@ export function Reader({
               </ActionIcon>
             </Menu.Target>
             <Menu.Dropdown>
-              <Menu.Item disabled={locked} onClick={() => setRenaming(true)}>
+              <Menu.Item
+                disabled={locked}
+                onClick={() => {
+                  setTitleDraft(session?.title || "");
+                  setRenaming(true);
+                }}
+              >
                 Rename
               </Menu.Item>
               {!session?.is_collection &&
@@ -596,7 +612,7 @@ export function Reader({
         noun={documentNoun}
         onClose={() => setDeleting(false)}
         onConfirm={() =>
-          void act({ type: "session_delete", id: session.id })
+          act({ type: "session_delete", id: session.id })
             .then(() => {
               setDeleting(false);
               onDeleted();

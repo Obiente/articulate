@@ -5,7 +5,9 @@
 // retry. While a document action runs, editing is locked.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { action } from "../bridge.js";
-import { savedPatchValue } from "../actions.js";
+import { savedPatchValue, validTitle } from "../actions.js";
+
+import { flushPatches } from "./document-edits.js";
 
 const SAVE_DELAY = 650;
 
@@ -55,12 +57,14 @@ export function useDocumentEdits({ state, getState, sync, report }) {
     if (!pending.current.size) return;
     setSavingNow(true);
     const work = (async () => {
-      while (pending.current.size) {
-        for (const [id, patch] of [...pending.current.entries()]) {
-          await action({ type: "session_patch", id, ...patch });
-          if (pending.current.get(id) === patch) pending.current.delete(id);
-        }
-      }
+      await flushPatches(pending.current, action, (id, error) => {
+        setEdits((old) => {
+          const next = { ...old };
+          delete next[id];
+          return next;
+        });
+        report(error);
+      });
       await sync();
       prune();
     })();
@@ -71,11 +75,12 @@ export function useDocumentEdits({ state, getState, sync, report }) {
       if (saving.current === work) saving.current = null;
       setSavingNow(false);
     }
-  }, [sync, prune]);
+  }, [sync, prune, report]);
 
   const edit = useCallback(
     (id, patch) => {
       if (transition.current) return;
+      if (patch.title !== undefined && !validTitle(patch.title)) return;
       pending.current.set(id, { ...(pending.current.get(id) || {}), ...patch });
       setEdits((old) => ({ ...old, [id]: { ...(old[id] || {}), ...patch } }));
       clearTimeout(timer.current);

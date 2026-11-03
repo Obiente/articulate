@@ -1,6 +1,6 @@
 //! Dictation, call and spoken-note capture.
 
-use super::library::{SessionMeta, SessionView};
+use super::library::{SessionBody, SessionMeta};
 use crate::app::{App, capture_feedback, desktop::publish::Collector, desktop::publish::RowStream};
 use crate::{calls, history::Kind};
 use serde::Serialize;
@@ -49,7 +49,7 @@ pub(crate) struct Dictation<'a> {
     text: &'a str,
     original: &'a str,
     dictation_interruption: Option<&'a str>,
-    dictation_session: Option<SessionView<'a>>,
+    dictation_session: Option<SessionMeta<'a>>,
 }
 
 pub(crate) fn dictation(app: &App) -> Dictation<'_> {
@@ -62,7 +62,28 @@ pub(crate) fn dictation(app: &App) -> Dictation<'_> {
             .dictation
             .as_ref()
             .filter(|_| !app.history.dictation_deleted)
-            .map(SessionView::new),
+            .map(SessionMeta::new),
+    }
+}
+
+#[derive(Serialize)]
+pub(crate) struct Bodies<'a> {
+    dictation_body: Option<SessionBody<'a>>,
+    call_body: Option<SessionBody<'a>>,
+    note_body: Option<SessionBody<'a>>,
+}
+pub(crate) fn bodies(app: &App) -> Bodies<'_> {
+    let current = app.history.call.as_ref();
+    let note = app.is_note_capture();
+    Bodies {
+        dictation_body: app
+            .history
+            .dictation
+            .as_ref()
+            .filter(|_| !app.history.dictation_deleted)
+            .map(SessionBody::new),
+        call_body: current.filter(|_| !note).map(SessionBody::new),
+        note_body: current.filter(|_| note).map(SessionBody::new),
     }
 }
 

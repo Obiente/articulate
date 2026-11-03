@@ -173,6 +173,15 @@ fn run(requests: Receiver<Request>, mut publisher: Publisher) {
     }
 }
 
+fn reply_completed(
+    reply: Sender<Result<(), String>>,
+    result: Result<(), String>,
+    shutting_down: bool,
+) -> bool {
+    let quit = shutting_down && result.is_ok();
+    reply.send(result).is_ok() && quit
+}
+
 fn running(app: &mut App, requests: &Receiver<Request>, publisher: &mut Publisher) -> Exit {
     let mut next_publish = Instant::now();
     loop {
@@ -221,9 +230,7 @@ fn running(app: &mut App, requests: &Receiver<Request>, publisher: &mut Publishe
         }));
         match result {
             Ok(result) => {
-                let quit = shutting_down && result.is_ok();
-                let _ = reply.send(result);
-                if quit {
+                if reply_completed(reply, result, shutting_down) {
                     return Exit::Quit;
                 }
             }
@@ -266,8 +273,9 @@ fn failed(app: &mut App, requests: &Receiver<Request>, publisher: &mut Publisher
                 match catch_unwind(AssertUnwindSafe(|| app.desktop_shutdown())) {
                     Ok(Ok(())) => {
                         log::info!("Saved changes after the controller stopped");
-                        let _ = reply.send(Ok(()));
-                        return;
+                        if reply.send(Ok(())).is_ok() {
+                            return;
+                        }
                     }
                     Ok(Err(error)) => {
                         let _ = reply.send(Err(format!("{UNVERIFIED} {error}")));
@@ -439,8 +447,12 @@ impl Bridge {
     }
 
     /// The newest section revision. A cheap check for missed events.
-    pub(crate) fn revision(&self) -> u64 {
+    pub(crate) fn revision(&self) -> HashMap<String, u64> {
         lock(&self.shared.published).revision()
+    }
+
+    pub(crate) fn setting_bool(&self, key: &str) -> bool {
+        lock(&self.shared.published).setting_bool(key)
     }
 
     pub(crate) fn has_frontend(&self) -> bool {
@@ -460,6 +472,9 @@ impl Bridge {
         if !health.can_close_anyway {
             *health =
                 ControllerHealth::new(ControllerState::Unresponsive, Some(message.to_owned()));
+            lock(&self.shared.published).health(&ControllerSection {
+                controller: &health,
+            });
         }
     }
 
@@ -575,11 +590,22 @@ mod tests {
             startup_failed: AtomicBool::new(false),
         });
         let bridge = Bridge::with_channel(sender, shared);
+        assert!(!bridge.setting_bool("close_to_tray"));
+        assert!(!bridge.has_frontend());
         assert!(!bridge.force_close_allowed());
         assert!(bridge.shutdown().is_err());
         assert!(
             bridge.force_close_allowed(),
             "a stopped controller offers closing anyway"
+        );
+        let snapshot = bridge.snapshot(None);
+        assert_eq!(
+            snapshot.sections["controller"]
+                .data
+                .as_ref()
+                .unwrap()
+                .value()["controller"]["state"],
+            "unresponsive"
         );
         bridge.shared.startup_failed.store(true, Ordering::Release);
         assert!(bridge.shutdown().is_ok());
@@ -657,6 +683,35 @@ mod tests {
         };
         bridge.acknowledge_close(id, false);
         assert!(!bridge.close_unanswered(id, Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn abandoned_shutdown_reply_does_not_stop_controller() {
+        let (reply, response) = mpsc::channel();
+        drop(response);
+        assert!(!reply_completed(reply, Ok(()), true));
+        let (reply, response) = mpsc::channel();
+        assert!(reply_completed(reply, Ok(()), true));
+        assert_eq!(response.recv().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn saving_progress_delays_close_escalation() {
+        let start = Instant::now();
+        let mut state = CloseState::default();
+        let CloseStep::AskRenderer(id) = state.request(true, start) else {
+            panic!("expected renderer");
+        };
+        state.acknowledge(id, false, start);
+        state.acknowledge(id, false, start + Duration::from_secs(5));
+        assert_eq!(
+            state.request(true, start + Duration::from_secs(6)),
+            CloseStep::InProgress
+        );
+        assert_eq!(
+            state.request(true, start + Duration::from_secs(8)),
+            CloseStep::Native
+        );
     }
 
     #[test]

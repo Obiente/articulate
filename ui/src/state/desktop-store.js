@@ -71,7 +71,13 @@ export function createDesktopStore(bridge, { pollInterval = 2000 } = {}) {
     const poll = async () => {
       try {
         const revision = await bridge.fetchRevision();
-        if (active && revision !== store.revision) await sync();
+        const behind =
+          typeof revision === "number"
+            ? revision !== store.revision
+            : Object.entries(revision).some(
+                ([name, value]) => value !== store.revisions[name],
+              );
+        if (active && behind) await sync();
       } catch (e) {
         if (active) setError(String(e));
       } finally {

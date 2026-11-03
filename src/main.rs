@@ -42,8 +42,8 @@ mod learning;
 mod library;
 mod live;
 mod macros;
-mod meetings;
 mod media;
+mod meetings;
 mod model;
 mod notes;
 mod people;
@@ -112,7 +112,7 @@ fn desktop_snapshot(
 fn desktop_revision(
     window: tauri::WebviewWindow,
     bridge: tauri::State<'_, Arc<Bridge>>,
-) -> Result<u64, String> {
+) -> Result<HashMap<String, u64>, String> {
     require_main(&window)?;
     Ok(bridge.revision())
 }

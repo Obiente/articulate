@@ -65,44 +65,26 @@ function splice(rows = EMPTY_ROWS, { start, rows: replacement }) {
 
 // The open document arrives as metadata (`selected`) and a separately sent
 // body (`selected_body`), so note edits never resend a long transcript.
-function composeSelected(values, previous) {
-  const meta = values.selected;
-  if (!meta || !("selected_body" in values)) return meta ?? null;
-  const body =
-    values.selected_body?.id === meta.id ? values.selected_body : null;
-  if (
-    previous?.meta === meta &&
-    previous.body === body &&
-    previous.value !== undefined
-  )
-    return previous.value;
-  return {
-    ...meta,
-    text: body?.text ?? "",
-    original: body?.original ?? "",
-    rows: body?.rows ?? EMPTY_ROWS,
-  };
-}
-
 function derive(values, previous) {
-  const selected = composeSelected(values, previous?.composed);
-  const state = {
-    call_rows: EMPTY_ROWS,
-    note_rows: EMPTY_ROWS,
-    ...values,
-    selected,
-  };
-  return {
-    state,
-    composed: {
-      meta: values.selected,
-      body:
-        values.selected_body?.id === values.selected?.id
-          ? values.selected_body
-          : null,
-      value: selected,
-    },
-  };
+  const state = { call_rows: EMPTY_ROWS, note_rows: EMPTY_ROWS, ...values };
+  for (const [key, bodyKey] of [
+    ["selected", "selected_body"],
+    ["dictation_session", "dictation_body"],
+    ["call_session", "call_body"],
+    ["note_session", "note_body"],
+  ]) {
+    const meta = values[key];
+    if (!meta || !(bodyKey in values)) continue;
+    const body = values[bodyKey]?.id === meta.id ? values[bodyKey] : null;
+    state[key] = reconcile(previous?.state?.[key], {
+      ...meta,
+      text: body?.text ?? "",
+      original: body?.original ?? "",
+      personal_notes: body?.personal_notes ?? meta.personal_notes ?? "",
+      rows: body?.rows ?? EMPTY_ROWS,
+    });
+  }
+  return { state };
 }
 
 // Apply an update. Returns the next store and whether a complete resync is

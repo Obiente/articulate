@@ -1,6 +1,6 @@
 # Desktop UI bridge
 
-The `articulate` binary is a Tauri shell that runs the application controller on one Rust-owned thread. Tauri is the sole interface and requires no feature flag. The renderer never receives audio buffers, native handles, the Discord pairing key or arbitrary filesystem contents. Managed model paths are exposed only for the local model manager.
+The `articulate` binary is a Tauri shell that runs the application controller on one Rust-owned thread. Tauri is the sole interface and requires no feature flag. The renderer never receives audio buffers, native handles, the Discord pairing key or arbitrary filesystem contents. Managed models expose only their file names.
 
 ## State sections
 
@@ -19,7 +19,7 @@ Sections are typed serde views in `src/app/desktop/view/`; the registry is `view
 | `document` | `selected` | Live |
 | `notes` | `notes`, `selected_notes`, `call_notes`, `note_notes` | Live |
 | `settings` | `settings`, `microphones`, `outputs` | Live |
-| `models` | `model_status`, `downloading`, `managed_models`, `cleanup` | Live |
+| `models` | `model_status`, `downloading`, `managed_models`, `cleanup` | Background |
 | `discord` | `discord` | Live |
 | `meetings` | `meetings` | Live |
 | `updater` | `updater` | Live |
@@ -27,6 +27,7 @@ Sections are typed serde views in `src/app/desktop/view/`; the registry is `view
 | `call_tools` | `audio_import`, `playback` | Live |
 | `history` | `history` | Background |
 | `document_body` | `selected_body` | Background |
+| `capture_bodies` | `dictation_body`, `call_body`, `note_body` | Background |
 | `vocabulary` | `dictionary`, `macros`, `assort` | Background |
 | `insights` | `insights` | Background |
 | `search` | `search` | Live |
@@ -48,9 +49,9 @@ type Summary = {
   topic_id: string | null; is_collection: boolean; can_receive_sources: boolean;
   pinned: boolean;
 };
-// `selected`, `call_session` and `note_session`: metadata and notes only.
+// `selected`, `dictation_session`, `call_session` and `note_session`: metadata only.
 type SessionMeta = {
-  id: string; title: string; kind: string; personal_notes: string;
+  id: string; title: string; kind: string;
   audio_packets_lost: number; created_ms: number; updated_ms: number;
   topic_id: string | null; is_collection: boolean; can_receive_sources: boolean;
   sources: { id: string; title: string; kind: string; created_ms: number; preview: string }[];
@@ -69,9 +70,9 @@ type Interruption = {
   ongoing: boolean;
   message: string; // "Audio interrupted 12:03–12:07: microphone disconnected"
 };
-// `selected_body`: the open document's transcript, sent separately.
-type SessionBody = { id: string; text: string; original: string; rows: Row[] };
-// `dictation_session`: both together.
+// Each body carries notes and transcript content, sent separately.
+type SessionBody = { id: string; personal_notes: string; text: string; original: string; rows: Row[] };
+// The renderer combines each session metadata value with its matching body by id.
 type SessionView = SessionMeta & Omit<SessionBody, "id">;
 type Row = {
   start_ms: number; end_ms: number; speaker: string; speaker_labels: string[];
@@ -158,8 +159,8 @@ type Section = {
 - The controller emits `desktop-state` to the main window whenever a pass changes any section. The event carries only changed sections.
 - `live_rows` changes are sent as splices: keep rows `0..start` from the renderer's copy at revision `base`, then append `rows`. A renderer whose revision for the section is not `base` must resynchronize.
 - `desktop_snapshot({ since?: Record<string, number> })` returns every section newer than `since`, or all sections without it. Row sections are returned as splices when the renderer is exactly one revision behind, otherwise as complete `data`.
-- `desktop_revision()` returns the state revision. The renderer calls it every two seconds as a fallback for missed events and fetches newer sections when it differs.
-- `desktop_health()` returns the `Controller` object. It also reports `unresponsive` after a close request times out, which the event stream cannot.
+- `desktop_revision()` returns the per-section revision map. The renderer checks every section every two seconds and fetches updates if any revision differs.
+- `desktop_health()` returns the `Controller` object. It also reports `unresponsive` after a close request times out, also available through the cached controller section.
 - `desktop_discord_avatar({ uri })` returns the cached PNG bytes for a `Participant.avatar` identifier, or an empty body while the picture is not cached yet or pictures are turned off. Only identifiers of that exact form are accepted; the renderer never receives Discord URLs and the existing `img-src 'self' data: blob:` policy is enough because the bytes are shown through a blob URL. The renderer retries an empty answer a few times and then keeps initials.
 
 The renderer (`ui/src/state/store.js`) applies sections in order, ignores sections at or below its revision, and keeps the previous object identity for every unchanged value, including individual rows and history entries (matched by `id`).
@@ -231,9 +232,9 @@ Editing an existing vocabulary entry requires `index` and its original `expected
 ## Closing
 
 1. A window close request sends `desktop-close-requested` with a numeric request id to the main window.
-2. The renderer acknowledges at once with `desktop_close_ack { id }`, saves its pending document edits, then invokes `desktop_close`. If it decides not to close (a document action is running, or saving failed) it sends `desktop_close_ack { id, cancelled: true }`.
+2. The renderer acknowledges at once with `desktop_close_ack { id }`, repeats that acknowledgement every 500 ms while saving its pending document edits, then invokes `desktop_close`. If it decides not to close (a document action is running, or saving failed) it sends `desktop_close_ack { id, cancelled: true }`.
 3. Without an acknowledgement within three seconds, the native shell closes on its own: the controller saves everything it holds, then the app exits. Edits still only in an unresponsive renderer cannot be saved.
-4. Another close request while the first is unanswered for over a second, or acknowledged for over two seconds without closing, escalates to the same native shutdown.
+4. Another close request while the first is unanswered for over a second, or without an acknowledgement or saving heartbeat for over two seconds, escalates to the same native shutdown.
 5. Native shutdown and `desktop_close` refuse while recording or processing is active, while a model or update download is running, or while saves have not settled; the reason is shown. A rejected close keeps the window open and recoverable.
 6. When the controller has failed or stopped answering, a rejected close offers **Close anyway**: `desktop_close { force: true }` in the renderer, or a confirmation dialog from native code. `force` is refused while the controller is healthy.
 
@@ -328,7 +329,7 @@ exposed in the renderer. There is no legacy UI build.
 
 ## Model and review controls
 
-`managed_models` is an array of `{id, installed, disk_size, path, in_use}`. IDs are `speech`, `verifier`, `speaker`, `sound_cues`, `polish`, `notes`. Paths are local display information and must never enter telemetry or shareable reports. `model_delete {id}` rejects leased models. `model_download_cancel {id}` cancels speech, verifier, speaker or sound-cue downloads. Notes and cleanup retain their dedicated cancellation actions.
+`managed_models` is an array of `{id, installed, disk_size, path, in_use}`. IDs are `speech`, `verifier`, `speaker`, `sound_cues`, `polish`, `notes`. `path` contains only the file name, never a managed directory. `model_delete {id}` rejects leased models. `model_download_cancel {id}` cancels speech, verifier, speaker or sound-cue downloads. Notes and cleanup retain their dedicated cancellation actions.
 
 `desktop_model_file()` opens a native GGUF file dialog outside the controller, returning a path or null. The renderer applies it with the existing validated `settings_patch {model_path}` action.
 
@@ -347,3 +348,7 @@ The four notes status values are typed as `{ready, acceleration_installed, worki
 Settings exposes those fields plus `recent_dictation_app`, `shortcut_error` and `microphone_check: {running, result, error}`. Result is null or `{device, peak, rms, clipping_ratio, silent}`. `microphone_check` starts a three-second worker and rejects overlapping tests or active recording. The reusable `MicrophoneCheck` component accepts `check`, `onTest` and `disabled` for call setup integration.
 
 `dictation_interruption` is null or the reason capture ended early, retained until the next capture. `insert_text {text, line_breaks?}` runs outside the controller, waits three seconds for external focus, then arms and inserts through field identity guards. It accepts up to 16,000 bytes and an optional executable-to-line-break map (up to 100 entries), used to select the focused app profile. Browser preview simulates microphone results; it never inserts into external apps.
+
+`desktop_revision` returns a map of section names to revisions. The fallback check compares every section, so receiving a newer unrelated event cannot hide a missed update. Unresponsive controller health is published in the cached `controller` section and recovered by that check.
+
+Invalid title drafts stay local to the title input and revert on blur. Flush reports and discards client-invalid patches once; transport failures retain patches for retry. A successful action remains successful if its follow-up synchronization fails.

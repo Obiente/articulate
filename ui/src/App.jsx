@@ -104,7 +104,7 @@ export function App() {
       try {
         if (changes) await flush();
         await bridge.action(command);
-        await desktop.sync();
+        await desktop.sync().catch(() => {});
         if (command.type === "copy")
           notifications.show({
             message: "Copied to clipboard",
