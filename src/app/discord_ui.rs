@@ -26,6 +26,9 @@ pub(super) struct LaunchState {
     /// Whether the companion pairing file has been checked against the saved
     /// key since startup, so settings restored by other means are mirrored.
     pairing_file_checked: bool,
+    /// Where the pairing file is published; the data directory unless a test
+    /// needs a folder no parallel test can touch.
+    pairing_directory: Option<std::path::PathBuf>,
 }
 
 /// What a background relaunch did when it succeeded.
@@ -500,12 +503,14 @@ impl App {
     /// companion keeps pairing when `settings.json` is encrypted at rest.
     fn publish_pairing_file(&mut self) -> Result<(), String> {
         self.discord_launch.pairing_file_checked = true;
-        crate::discord::pairing::sync(
-            &crate::model::data_dir(),
-            &self.settings.discord_pairing_key,
-        )
-        .map(|_| ())
-        .map_err(|error| format!("The companion cannot read the pairing key: {error:#}"))
+        let directory = self
+            .discord_launch
+            .pairing_directory
+            .clone()
+            .unwrap_or_else(crate::model::data_dir);
+        crate::discord::pairing::sync(&directory, &self.settings.discord_pairing_key)
+            .map(|_| ())
+            .map_err(|error| format!("The companion cannot read the pairing key: {error:#}"))
     }
 
     /// Installed editions as last scanned, for settings validation.
@@ -2512,8 +2517,17 @@ mod tests {
     #[test]
     fn pairing_changes_roll_back_when_saving_fails_and_mirror_the_pairing_file() {
         let (mut app, _) = super::super::tests::app();
-        let directory = crate::model::data_dir();
-        let _ = std::fs::remove_file(directory.join(crate::discord::pairing::FILE_NAME));
+        // Every test controller syncs the pairing file. A shared data directory
+        // lets a parallel test with no key delete this test's file mid-check.
+        let directory = std::env::temp_dir().join(format!(
+            "articulate-pairing-rollback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        app.discord_launch.pairing_directory = Some(directory.clone());
         app.settings.discord_companion = true;
         app.settings.discord_auto_connect = false;
         app.settings.discord_pairing_key = crate::discord::plugin::new_token().unwrap();
@@ -2564,5 +2578,6 @@ mod tests {
         app.desktop_discord_forget_pairing().unwrap();
         assert!(app.settings.discord_pairing_key.is_empty());
         assert_eq!(crate::discord::pairing::read(&directory).unwrap(), None);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
