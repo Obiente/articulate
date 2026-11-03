@@ -55,6 +55,7 @@ mod playback;
 )]
 mod polish;
 mod sensevoice;
+pub mod sound_alike;
 mod speaker_edits;
 mod speakers;
 mod speech;

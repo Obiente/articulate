@@ -50,6 +50,7 @@ export const actionCatalog = Object.freeze({
   export: { preview: true },
   // Vocabulary and snippets
   dictionary_save: { preview: true },
+  dictionary_sound_alike: { preview: true },
   dictionary_delete: { preview: true },
   macro_save: { preview: true },
   macro_delete: { preview: true },
@@ -207,7 +208,16 @@ const validators = {
     )
       throw Error("Unsupported export.");
   },
+  dictionary_sound_alike(action) {
+    if (typeof action.enabled !== "boolean")
+      throw Error("Choose whether to match similar-sounding words.");
+  },
   dictionary_save(action) {
+    if (
+      action.sound_alike !== undefined &&
+      typeof action.sound_alike !== "boolean"
+    )
+      throw Error("Choose whether to match similar-sounding words.");
     if (!action.heard?.trim() || !action.wanted?.trim())
       throw Error("Fill in both words or phrases");
   },

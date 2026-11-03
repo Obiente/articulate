@@ -21,6 +21,7 @@ pub struct Entry {
     pub contexts: Vec<Context>,
     #[serde(default = "enabled")]
     pub enabled: bool,
+    pub sound_alike: bool,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +38,8 @@ struct StoredEntry {
     contexts: Vec<Context>,
     #[serde(default = "enabled")]
     enabled: bool,
+    #[serde(default)]
+    sound_alike: Option<bool>,
 }
 impl From<StoredEntry> for Entry {
     fn from(value: StoredEntry) -> Self {
@@ -45,7 +48,11 @@ impl From<StoredEntry> for Entry {
         let ignore_case = value
             .ignore_case
             .unwrap_or_else(|| spoken_mention(&value.heard, &value.wanted));
+        let sound_alike = value
+            .sound_alike
+            .unwrap_or_else(|| crate::sound_alike::is_distinctive(&value.wanted));
         Self {
+            sound_alike,
             heard: value.heard,
             wanted: value.wanted,
             app: value.app,
@@ -130,6 +137,7 @@ impl Entry {
 }
 
 fn merge_contexts(existing: &mut Entry, incoming: &Entry) {
+    existing.sound_alike &= incoming.sound_alike;
     let mut policies: Vec<Context> = Vec::new();
     for (cues, ignore_case) in existing.policies().chain(incoming.policies()) {
         let mut cues = cues.to_vec();
@@ -269,6 +277,7 @@ pub fn validate(heard: &str, wanted: &str) -> anyhow::Result<Entry> {
         ignore_case: spoken_mention(heard, wanted),
         contexts: Vec::new(),
         enabled: true,
+        sound_alike: crate::sound_alike::is_distinctive(wanted),
     })
 }
 
@@ -338,70 +347,325 @@ pub(crate) fn output_in_context(entry: &Entry, text: &str) -> bool {
         })
 }
 
+/// Exact matching remains available for callers that explicitly need saved pairs.
 pub fn apply_in(text: &str, entries: &[Entry], app: Option<&str>) -> (String, usize) {
-    let mut entries: Vec<_> = entries
-        .iter()
-        .filter(|e| {
-            e.enabled
-                && !e.heard.is_empty()
-                && e.app
-                    .as_deref()
-                    .is_none_or(|scope| app.is_some_and(|app| app.eq_ignore_ascii_case(scope)))
-        })
-        .flat_map(|entry| {
-            entry
-                .policies()
-                .map(move |(cues, ignore_case)| (entry, cues, ignore_case))
-        })
-        .collect();
-    entries.sort_by_key(|(e, cues, _)| {
-        std::cmp::Reverse((e.heard.chars().count(), e.app.is_some(), !cues.is_empty()))
-    });
-    // Prepare case folding once per rule, not once for every input character.
-    let entries: Vec<_> = entries
-        .into_iter()
-        .map(|(e, cues, ignore_case)| {
-            (
-                e,
-                e.heard.chars().count(),
-                ignore_case.then(|| e.heard.to_lowercase()),
-                cues,
-            )
-        })
-        .collect();
-    let mut output = String::with_capacity(text.len());
-    let mut at = 0;
-    let mut changed = 0;
-    while at < text.len() {
-        let found = entries.iter().find_map(|(e, chars, folded, cues)| {
-            let len = if folded.is_some() {
-                text[at..].chars().take(*chars).map(char::len_utf8).sum()
+    let result = apply_with_sound(text, entries, app, false);
+    (result.text, result.changed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchKind {
+    Exact,
+    SoundAlike,
+}
+
+pub struct Match {
+    pub entry: usize,
+    pub range: std::ops::Range<usize>,
+    pub kind: MatchKind,
+}
+
+#[derive(Clone)]
+pub struct AppliedSound {
+    pub entry: Entry,
+    pub heard: String,
+}
+
+pub struct Applied {
+    pub text: String,
+    pub changed: usize,
+    pub sounds: Vec<AppliedSound>,
+    pub matches: Vec<Match>,
+}
+
+struct Rule {
+    entry: usize,
+    chars: usize,
+    folded: Option<String>,
+    cues: Vec<String>,
+}
+
+#[derive(Default)]
+struct Compiled {
+    entries: Vec<Entry>,
+    exact: std::collections::HashMap<char, Vec<Rule>>,
+    wanted: std::collections::HashMap<char, Vec<(usize, String, usize)>>,
+    sounds: std::collections::HashMap<(u8, usize), Vec<(usize, crate::sound_alike::Key)>>,
+    sound_initials: std::collections::HashSet<u8>,
+}
+
+fn initial(text: &str) -> char {
+    text.chars().next().unwrap().to_lowercase().next().unwrap()
+}
+fn scoped(entry: &Entry, app: Option<&str>) -> bool {
+    entry.enabled
+        && entry
+            .app
+            .as_deref()
+            .is_none_or(|scope| app.is_some_and(|app| app.eq_ignore_ascii_case(scope)))
+}
+fn phrase_len(
+    text: &str,
+    at: usize,
+    phrase: &str,
+    chars: usize,
+    folded: Option<&str>,
+) -> Option<usize> {
+    let len = if folded.is_some() {
+        text[at..].chars().take(chars).map(char::len_utf8).sum()
+    } else {
+        phrase.len()
+    };
+    let candidate = text.get(at..at + len)?;
+    let matches = folded.map_or(candidate == phrase, |s| candidate.to_lowercase() == s);
+    (matches && !text[at + len..].chars().next().is_some_and(word)).then_some(len)
+}
+impl Compiled {
+    fn new(entries: &[Entry]) -> Self {
+        let mut result = Self {
+            entries: entries.to_vec(),
+            ..Self::default()
+        };
+        for (index, entry) in entries.iter().enumerate() {
+            if !entry.wanted.is_empty() {
+                result
+                    .wanted
+                    .entry(initial(&entry.wanted))
+                    .or_default()
+                    .push((
+                        index,
+                        entry.wanted.to_lowercase(),
+                        entry.wanted.chars().count(),
+                    ));
+            }
+            if !entry.enabled || entry.heard.is_empty() {
+                continue;
+            }
+            for (cues, ignore_case) in entry.policies() {
+                result
+                    .exact
+                    .entry(initial(&entry.heard))
+                    .or_default()
+                    .push(Rule {
+                        entry: index,
+                        chars: entry.heard.chars().count(),
+                        folded: ignore_case.then(|| entry.heard.to_lowercase()),
+                        cues: cues.to_vec(),
+                    });
+            }
+            if entry.sound_alike && crate::sound_alike::is_distinctive(&entry.wanted) {
+                for phrase in [&entry.wanted, &entry.heard] {
+                    if phrase.split_whitespace().any(crate::sound_alike::protected) {
+                        continue;
+                    }
+                    if let Some(key) = crate::sound_alike::Key::new(phrase) {
+                        result.sound_initials.insert(key.bucket().0);
+                        result
+                            .sounds
+                            .entry(key.bucket())
+                            .or_default()
+                            .push((index, key));
+                    }
+                }
+            }
+        }
+        for rules in result.exact.values_mut() {
+            rules.sort_by_key(|r| {
+                std::cmp::Reverse((r.chars, entries[r.entry].app.is_some(), !r.cues.is_empty()))
+            });
+        }
+        result
+    }
+
+    fn apply(&self, text: &str, app: Option<&str>, enabled: bool) -> Applied {
+        // Reserve exact matches and saved outputs before considering any wider
+        // sound span. A fallback may never swallow a later exact match.
+        let mut exact = std::collections::BTreeMap::new();
+        let mut reserved = vec![false; text.len()];
+        for (at, c) in text.char_indices() {
+            if at > 0 && text[..at].chars().next_back().is_some_and(word) {
+                continue;
+            }
+            let first = c.to_lowercase().next().unwrap();
+            if let Some(rules) = self.exact.get(&first) {
+                for rule in rules {
+                    let entry = &self.entries[rule.entry];
+                    if !scoped(entry, app) {
+                        continue;
+                    }
+                    if let Some(len) =
+                        phrase_len(text, at, &entry.heard, rule.chars, rule.folded.as_deref())
+                        && nearby(text, at, at + len, &rule.cues)
+                    {
+                        exact.insert(at, (rule.entry, len));
+                        reserved[at..at + len].fill(true);
+                        break;
+                    }
+                }
+            }
+            if enabled && let Some(outputs) = self.wanted.get(&first) {
+                for (index, folded, chars) in outputs {
+                    if let Some(len) =
+                        phrase_len(text, at, &self.entries[*index].wanted, *chars, Some(folded))
+                    {
+                        reserved[at..at + len].fill(true);
+                    }
+                }
+            }
+        }
+        let mut result = Applied {
+            text: String::with_capacity(text.len()),
+            changed: 0,
+            sounds: Vec::new(),
+            matches: Vec::new(),
+        };
+        let mut at = 0;
+        while at < text.len() {
+            let found = exact
+                .get(&at)
+                .map(|(entry, len)| (*entry, *len, MatchKind::Exact))
+                .or_else(|| {
+                    (enabled
+                        && !self.sounds.is_empty()
+                        && !reserved[at]
+                        && (at == 0 || !text[..at].chars().next_back().is_some_and(word)))
+                    .then(|| self.sound_at(text, at, app, &reserved))
+                    .flatten()
+                    .map(|(entry, len)| (entry, len, MatchKind::SoundAlike))
+                });
+            if let Some((index, len, kind)) = found {
+                let entry = &self.entries[index];
+                result.text.push_str(&entry.wanted);
+                if kind == MatchKind::SoundAlike {
+                    result.sounds.push(AppliedSound {
+                        entry: entry.clone(),
+                        heard: text[at..at + len].into(),
+                    });
+                }
+                result.matches.push(Match {
+                    entry: index,
+                    range: at..at + len,
+                    kind,
+                });
+                at += len;
+                result.changed += 1;
             } else {
-                e.heard.len()
-            };
-            let candidate = text.get(at..at + len)?;
-            let matches = if let Some(folded) = folded {
-                candidate.to_lowercase() == *folded
-            } else {
-                candidate == e.heard
-            };
-            (matches
-                && (at == 0 || !text[..at].chars().next_back().is_some_and(word))
-                && !text[at + len..].chars().next().is_some_and(word)
-                && nearby(text, at, at + len, cues))
-            .then_some((*e, len))
-        });
-        if let Some((entry, len)) = found {
-            output.push_str(&entry.wanted);
-            at += len;
-            changed += 1;
+                let c = text[at..].chars().next().unwrap();
+                result.text.push(c);
+                at += c.len_utf8();
+            }
+        }
+        result
+    }
+
+    fn sound_at(
+        &self,
+        text: &str,
+        at: usize,
+        app: Option<&str>,
+        reserved: &[bool],
+    ) -> Option<(usize, usize)> {
+        let mut end = at;
+        let mut best: Option<(usize, usize, f32)> = None;
+        let mut tied = false;
+        for count in 1..=4 {
+            let start = end;
+            end += text[end..]
+                .chars()
+                .take_while(|c| word(*c))
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if end == start
+                || end - at > 160
+                || reserved[start..end].iter().any(|b| *b)
+                || crate::sound_alike::protected(&text[start..end])
+            {
+                break;
+            }
+            let phrase = &text[at..end];
+            if !(count == 1 && crate::sound_alike::common(phrase))
+                && let Some(key) = crate::sound_alike::Key::new(phrase)
+            {
+                let (first, size) = key.bucket();
+                if !self.sound_initials.contains(&first) {
+                    break;
+                }
+                // A length difference alone must fit within the score budget.
+                let allowance = (size as f32 * 0.12) as usize;
+                for length in size.saturating_sub(allowance)..=size + allowance {
+                    for (index, target) in self.sounds.get(&(first, length)).into_iter().flatten() {
+                        let entry = &self.entries[*index];
+                        // A case-only version of the literal heard phrase
+                        // still belongs to its explicit capitalization policy.
+                        if !scoped(entry, app) || phrase.eq_ignore_ascii_case(&entry.heard) {
+                            continue;
+                        }
+                        let score = key.score(target);
+                        if score < crate::sound_alike::THRESHOLD
+                            || !entry
+                                .policies()
+                                .any(|(cues, _)| nearby(text, at, end, cues))
+                        {
+                            continue;
+                        }
+                        match best {
+                            Some((old, old_len, old_score))
+                                if (score - old_score).abs() < 0.00001 =>
+                            {
+                                if self.entries[old].wanted != entry.wanted || old_len != end - at {
+                                    tied = true;
+                                } else if (entry.app.is_some(), !entry.cues.is_empty())
+                                    > (
+                                        self.entries[old].app.is_some(),
+                                        !self.entries[old].cues.is_empty(),
+                                    )
+                                {
+                                    best = Some((*index, end - at, score));
+                                }
+                            }
+                            Some((_, _, old_score)) if score < old_score => (),
+                            _ => {
+                                best = Some((*index, end - at, score));
+                                tied = false;
+                            }
+                        }
+                    }
+                }
+            }
+            let spaces = text[end..].bytes().take_while(|b| *b == b' ').count();
+            if spaces == 0 {
+                break;
+            }
+            end += spaces;
+        }
+        if tied {
+            None
         } else {
-            let c = text[at..].chars().next().unwrap();
-            output.push(c);
-            at += c.len_utf8();
+            best.map(|(entry, len, _)| (entry, len))
         }
     }
-    (output, changed)
+}
+
+thread_local! {
+    static MATCHER: std::cell::RefCell<Compiled> = std::cell::RefCell::new(Compiled::default());
+}
+
+/// Cached per calling thread. Equality checks detect edits, imports, learning,
+/// undo and reorder without requiring every mutation site to invalidate keys.
+/// The cache holds only the current vocabulary, never transcript text.
+pub fn apply_with_sound(
+    text: &str,
+    entries: &[Entry],
+    app: Option<&str>,
+    enabled: bool,
+) -> Applied {
+    MATCHER.with_borrow_mut(|cache| {
+        if cache.entries != entries {
+            *cache = Compiled::new(entries);
+        }
+        cache.apply(text, app, enabled)
+    })
 }
 
 #[cfg(test)]
@@ -409,6 +673,198 @@ mod tests {
     use super::*;
     fn e(a: &str, b: &str) -> Entry {
         validate(a, b).unwrap()
+    }
+    fn sound(text: &str, entries: &[Entry], app: Option<&str>) -> Applied {
+        apply_with_sound(text, entries, app, true)
+    }
+    #[test]
+    fn equal_sound_spelling_retains_the_more_specific_origin() {
+        let global = e("obi ante", "Obiente");
+        let mut scoped = global.clone();
+        scoped.app = Some("editor.exe".into());
+        let entries = [global, scoped.clone()];
+        let applied = sound("obi yente", &entries, Some("editor.exe"));
+        assert_eq!(applied.text, "Obiente");
+        assert!(applied.sounds[0].entry == scoped);
+    }
+    #[test]
+    fn sound_names_preserve_saved_case_and_phrase_boundaries() {
+        let entries = [e("obi ante", "Obiente"), e("ven kord", "Vencord")];
+        for (input, expected) in [
+            ("Visit Obi Yente today.", "Visit Obiente today."),
+            ("Use when cord.", "Use Vencord."),
+            ("Use Ven cord and obi yente.", "Use Vencord and Obiente."),
+            ("Use obi y ente.", "Use Obiente."),
+            ("Use o bi y ente.", "Use Obiente."),
+        ] {
+            assert_eq!(sound(input, &entries, None).text, expected);
+        }
+        for text in [
+            "obi. yente",
+            "obi, yente",
+            "obi\nyente",
+            "preobi yente",
+            "obi yente's",
+            "o b i y ente",
+        ] {
+            assert_eq!(sound(text, &entries, None).text, text, "{text}");
+        }
+    }
+    #[test]
+    fn sound_respects_apps_all_context_policies_and_sentence_limits() {
+        let mut entry = e("obi ante", "Obiente");
+        entry.app = Some("editor.exe".into());
+        entry.cues = vec!["website".into()];
+        entry.contexts.push(Context {
+            cues: vec!["domain".into()],
+            ignore_case: true,
+        });
+        let entries = [entry];
+        assert_eq!(
+            sound("Obi Yente website", &entries, Some("EDITOR.EXE")).text,
+            "Obiente website"
+        );
+        assert_eq!(
+            sound("domain obi yente", &entries, Some("editor.exe")).text,
+            "domain Obiente"
+        );
+        for (text, app) in [
+            ("Obi Yente website", None),
+            ("Obi Yente website", Some("chat.exe")),
+            ("website. Obi Yente", Some("editor.exe")),
+            ("Obi Yente", Some("editor.exe")),
+        ] {
+            assert_eq!(sound(text, &entries, app).changed, 0);
+        }
+        assert_eq!(
+            sound(
+                &format!("website {} obi yente", "x".repeat(121)),
+                &entries,
+                Some("editor.exe")
+            )
+            .changed,
+            0
+        );
+    }
+    #[test]
+    fn sound_does_not_consume_protected_words_or_common_destinations() {
+        for (heard, wanted, input) in [
+            ("nah tredy", "Notready", "not ready"),
+            ("tha corder", "Thecorder", "the corder"),
+            ("too lace", "Toolace", "two lace"),
+            ("wee cord", "Wecord", "we cord"),
+            ("won day", "Monday", "mon day"),
+            ("there", "Their", "there"),
+            ("pro ject", "Project", "pro jekt"),
+            ("fif teen", "Fifteen", "fif teen"),
+        ] {
+            let mut entry = e(heard, wanted);
+            entry.sound_alike = true;
+            // Only fallback is under test; a saved exact pair remains explicit.
+            if heard == input {
+                entry.heard = "unrelated spelling".into();
+            }
+            assert_eq!(sound(input, &[entry], None).changed, 0, "{input}");
+        }
+        for text in [
+            "there their then",
+            "10 100 one two",
+            "I you we they",
+            "Mon day",
+            "when record",
+        ] {
+            assert_eq!(
+                sound(
+                    text,
+                    &[e("obi ante", "Obiente"), e("ven cord", "Vencord")],
+                    None
+                )
+                .changed,
+                0
+            );
+        }
+    }
+    #[test]
+    fn sound_uses_heard_alias_but_exact_priority_and_outputs_are_reserved() {
+        let entries = [e("cinderkit", "Obiente"), e("kit", "package")];
+        assert_eq!(sound("sinderkit", &entries, None).text, "Obiente");
+        assert_eq!(sound("cinder kit", &entries, None).text, "cinder package");
+        let entries = [e("obi ante", "Obiente"), e("other", "Obi Yente")];
+        assert_eq!(sound("Obi Yente", &entries, None).changed, 0);
+        let entries = [e("obi ante", "Obiente"), e("Obiente", "changed")];
+        assert_eq!(sound("obi yente", &entries, None).text, "Obiente");
+        let entries = [e("obi yente", "exact wins"), e("obi ante", "Obiente")];
+        assert_eq!(sound("obi yente", &entries, None).text, "exact wins");
+    }
+    #[test]
+    fn sound_picks_closest_and_abstains_on_equal_alternatives() {
+        let entries = [e("other form", "Obiente"), e("other name", "Obiante")];
+        assert_eq!(sound("obi yente", &entries, None).text, "Obiente");
+        let entries = [e("obi yente", "Obiente"), e("obi yente", "Obiante")];
+        assert_eq!(sound("obi yente", &entries, None).text, "Obiente"); // Exact saved order.
+        let entries = [e("same alias", "Obiente"), e("same alias", "Obiante")];
+        assert_eq!(sound("saim alias", &entries, None).changed, 0);
+    }
+    #[test]
+    fn sound_flags_migrate_persist_and_invalidate_cached_keys() {
+        let mut entries = vec![e("obi ante", "Obiente")];
+        assert!(entries[0].sound_alike);
+        assert_eq!(sound("obi yente", &entries, None).changed, 1);
+        entries[0].sound_alike = false;
+        assert_eq!(sound("obi yente", &entries, None).changed, 0);
+        assert_eq!(sound("obi ante", &entries, None).changed, 1);
+        entries[0].sound_alike = true;
+        assert_eq!(
+            apply_with_sound("obi yente", &entries, None, false).changed,
+            0
+        );
+        entries[0].wanted = "DifferentName".into();
+        entries[0].heard = "different alias".into();
+        assert_eq!(sound("obi yente", &entries, None).changed, 0);
+        let legacy: Entry =
+            serde_json::from_str(r#"{"heard":"obi ante","wanted":"Obiente"}"#).unwrap();
+        assert!(legacy.sound_alike);
+        let common: Entry = serde_json::from_str(r#"{"heard":"werd","wanted":"word"}"#).unwrap();
+        assert!(!common.sound_alike);
+        let mut explicit = legacy;
+        explicit.sound_alike = false;
+        let restored: Entry =
+            serde_json::from_str(&serde_json::to_string(&explicit).unwrap()).unwrap();
+        assert!(!restored.sound_alike);
+    }
+    #[test]
+    fn cached_preview_budget_for_two_hundred_entries_and_words() {
+        let mut entries: Vec<_> = (0..199)
+            .map(|i| {
+                let suffix = format!(
+                    "{}{}",
+                    (b'a' + (i / 26) as u8) as char,
+                    (b'a' + (i % 26) as u8) as char
+                );
+                e(&format!("termon{suffix}"), &format!("Termun{suffix}"))
+            })
+            .collect();
+        entries.push(e("obi ante", "Obiente"));
+        let text = format!(
+            "{} obi yente",
+            "Please visit website example using vocabulary today with context ".repeat(22)
+        );
+        assert_eq!(apply_with_sound(&text, &entries, None, true).changed, 1);
+        let mut times = Vec::new();
+        for _ in 0..25 {
+            let start = std::time::Instant::now();
+            std::hint::black_box(apply_with_sound(
+                std::hint::black_box(&text),
+                &entries,
+                None,
+                true,
+            ));
+            times.push(start.elapsed());
+        }
+        times.sort();
+        eprintln!("Cached vocabulary median: {:?}", times[times.len() / 2]);
+        // The median avoids a scheduler interruption becoming a timing failure.
+        assert!(times[times.len() / 2] < std::time::Duration::from_millis(1));
     }
     #[test]
     fn duplicates_merge_exact_matching_union_without_crossing_case_contexts() {

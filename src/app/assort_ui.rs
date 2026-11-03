@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub(super) struct ReviewState {
     task: Option<crate::classification::CorrectionTask>,
     review: Option<crate::correction_context::Review>,
+    pending: Option<crate::correction_context::Request>,
     utterance: u64,
     raw: String,
     baseline: String,
@@ -40,21 +41,54 @@ impl super::App {
         let request =
             crate::correction_context::prepare(&self.raw, &self.settings.entries, app.as_deref())
                 .map_err(|e| e.to_string())?;
-        let package = self
-            .settings
-            .assort
-            .package(ModelTask::Corrections)
-            .map_err(|e| e.to_string())?;
-        let task = crate::classification::start_corrections(package, request)
-            .map_err(|e| e.to_string())?;
+        let exact = crate::correction_context::Request {
+            candidates: request
+                .candidates
+                .iter()
+                .filter(|c| c.match_kind == crate::dictionary::MatchKind::Exact)
+                .cloned()
+                .collect(),
+            ..request.clone()
+        };
+        let task = if exact.candidates.is_empty() {
+            Ok(None)
+        } else {
+            self.settings
+                .assort
+                .package(ModelTask::Corrections)
+                .and_then(|package| crate::classification::start_corrections(package, exact))
+                .map(Some)
+        };
+        let task = match task {
+            Ok(task) => task,
+            Err(_)
+                if request
+                    .candidates
+                    .iter()
+                    .any(|c| c.match_kind == crate::dictionary::MatchKind::SoundAlike) =>
+            {
+                None
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let ready = task.is_none();
         self.polish.assort = ReviewState {
-            task: Some(task),
+            task,
             utterance: self.utterance,
             raw: self.raw.clone(),
             baseline: self.text.clone(),
             app,
-            status: "Reviewing vocabulary".into(),
-            review: None,
+            status: if ready {
+                "Review suggestions before applying"
+            } else {
+                "Reviewing vocabulary"
+            }
+            .into(),
+            review: ready.then(|| crate::correction_context::Review {
+                request: request.clone(),
+                scores: Vec::new(),
+            }),
+            pending: (!ready).then_some(request),
         };
         Ok(())
     }
@@ -76,11 +110,34 @@ impl super::App {
         if let Some(result) = state.task.as_ref().and_then(|task| task.poll()) {
             state.task = None;
             match result {
-                Ok(review) => {
+                Ok(mut review) => {
+                    if let Some(request) = state.pending.take() {
+                        let indices: Vec<_> = request
+                            .candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.match_kind == crate::dictionary::MatchKind::Exact)
+                            .map(|(i, _)| i)
+                            .collect();
+                        for score in &mut review.scores {
+                            score.candidate = indices[score.candidate];
+                        }
+                        review.request = request;
+                    }
                     state.review = Some(review);
                     state.status = "Review suggestions before applying".into();
                 }
-                Err(error) => state.status = error,
+                Err(error) => {
+                    state.status = error;
+                    state.review =
+                        state
+                            .pending
+                            .take()
+                            .map(|request| crate::correction_context::Review {
+                                request,
+                                scores: Vec::new(),
+                            });
+                }
             }
         }
     }
@@ -210,6 +267,31 @@ pub(crate) struct ReviewStatus<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sound_only_review_needs_no_package_and_uses_destination_app() {
+        let (mut app, _) = super::super::tests::app();
+        app.preview_inflight = false;
+        app.dictation_app = Some("editor.exe".into());
+        let mut entry = crate::dictionary::validate("obi ante", "Obiente").unwrap();
+        entry.app = app.dictation_app.clone();
+        app.settings.entries.push(entry);
+        app.raw = "Use obi yente website".into();
+        app.text = "Use Obiente website".into();
+        app.desktop_action(
+            serde_json::from_value(serde_json::json!({"type":"assort_start"})).unwrap(),
+        )
+        .unwrap();
+        assert!(!app.polish.assort.working());
+        let review = app.polish.assort.review.as_ref().unwrap();
+        assert!(review.scores.is_empty());
+        assert_eq!(review.request.app.as_deref(), Some("editor.exe"));
+        assert_eq!(
+            review.request.candidates[0].match_kind,
+            crate::dictionary::MatchKind::SoundAlike
+        );
+        app.desktop_assort_apply(0, false).unwrap();
+        assert_eq!(app.text, "Use obi yente website");
+    }
     #[test]
     fn completed_review_applies_only_to_unchanged_text() {
         let (mut app, _) = super::super::tests::app();

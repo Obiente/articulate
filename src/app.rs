@@ -42,6 +42,8 @@ struct Settings {
     cpu: bool,
     insert: bool,
     entries: Vec<Entry>,
+    #[serde(default = "enabled")]
+    vocabulary_sound_alike: bool,
     macros: Vec<macros::VoiceMacro>,
     model_path: String,
     transcription_language: String,
@@ -106,6 +108,7 @@ impl Default for Settings {
             cpu: false,
             insert: false,
             entries: Vec::new(),
+            vocabulary_sound_alike: true,
             macros: Vec::new(),
             model_path: String::new(),
             transcription_language: String::new(),
@@ -259,6 +262,7 @@ pub struct App {
     edit_baseline: String,
     edited_at: Option<Instant>,
     remembered: Vec<learning::Change>,
+    sound_matches: Vec<dictionary::AppliedSound>,
     overlay_until: Option<Instant>,
     overlay_message: String,
     live_mode: bool,
@@ -798,6 +802,7 @@ impl App {
             edit_baseline: String::new(),
             edited_at: None,
             remembered: Vec::new(),
+            sound_matches: Vec::new(),
             overlay_until: None,
             overlay_message: String::new(),
             live_mode: false,
@@ -977,6 +982,7 @@ impl App {
                     self.pending_final = None;
                     self.text.clear();
                     self.raw.clear();
+                    self.sound_matches.clear();
                     self.committed_raw.clear();
                     self.words_changed = 0;
                     self.cleanup_count = 0;
@@ -1116,6 +1122,7 @@ impl App {
         // create another session containing the previous dictation's words.
         self.text.clear();
         self.raw.clear();
+        self.sound_matches.clear();
         self.edit_baseline.clear();
         self.edited_at = None;
         self.elapsed = None;
@@ -1219,11 +1226,15 @@ impl App {
             .collect();
         let (cleaned, count) = crate::writing_style::apply(&self.raw, style, &protected);
         self.cleanup_count = count;
-        (self.text, self.words_changed) = dictionary::apply_in(
+        let applied = dictionary::apply_with_sound(
             &cleaned,
             &self.settings.entries,
             self.dictation_app.as_deref(),
+            self.settings.vocabulary_sound_alike,
         );
+        self.text = applied.text;
+        self.words_changed = applied.changed;
+        self.sound_matches = applied.sounds;
         self.edit_baseline.clone_from(&self.text);
         self.edited_at = None;
     }
@@ -1758,10 +1769,11 @@ impl App {
                     self.overlay_until = Some(Instant::now() + Duration::from_secs(5));
                 }
                 integration::Event::Learned(entry, before) if self.settings.learn_corrections => {
-                    self.remember(learning::bind_context(
+                    self.remember(learning::bind_applied(
                         entry,
                         &before,
                         &self.settings.entries,
+                        &self.sound_matches,
                     ))
                 }
                 _ => {}
@@ -1778,10 +1790,11 @@ impl App {
             self.edited_at = None;
             if let Some(mut entry) = learning::correction(&self.edit_baseline, &self.text) {
                 entry.app.clone_from(&self.dictation_app);
-                self.remember(learning::bind_context(
+                self.remember(learning::bind_applied(
                     entry,
                     &self.edit_baseline,
                     &self.settings.entries,
+                    &self.sound_matches,
                 ));
             }
             self.edit_baseline.clone_from(&self.text);
@@ -1817,7 +1830,9 @@ impl App {
         };
         self.overlay_message = format!(
             "{}: {} → {}. Undo in Articulate.",
-            if change.updated_context() {
+            if change.disabled_sound() {
+                "Stopped matching similar sounds"
+            } else if change.updated_context() {
                 "Updated context"
             } else if change.updated_existing() {
                 "Updated correction"
@@ -2093,6 +2108,22 @@ impl Drop for App {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn preview_sound_matching_tracks_provenance_and_global_switch() {
+        let (mut app, _) = app();
+        app.settings
+            .entries
+            .push(dictionary::validate("obi ante", "Obiente").unwrap());
+        app.update_text("Visit obi yente website".into());
+        assert!(app.text.contains("Obiente"));
+        assert_eq!(app.sound_matches.len(), 1);
+        app.settings.vocabulary_sound_alike = false;
+        app.update_text("Visit obi yente website".into());
+        assert!(!app.text.contains("Obiente"));
+        assert!(app.sound_matches.is_empty());
+        app.update_text("Visit obi ante website".into());
+        assert!(app.text.contains("Obiente"));
+    }
     #[test]
     fn command_only_recording_routes_to_verified_previous_field_edit() {
         let (mut app, _) = app();
@@ -2915,6 +2946,7 @@ mod tests {
                 edit_baseline: String::new(),
                 edited_at: None,
                 remembered: Vec::new(),
+                sound_matches: Vec::new(),
                 overlay_until: None,
                 overlay_message: String::new(),
                 live_mode: false,

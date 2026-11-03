@@ -7,6 +7,13 @@ pub struct Change {
     saved: Vec<Entry>,
 }
 impl Change {
+    pub fn disabled_sound(&self) -> bool {
+        !self.entry.sound_alike
+            && self
+                .previous
+                .iter()
+                .any(|e| e.same_correction(&self.entry) && e.sound_alike)
+    }
     pub fn updated_existing(&self) -> bool {
         self.previous
             .iter()
@@ -18,6 +25,18 @@ impl Change {
             .any(|entry| entry.same_correction(&self.entry))
     }
     pub fn apply(entries: &mut Vec<Entry>, mut entry: Entry) -> Option<Self> {
+        if crate::sound_alike::is_distinctive(&entry.wanted)
+            && crate::sound_alike::similar(&entry.heard, &entry.wanted)
+                >= crate::sound_alike::THRESHOLD
+            && !entries.iter().any(|e| e.same_correction(&entry))
+        {
+            let mut family = entries
+                .iter()
+                .filter(|e| e.wanted == entry.wanted && e.same_app(&entry));
+            if let Some(existing) = family.next().filter(|_| family.next().is_none()) {
+                entry.heard.clone_from(&existing.heard);
+            }
+        }
         // Keep the exact ordered dictionary. Case-folding means rules outside
         // the literal heard/app family may participate in precedence ties.
         let previous = entries.clone();
@@ -28,6 +47,7 @@ impl Change {
         if let Some(existing) = existing {
             // Disabling a rule is an explicit user choice. Learning must not
             // silently reactivate it, or reset its matching policy.
+            entry.sound_alike &= existing.sound_alike;
             if !existing.enabled {
                 return None;
             }
@@ -81,6 +101,28 @@ impl Change {
 /// Resolve a revision of an applied correction using only its local sentence
 /// and destination app. Never infer an origin from a different app or cue.
 pub fn bind_context(mut entry: Entry, before: &str, entries: &[Entry]) -> Entry {
+    // Spelling variants of the same distinctive destination share one rule.
+    // An observation may add a cue, but cannot reactivate a rejected fallback.
+    if crate::sound_alike::is_distinctive(&entry.wanted)
+        && crate::sound_alike::similar(&entry.heard, &entry.wanted) >= crate::sound_alike::THRESHOLD
+    {
+        let mut family = entries
+            .iter()
+            .filter(|rule| rule.wanted == entry.wanted && rule.same_app(&entry));
+        if let Some(existing) = family.next().filter(|_| family.next().is_none()) {
+            let cues = observed_cues(before, &entry);
+            entry.heard.clone_from(&existing.heard);
+            entry.sound_alike = existing.sound_alike;
+            entry.ignore_case = existing.ignore_case;
+            if !existing.enabled {
+                return existing.clone();
+            }
+            if !cues.is_empty() && existing.policies().all(|(cues, _)| !cues.is_empty()) {
+                entry.cues = cues;
+                return entry;
+            }
+        }
+    }
     let existing = entries
         .iter()
         .find(|rule| rule.same_correction(&entry))
@@ -145,7 +187,45 @@ pub fn bind_context(mut entry: Entry, before: &str, entries: &[Entry]) -> Entry 
         entry.ignore_case = origin.ignore_case;
         entry.contexts.clone_from(&origin.contexts);
     }
+    if entry.cues.is_empty()
+        && entry.contexts.is_empty()
+        && crate::sound_alike::is_distinctive(&entry.wanted)
+        && crate::sound_alike::similar(&entry.heard, &entry.wanted) >= crate::sound_alike::THRESHOLD
+        && !entries.iter().any(|e| e.same_correction(&entry))
+    {
+        entry.cues = observed_cues(before, &entry);
+    }
     entry
+}
+
+/// Bind a reversal only to a recorded sound replacement from this dictation.
+/// Exact replacements and unobserved lookalikes keep the existing learning path.
+pub fn bind_applied(
+    entry: Entry,
+    before: &str,
+    entries: &[Entry],
+    applied: &[dictionary::AppliedSound],
+) -> Entry {
+    let mut origins = applied.iter().filter(|applied| {
+        applied.entry.wanted == entry.heard
+            && applied.heard.eq_ignore_ascii_case(&entry.wanted)
+            && applied.entry.app.as_deref().is_none_or(|scope| {
+                entry
+                    .app
+                    .as_deref()
+                    .is_some_and(|app| app.eq_ignore_ascii_case(scope))
+            })
+            && dictionary::output_in_context(&applied.entry, before)
+            && entries.contains(&applied.entry)
+    });
+    if let Some(origin) = origins.next()
+        && origins.all(|other| other.entry == origin.entry)
+    {
+        let mut rejected = origin.entry.clone();
+        rejected.sound_alike = false;
+        return rejected;
+    }
+    bind_context(entry, before, entries)
 }
 
 /// A short, user-confirmed substitution can extend a restricted rule with
@@ -187,8 +267,8 @@ fn observed_cues(before: &str, entry: &Entry) -> Vec<String> {
         "need", "next", "only", "other", "over", "please", "really", "said", "same", "send",
         "should", "some", "such", "take", "tell", "than", "thank", "thanks", "that", "their",
         "them", "then", "there", "these", "they", "thing", "think", "this", "those", "through",
-        "time", "today", "tomorrow", "very", "want", "were", "what", "when", "where", "which",
-        "while", "will", "with", "word", "words", "would", "your",
+        "time", "today", "tomorrow", "very", "visit", "want", "were", "what", "when", "where",
+        "which", "while", "will", "with", "word", "words", "would", "your",
     ];
     let mut candidates: Vec<_> = tokens(&before[left..right])
         .into_iter()
@@ -282,58 +362,18 @@ pub fn correction(before: &str, after: &str) -> Option<Entry> {
         .count();
     let aa = &a[prefix..a.len() - suffix];
     let bb = &b[prefix..b.len() - suffix];
-    if aa.is_empty() || bb.is_empty() || aa.len() > 3 || bb.len() > 3 {
+    if aa.is_empty() || bb.is_empty() || aa.len() > 4 || bb.len() > 4 {
         return None;
     }
     // Separated edits and changes to meaning-bearing operators are not spelling corrections.
     if aa.iter().any(|a| bb.iter().any(|b| a.2 == b.2)) {
         return None;
     }
-    const PROTECTED: &[&str] = &[
-        "no",
-        "not",
-        "never",
-        "don't",
-        "dont",
-        "do",
-        "can",
-        "can't",
-        "cannot",
-        "will",
-        "won't",
-        "is",
-        "isn't",
-        "a",
-        "an",
-        "the",
-        "and",
-        "or",
-        "to",
-        "from",
-        "one",
-        "two",
-        "three",
-        "four",
-        "five",
-        "six",
-        "seven",
-        "eight",
-        "nine",
-        "ten",
-        "hundred",
-        "thousand",
-        "million",
-        "monday",
-        "tuesday",
-        "wednesday",
-        "thursday",
-        "friday",
-        "saturday",
-        "sunday",
-    ];
-    if aa.iter().chain(bb).any(|t| {
-        t.2.chars().any(char::is_numeric) || PROTECTED.contains(&t.2.to_lowercase().as_str())
-    }) {
+    if aa
+        .iter()
+        .chain(bb)
+        .any(|t| crate::sound_alike::protected(t.2))
+    {
         return None;
     }
     let heard = &before[aa.first()?.0..aa.last()?.1];
@@ -393,6 +433,97 @@ mod tests {
     fn refine(entries: &mut Vec<Entry>, heard: &str, wanted: &str) -> Change {
         let entry = bind_context(dictionary::validate(heard, wanted).unwrap(), heard, entries);
         Change::apply(entries, entry).unwrap()
+    }
+    #[test]
+    fn first_sound_correction_learns_one_local_cue() {
+        let before = "Visit obi yente website";
+        let entry = correction(before, "Visit Obiente website").unwrap();
+        let entry = bind_context(entry, before, &[]);
+        assert_eq!(entry.cues, ["website"]);
+        assert!(entry.sound_alike);
+        let before = "website. obi yente";
+        let entry = correction(before, "website. Obiente").unwrap();
+        assert!(bind_context(entry, before, &[]).cues.is_empty());
+    }
+    #[test]
+    fn explicit_spelling_learning_merges_variants_without_losing_rejection() {
+        let mut existing = dictionary::validate("obi ante", "Obiente").unwrap();
+        existing.sound_alike = false;
+        existing.cues = vec!["website".into()];
+        let mut entries = vec![existing];
+        let mut incoming = dictionary::validate("obi yente", "Obiente").unwrap();
+        incoming.cues = vec!["domain".into()];
+        Change::apply(&mut entries, incoming).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].sound_alike);
+        assert_eq!(entries[0].all_cues(), ["domain", "website"]);
+    }
+    #[test]
+    fn sound_variants_merge_context_and_undo_without_reactivating() {
+        let mut rule = dictionary::validate("obi ante", "Obiente").unwrap();
+        rule.app = Some("editor.exe".into());
+        rule.cues = vec!["website".into()];
+        rule.sound_alike = false;
+        let mut entries = vec![rule.clone()];
+        let before = "Use obi yente domain";
+        let mut entry = correction(before, "Use Obiente domain").unwrap();
+        entry.app = rule.app.clone();
+        let entry = bind_context(entry, before, &entries);
+        let change = Change::apply(&mut entries, entry).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].heard, "obi ante");
+        assert!(!entries[0].sound_alike);
+        assert!(entries[0].all_cues().contains(&"domain".into()));
+        assert!(change.undo(&mut entries));
+        assert!(entries == [rule]);
+    }
+    #[test]
+    fn reverting_recorded_sound_match_disables_only_fallback_and_undo_restores() {
+        let rule = dictionary::validate("obi ante", "Obiente").unwrap();
+        let mut entries = vec![rule];
+        let applied = dictionary::apply_with_sound("obi yente website", &entries, None, true);
+        let edit = correction(&applied.text, "obi yente website").unwrap();
+        let bound = bind_applied(edit, &applied.text, &entries, &applied.sounds);
+        let change = Change::apply(&mut entries, bound).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].sound_alike);
+        assert_eq!(
+            dictionary::apply_in("obi ante", &entries, None).0,
+            "Obiente"
+        );
+        assert_eq!(
+            dictionary::apply_with_sound("obi yente", &entries, None, true).changed,
+            0
+        );
+        assert!(change.undo(&mut entries));
+        assert!(entries[0].sound_alike);
+    }
+    #[test]
+    fn sound_rejection_requires_provenance_and_matching_scope() {
+        let mut rule = dictionary::validate("ven cord", "Vencord").unwrap();
+        rule.app = Some("editor.exe".into());
+        let entries = vec![rule];
+        let applied = dictionary::apply_with_sound("when cord", &entries, Some("editor.exe"), true);
+        let mut edit = correction("Vencord", "when cord").unwrap();
+        edit.app = Some("chat.exe".into());
+        let bound = bind_applied(edit, "Vencord", &entries, &applied.sounds);
+        assert_ne!(bound.wanted, "Vencord");
+        let edit = correction("Vencord", "when cord").unwrap();
+        assert_ne!(
+            bind_applied(edit, "Vencord", &entries, &[]).wanted,
+            "Vencord"
+        );
+    }
+    #[test]
+    fn numeric_pronoun_and_curly_negation_edits_are_not_learned() {
+        for (before, after) in [
+            ("we cord", "Vencord"),
+            ("isn’t done", "finished"),
+            ("twenty", "plenty"),
+            ("their site", "Obiente"),
+        ] {
+            assert!(correction(before, after).is_none(), "{before}");
+        }
     }
     #[test]
     fn learning_merges_new_context_and_undo_restores_exact_previous_policy() {
