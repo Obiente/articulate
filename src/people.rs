@@ -150,30 +150,32 @@ impl Directory {
             blocked: None,
         };
         match std::fs::read(&path) {
-            Ok(bytes) => match {
+            Ok(bytes) => {
                 let sealed = protect::is_sealed(&bytes);
-                protect::open(bytes)
-                    .and_then(|plain| Ok((sealed, serde_json::from_slice::<Stored>(&plain)?)))
-            } {
-                Ok((sealed, stored)) if stored.version <= VERSION => {
-                    directory.people = stored.people;
-                    directory.people.truncate(MAX_PEOPLE);
-                    // The setting counts, not whatever form the file is in.
-                    directory.dirty = sealed != protect;
+                let decoded = protect::open(bytes)
+                    .and_then(|plain| Ok((sealed, serde_json::from_slice::<Stored>(&plain)?)));
+                match decoded {
+                    Ok((sealed, stored)) if stored.version <= VERSION => {
+                        directory.people = stored.people;
+                        directory.people.truncate(MAX_PEOPLE);
+                        // The setting counts, not whatever form the file is in.
+                        directory.dirty = sealed != protect;
+                    }
+                    Ok(_) => {
+                        directory.blocked = Some(
+                            "Known people were saved by a newer version of Articulate.".into(),
+                        );
+                    }
+                    Err(error) if error.is::<protect::Undecryptable>() => {
+                        directory.blocked = Some(error.to_string());
+                    }
+                    Err(_) => {
+                        let aside = path
+                            .with_extension(format!("corrupt-{}.json", crate::history::now_ms()));
+                        let _ = std::fs::rename(&path, aside);
+                    }
                 }
-                Ok(_) => {
-                    directory.blocked =
-                        Some("Known people were saved by a newer version of Articulate.".into());
-                }
-                Err(error) if error.is::<protect::Undecryptable>() => {
-                    directory.blocked = Some(error.to_string());
-                }
-                Err(_) => {
-                    let aside =
-                        path.with_extension(format!("corrupt-{}.json", crate::history::now_ms()));
-                    let _ = std::fs::rename(&path, aside);
-                }
-            },
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => directory.blocked = Some(format!("Could not read known people: {error}")),
         }
