@@ -448,7 +448,6 @@ export function App() {
                     .catch(() => {})
                 }
                 start={() => setCallSetup(true)}
-                act={act}
               />
             ) : (
               <Reader

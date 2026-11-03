@@ -119,7 +119,6 @@ export function LibraryPage({
   newNote,
   start,
   speak,
-  act,
 }) {
   const [preview, setPreview] = useState(null),
     [reviewing, setReviewing] = useState(false);
