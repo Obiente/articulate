@@ -12,7 +12,7 @@
 //! fall back to a substring filter.
 use super::{Kind, Session};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, params_from_iter, types::Value};
+use rusqlite::{Connection, InterruptHandle, params_from_iter, types::Value};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -20,8 +20,77 @@ use std::sync::{
 
 pub const MAX_HITS: usize = 200;
 const MAX_QUERY_CHARS: usize = 160;
-const OPEN: char = '\u{2}';
-const CLOSE: char = '\u{3}';
+
+/// Stops one search. Cancelling also interrupts its SQLite statement, so a
+/// superseded search releases the index promptly and never delays saves.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<CancelState>);
+
+#[derive(Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    /// Set only while this search holds the index lock.
+    running: Mutex<Option<InterruptHandle>>,
+}
+
+impl Cancel {
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::Release);
+        if let Some(handle) = self.running().as_ref() {
+            handle.interrupt();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<()> {
+        ensure!(!self.is_cancelled(), Cancelled);
+        Ok(())
+    }
+
+    fn running(&self) -> std::sync::MutexGuard<'_, Option<InterruptHandle>> {
+        self.0.running.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The search was cancelled before it finished.
+#[derive(Debug)]
+pub struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Search cancelled.")
+    }
+}
+impl std::error::Error for Cancelled {}
+
+/// Clears the interrupt handle before the index lock is released, so a late
+/// cancel can never interrupt another caller's statement.
+struct Running<'a>(&'a Cancel);
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        *self.0.running() = None;
+    }
+}
+
+/// Highlight markers for one query. Each holds a random token, so stored text
+/// cannot imitate them; a result that still does not align with the stored
+/// text is shown without highlights rather than misread.
+struct Markers {
+    open: String,
+    close: String,
+}
+
+impl Markers {
+    fn new() -> Self {
+        let token = super::new_id();
+        Self {
+            open: format!("\u{2}{token}["),
+            close: format!("]{token}\u{3}"),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Field {
@@ -204,13 +273,40 @@ impl SearchIndex {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn search(&self, query: &str, filters: &Filters) -> Result<Found> {
+        self.search_cancellable(query, filters, &Cancel::default())
+    }
+
+    /// Search until `cancel` is triggered. A cancelled search returns
+    /// `Cancelled` and stops its SQLite work as soon as possible.
+    pub fn search_cancellable(
+        &self,
+        query: &str,
+        filters: &Filters,
+        cancel: &Cancel,
+    ) -> Result<Found> {
         let terms = terms(query)?;
+        cancel.check()?;
         let db = self.db();
-        let indexed_sessions: usize =
-            db.query_row("SELECT COUNT(DISTINCT session_id) FROM fields", [], |row| {
+        // Publish the handle before checking again: a cancel that raced the
+        // lock is either seen here or interrupts the statement below.
+        *cancel.running() = Some(db.get_interrupt_handle());
+        let _running = Running(cancel);
+        cancel.check()?;
+        let markers = Markers::new();
+        let interrupted = |error: rusqlite::Error| -> anyhow::Error {
+            if cancel.is_cancelled() {
+                Cancelled.into()
+            } else {
+                error.into()
+            }
+        };
+        let indexed_sessions: usize = db
+            .query_row("SELECT COUNT(DISTINCT session_id) FROM fields", [], |row| {
                 row.get::<_, i64>(0)
-            })? as usize;
+            })
+            .map_err(interrupted)? as usize;
         let mut sql = String::from(
             "SELECT f.session_id, f.title, f.kind, f.created_ms, f.updated_ms, f.field,
                     f.row_index, f.speaker, f.start_ms, f.end_ms, body.text, ",
@@ -221,10 +317,11 @@ impl SearchIndex {
         if long.is_empty() {
             sql.push_str("NULL FROM body JOIN fields f ON f.id = body.rowid WHERE 1");
         } else {
-            sql.push_str(&format!(
-                "highlight(body, 0, char({}), char({})) FROM body JOIN fields f ON f.id = body.rowid WHERE body MATCH ?",
-                OPEN as u32, CLOSE as u32
-            ));
+            sql.push_str(
+                "highlight(body, 0, ?, ?) FROM body JOIN fields f ON f.id = body.rowid WHERE body MATCH ?",
+            );
+            values.push(Value::Text(markers.open.clone()));
+            values.push(Value::Text(markers.close.clone()));
             values.push(Value::Text(
                 long.iter()
                     .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
@@ -278,13 +375,16 @@ impl SearchIndex {
         });
         sql.push_str(&format!(" LIMIT {}", MAX_HITS + 1));
         let mut statement = db.prepare(&sql)?;
-        let mut rows = statement.query(params_from_iter(values))?;
+        let mut rows = statement
+            .query(params_from_iter(values))
+            .map_err(interrupted)?;
         let mut found = Found {
             indexed_sessions,
             unreadable_sessions: self.0.unreadable.load(Ordering::Acquire),
             ..Default::default()
         };
-        while let Some(row) = rows.next()? {
+        while let Some(row) = rows.next().map_err(interrupted)? {
+            cancel.check()?;
             if found.hits.len() == MAX_HITS {
                 found.partial = true;
                 break;
@@ -293,7 +393,7 @@ impl SearchIndex {
             let highlighted: Option<String> = row.get(11)?;
             let mut ranges = highlighted
                 .as_deref()
-                .map(marked_ranges)
+                .and_then(|marked| marked_ranges(marked, &text, &markers))
                 .unwrap_or_default();
             for term in &short {
                 ranges.extend(find_all(&text, term));
@@ -501,23 +601,37 @@ fn escape_like(term: &str) -> String {
     escaped
 }
 
-/// Byte ranges in the unmarked text from FTS5 highlight markers.
-fn marked_ranges(marked: &str) -> Vec<(usize, usize)> {
+/// Byte ranges of `text` from FTS5 highlight output. `None` unless removing
+/// the markers reproduces `text` exactly, so every range is a valid slice of
+/// the stored text whatever characters it contains.
+fn marked_ranges(marked: &str, text: &str, markers: &Markers) -> Option<Vec<(usize, usize)>> {
     let mut ranges = Vec::new();
+    let mut rest = marked;
     let mut offset = 0;
-    let mut open = None;
-    for c in marked.chars() {
-        match c {
-            OPEN => open = Some(offset),
-            CLOSE => {
-                if let Some(start) = open.take() {
-                    ranges.push((start, offset));
-                }
-            }
-            _ => offset += c.len_utf8(),
+    // Each plain or highlighted piece must equal the stored text at `offset`.
+    let consume = |piece: &str, offset: &mut usize| -> Option<()> {
+        (text.get(*offset..*offset + piece.len())? == piece).then_some(())?;
+        *offset += piece.len();
+        Some(())
+    };
+    while let Some(at) = rest.find(&markers.open) {
+        consume(&rest[..at], &mut offset)?;
+        rest = &rest[at + markers.open.len()..];
+        let end = rest.find(&markers.close)?;
+        let inside = &rest[..end];
+        if inside.contains(&markers.open) {
+            return None;
         }
+        let start = offset;
+        consume(inside, &mut offset)?;
+        ranges.push((start, offset));
+        rest = &rest[end + markers.close.len()..];
     }
-    ranges
+    if rest.contains(&markers.close) {
+        return None;
+    }
+    consume(rest, &mut offset)?;
+    (offset == text.len()).then_some(ranges)
 }
 
 /// Case-insensitive occurrences of `needle`, as byte ranges of `text`.
@@ -555,7 +669,11 @@ fn find_all(text: &str, needle: &str) -> Vec<(usize, usize)> {
 /// A readable window around the first match: up to 70 characters before and
 /// 120 after, always on character boundaries.
 fn window(text: &str, first: Option<(usize, usize)>) -> (usize, usize) {
-    let (match_start, match_end) = first.unwrap_or((0, 0));
+    let (match_start, match_end) = first
+        .filter(|(start, end)| {
+            start <= end && text.is_char_boundary(*start) && text.is_char_boundary(*end)
+        })
+        .unwrap_or((0, 0));
     let start = text[..match_start]
         .char_indices()
         .rev()
@@ -785,6 +903,94 @@ mod tests {
         let text = "é".repeat(300);
         let (start, end) = window(&text, Some((300, 302)));
         assert!(text.is_char_boundary(start) && text.is_char_boundary(end));
-        assert_eq!(marked_ranges("a\u{2}bc\u{3}d"), vec![(1, 3)]);
+        let markers = Markers::new();
+        let marked = format!("a{}bc{}d", markers.open, markers.close);
+        assert_eq!(marked_ranges(&marked, "abcd", &markers), Some(vec![(1, 3)]));
+        // Output that does not reproduce the stored text is never trusted.
+        assert_eq!(marked_ranges(&marked, "abc", &markers), None);
+        assert_eq!(marked_ranges(&marked, "xbcd", &markers), None);
+        assert_eq!(window("abc", Some((1, 9))), (0, 3));
+    }
+
+    #[test]
+    fn stored_control_characters_never_break_highlighting() {
+        let index = SearchIndex::in_memory().unwrap();
+        let mut session = Session::new(Kind::Dictation);
+        session.title = "Controls".into();
+        session.text = "\u{2}\u{e9}abc \u{3}abc\u{2}".into();
+        index.upsert(&session).unwrap();
+        index.set_ready(0);
+        for query in ["abc", "\u{e9}ab", "abc ab"] {
+            let found = index.search(query, &Filters::default()).unwrap();
+            let hit = found
+                .hits
+                .iter()
+                .find(|hit| hit.field == Field::Text)
+                .unwrap();
+            assert_eq!(hit.snippet, session.text);
+            assert!(!hit.matches.is_empty(), "{query}");
+            for (start, end) in &hit.matches {
+                assert!(hit.snippet.get(*start..*end).is_some());
+            }
+        }
+        let found = index.search("abc", &Filters::default()).unwrap();
+        let hit = found
+            .hits
+            .iter()
+            .find(|hit| hit.field == Field::Text)
+            .unwrap();
+        let matched: Vec<&str> = hit
+            .matches
+            .iter()
+            .map(|(start, end)| &hit.snippet[*start..*end])
+            .collect();
+        assert_eq!(matched, ["abc", "abc"]);
+    }
+
+    #[test]
+    fn cancelled_searches_stop_before_and_during_the_query() {
+        let (index, _, _) = sample();
+        let cancel = Cancel::default();
+        cancel.cancel();
+        let error = index
+            .search_cancellable("zephyr", &Filters::default(), &cancel)
+            .unwrap_err();
+        assert!(error.is::<Cancelled>());
+        // A long query holding the index is interrupted, and the lock is free
+        // again for saves straight away.
+        for i in 0..200 {
+            let mut session = Session::new(Kind::Dictation);
+            session.title = format!("Bulk {i}");
+            session.text = "zephyr ".repeat(1000);
+            index.upsert(&session).unwrap();
+        }
+        let cancel = Cancel::default();
+        let running = {
+            let index = index.clone();
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                index.search_cancellable("zep", &Filters::default(), &cancel)
+            })
+        };
+        let started = std::time::Instant::now();
+        while cancel.running().is_none() && started.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::yield_now();
+        }
+        cancel.cancel();
+        let result = running.join().unwrap();
+        if let Err(error) = &result {
+            assert!(error.is::<Cancelled>(), "{error:#}");
+        }
+        assert!(cancel.running().is_none());
+        let mut late = Session::new(Kind::Note);
+        late.title = "After cancel".into();
+        index.upsert(&late).unwrap();
+        assert!(
+            !index
+                .search("after cancel", &Filters::default())
+                .unwrap()
+                .hits
+                .is_empty()
+        );
     }
 }

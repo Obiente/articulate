@@ -59,6 +59,8 @@ pub(super) struct State {
     /// Progress of storage operations, file dialogs and library notices.
     pub storage: Storage,
     call_saved_committed: (usize, u64, usize),
+    /// Open documents replaced by a restore, reloaded before further edits.
+    pub restore_reloads: std::collections::HashSet<String>,
     insights_requested: Option<Instant>,
     retention_applied: Option<Instant>,
 }
@@ -162,6 +164,9 @@ pub(super) struct Storage {
     pub restored_settings: Option<RestoredSettings>,
     /// Whether the isolated files have been listed since the app started.
     pub quarantine_listed: bool,
+    /// Preference copies updated with the latest encryption change, added to
+    /// the history migration report when it arrives.
+    pub settings_migration: Option<MigrationReport>,
     /// One file dialog at a time.
     pub dialog_open: bool,
     pub notice: Option<Notice>,
@@ -170,9 +175,11 @@ pub(super) struct Storage {
 }
 
 impl State {
-    pub fn start(protect: bool) -> Self {
+    /// `migrate` completes an interrupted encryption change; it is set only
+    /// when the saved encryption choice was read successfully.
+    pub fn start(protect: bool, migrate: bool) -> Self {
         Self {
-            worker: Some(Worker::start_protected(protect)),
+            worker: Some(Worker::start_protected(protect, migrate)),
             loading: true,
             ..Default::default()
         }
@@ -371,6 +378,9 @@ impl App {
                     self.history.loading = false;
                 }
                 HistoryEvent::Loaded(mut session) => {
+                    if self.history.restore_reloads.remove(&session.id) {
+                        self.history_reconcile_restored(&session);
+                    }
                     if self.history.open_requested.as_deref() != Some(session.id.as_str()) {
                         continue;
                     }
@@ -466,8 +476,14 @@ impl App {
                     self.history_notify(format!("{error} ({file_name})"), true);
                 }
                 HistoryEvent::Pinned(summary) => self.history.upsert(*summary),
-                HistoryEvent::ProtectionChanged(result) => {
+                HistoryEvent::ProtectionChanged(mut result) => {
                     self.history.storage.encryption_working = false;
+                    if let (Ok(report), Some(settings)) =
+                        (&mut result, self.history.storage.settings_migration.take())
+                    {
+                        report.changed += settings.changed;
+                        report.failed += settings.failed;
+                    }
                     self.history.protection = Some(result);
                 }
                 HistoryEvent::RetentionPreview(result) => {
@@ -535,6 +551,9 @@ impl App {
                                 );
                             }
                         }
+                    }
+                    if let Ok(restored) = &result {
+                        self.history_reload_restored(&restored.updated);
                     }
                     self.insights.stale = true;
                     self.history.restored = Some(result);
@@ -778,7 +797,17 @@ impl App {
             self.settings.encrypt_at_rest = previous;
             return Err(format!("Could not save preferences: {error}"));
         }
-        worker.set_protection(enabled);
+        // A change is queued unless the worker has stopped. Then the saved
+        // preference goes back, so it never disagrees with the stored files.
+        if !worker.set_protection(enabled) {
+            self.settings.encrypt_at_rest = previous;
+            if let Err(error) = self.save_preferences() {
+                log::warn!("Could not restore the encryption preference: {error:#}");
+            }
+            return Err("Local history is unavailable. Restart Articulate and try again.".into());
+        }
+        self.history.storage.settings_migration =
+            Some(migrate_settings_copies(&model::data_dir(), enabled));
         // Known people follow the same protection; retained audio is
         // migrated with the history files.
         if let Err(error) = self.call_tools.people.set_protection(enabled) {
@@ -832,8 +861,9 @@ impl App {
         } else {
             Vec::new()
         };
-        self.settings.retention = policy.clone();
+        let previous = std::mem::replace(&mut self.settings.retention, policy.clone());
         if let Err(error) = self.save_preferences() {
+            self.settings.retention = previous;
             return Err(format!("Could not save preferences: {error}"));
         }
         // The confirmed items are removed now; the next automatic pass waits a day.
@@ -1036,6 +1066,12 @@ impl App {
                 };
                 // Saving open documents first lets a restore compare their latest version.
                 app.history_save_personal_notes();
+                if app.history.dictation_dirty.is_some() {
+                    app.history_save_dictation();
+                }
+                if app.history.call_dirty.is_some() {
+                    app.history_save_call();
+                }
                 if let Some(worker) = &app.history.worker {
                     worker.restore(backup::RestoreRequest {
                         source,
@@ -1051,6 +1087,83 @@ impl App {
         })?;
         self.history.storage.restore = Progress::Choosing;
         Ok(())
+    }
+
+    /// Reload open documents that a restore replaced. Until each reload
+    /// arrives, edits are not autosaved, and the store rejects saves of the
+    /// older copy, so restored content is never overwritten.
+    fn history_reload_restored(&mut self, replaced: &[String]) {
+        for id in replaced {
+            let open = [
+                &self.history.dictation,
+                &self.history.call,
+                &self.history.selected,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|session| &session.id == id);
+            if !open {
+                continue;
+            }
+            if self.history.dictation.as_ref().is_some_and(|s| &s.id == id) {
+                self.history.dictation_dirty = None;
+            }
+            if self.history.call.as_ref().is_some_and(|s| &s.id == id) {
+                self.history.call_dirty = None;
+            }
+            if self.history.selected.as_ref().is_some_and(|s| &s.id == id) {
+                self.history.selected_dirty = None;
+            }
+            self.brain.forget(id);
+            self.history.restore_reloads.insert(id.clone());
+            if let Some(worker) = &self.history.worker {
+                worker.load(id.clone());
+            }
+        }
+    }
+
+    /// Replace cached copies of a document with the version a restore installed.
+    fn history_reconcile_restored(&mut self, session: &Session) {
+        if self
+            .history
+            .dictation
+            .as_ref()
+            .is_some_and(|current| current.id == session.id)
+        {
+            self.text.clone_from(&session.text);
+            self.raw.clone_from(&session.original);
+            self.dictation_metrics.clone_from(&session.metrics);
+            self.history.dictation = Some(session.clone());
+            self.history.dictation_dirty = None;
+        }
+        if self.call.is_none()
+            && self
+                .history
+                .call
+                .as_ref()
+                .is_some_and(|current| current.id == session.id)
+        {
+            self.call_rows.clone_from(&session.rows);
+            self.call_committed.clone_from(&session.rows);
+            self.speaker_names.clone_from(&session.speaker_names);
+            self.call_notes.clone_from(&session.notes);
+            self.history.call = Some(session.clone());
+            self.history.call_dirty = None;
+            self.history.call_saved_committed = committed_fingerprint(&self.call_committed);
+        }
+        if self
+            .history
+            .selected
+            .as_ref()
+            .is_some_and(|current| current.id == session.id)
+        {
+            self.history.selected = Some(session.clone());
+            self.history.selected_dirty = None;
+            if !self.history.renaming {
+                self.history.rename.clone_from(&session.title);
+            }
+        }
+        self.brain.remember(session);
     }
 
     /// Apply merged preferences from a backup. Encryption and retention stay
@@ -1462,5 +1575,38 @@ mod tests {
         app.history.dictation_deleted = false;
         app.history_save_dictation();
         assert_ne!(app.history.dictation.as_ref().unwrap().id, id);
+    }
+    #[test]
+    fn failed_preference_saves_roll_back_retention() {
+        let (mut app, _) = super::super::tests::app();
+        let previous = crate::history::retention::Policy {
+            enabled: true,
+            days: 30,
+            ..Default::default()
+        };
+        app.settings.retention = previous.clone();
+        app.settings.save_blocked = Some("Synthetic read failure".into());
+        let error = app
+            .history_save_retention(crate::history::retention::Policy::default())
+            .unwrap_err();
+        assert!(error.contains("Could not save preferences"));
+        assert_eq!(app.settings.retention, previous);
+    }
+
+    #[test]
+    fn encryption_is_not_changed_when_history_cannot_accept_it() {
+        let (mut app, _) = super::super::tests::app();
+        let directory = std::env::temp_dir().join(format!(
+            "articulate-encryption-stopped-{}",
+            Session::new(Kind::Note).id
+        ));
+        let worker = Worker::test_directory(directory.clone());
+        worker.stop_for_test();
+        app.history.worker = Some(worker);
+        assert!(app.history_set_encryption(true).is_err());
+        assert!(!app.settings.encrypt_at_rest);
+        assert!(!app.history.storage.encryption_working);
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

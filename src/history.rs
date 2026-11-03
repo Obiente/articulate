@@ -169,6 +169,28 @@ pub fn directory() -> PathBuf {
     crate::model::data_dir().join("history")
 }
 
+/// Whether any record, recovery copy or isolated file in `directory` is
+/// stored encrypted. Used when the saved encryption choice is
+/// unknown, so it is never turned off by accident.
+pub fn contains_protected(directory: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return false;
+        };
+        let Some((id, suffix)) = name.split_once('.') else {
+            return false;
+        };
+        if !valid_id(id) {
+            return false;
+        }
+        (matches!(suffix, "json" | "tmp" | "bak") || parse_quarantine_name(&name).is_some())
+            && protect::is_sealed_file(&entry.path())
+    })
+}
+
 impl Session {
     pub fn can_receive_sources(&self) -> bool {
         self.is_collection
@@ -276,6 +298,19 @@ impl std::fmt::Display for UnsupportedSchema {
     }
 }
 impl std::error::Error for UnsupportedSchema {}
+
+/// A save based on a version older than one installed by a restore. Saving
+/// it would silently replace the restored content.
+#[derive(Debug)]
+pub struct StaleSave;
+impl std::fmt::Display for StaleSave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "This item was replaced by a restore after it was opened, so the older copy was not saved. Reopen it to keep editing.",
+        )
+    }
+}
+impl std::error::Error for StaleSave {}
 
 #[derive(Debug)]
 struct DamagedRecord;
@@ -406,6 +441,9 @@ pub struct History {
     search: Option<SearchIndex>,
     protect: AtomicBool,
     quarantined_now: AtomicUsize,
+    /// `updated_ms` of records installed by a restore. Ordinary saves based
+    /// on an older version of these are rejected as stale.
+    replaced: Mutex<HashMap<String, u64>>,
 }
 
 impl History {
@@ -422,6 +460,7 @@ impl History {
             search: None,
             protect: AtomicBool::new(false),
             quarantined_now: AtomicUsize::new(0),
+            replaced: Mutex::new(HashMap::new()),
         })
     }
 
@@ -759,6 +798,15 @@ impl History {
 
     fn save_inner(&self, mut session: Session, preserve_membership: bool) -> Result<Session> {
         validate(&session)?;
+        if self
+            .replaced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session.id)
+            .is_some_and(|installed| session.updated_ms < *installed)
+        {
+            return Err(StaleSave.into());
+        }
         ensure!(
             !self.path(&session.id, "deleted")?.exists(),
             "This history item was deleted"
@@ -874,7 +922,16 @@ impl History {
             !self.path(&session.id, "deleted")?.exists(),
             "This history item was deleted"
         );
-        self.write_record(session)
+        self.write_record(session)?;
+        self.replaced_by_restore(session);
+        Ok(())
+    }
+
+    /// Open copies older than `session` can no longer be saved over it.
+    fn replaced_by_restore(&self, session: &Session) {
+        let mut replaced = self.replaced.lock().unwrap_or_else(|e| e.into_inner());
+        let floor = replaced.entry(session.id.clone()).or_default();
+        *floor = (*floor).max(session.updated_ms);
     }
 
     /// The stored version of a record, if any, without hydrating topics.
@@ -1170,6 +1227,14 @@ impl History {
                             self.quarantine(&main, id)?;
                         }
                         fs::rename(candidate, &main)?;
+                        // A copy written before an encryption change must not
+                        // bring the old form back. A failure leaves a readable
+                        // record that the next migration pass converts.
+                        let protect = self.protect.load(Ordering::Acquire);
+                        if let Err(error) = protect::migrate_file(&main, protect, MAX_STORED_BYTES)
+                        {
+                            log::warn!("Could not update a recovered history record: {error:#}");
+                        }
                     }
                     remove_if_present(&temporary)?;
                     remove_if_present(&backup)?;
@@ -1284,6 +1349,7 @@ impl History {
             );
         }
         self.write_record(&session)?;
+        self.replaced_by_restore(&session);
         remove_if_present(&path)?;
         Ok(session)
     }
@@ -1310,13 +1376,26 @@ impl History {
     /// Rewrite every stored record, backup and isolated file so it is encrypted
     /// (`protect`) or plaintext. Each file is replaced atomically, and readers
     /// accept both forms, so an interrupted migration is safe and resumes when
-    /// this is called again. In-flight `.tmp` files are left to recovery.
+    /// this is called again. Interrupted saves are recovered first, so a
+    /// temporary copy can never later install the old form; any copy that
+    /// could not be recovered is converted in place.
     pub fn set_protection(&self, protect: bool) -> Result<MigrationReport> {
         self.protect.store(protect, Ordering::Release);
         let mut report = MigrationReport {
             protect,
             ..Default::default()
         };
+        for (id, found) in self.scan()? {
+            if found.deleted || !(found.tmp || found.bak) {
+                continue;
+            }
+            match self.recover(&id) {
+                Ok(_) => {}
+                // Damaged copies were isolated and are converted below.
+                Err(error) if error.is::<DamagedRecord>() => {}
+                Err(_) => report.failed += 1,
+            }
+        }
         for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -1335,7 +1414,8 @@ impl History {
                 continue;
             }
             let eligible = valid_id(id)
-                && (matches!(suffix, "json" | "bak") || parse_quarantine_name(&name).is_some());
+                && (matches!(suffix, "json" | "tmp" | "bak")
+                    || parse_quarantine_name(&name).is_some());
             if !eligible {
                 continue;
             }
@@ -1872,28 +1952,34 @@ impl Worker {
     /// Start the history worker with plaintext writes.
     #[cfg(test)]
     pub fn start() -> Self {
-        Self::start_protected(false)
+        Self::start_protected(false, true)
     }
 
-    /// Start the history worker. `protect` selects encryption for new writes
-    /// and finishes any interrupted encryption migration before listing.
-    pub fn start_protected(protect: bool) -> Self {
+    /// Start the history worker. `protect` selects encryption for new writes.
+    /// With `migrate`, the saved choice is confirmed and any interrupted
+    /// encryption change is finished before listing; otherwise stored files
+    /// keep their current form until the user changes the setting.
+    pub fn start_protected(protect: bool, migrate: bool) -> Self {
         let data = crate::model::data_dir();
         remove_leftover_call_audio(&data.join("audio-context-temp"));
         crate::audio_store::recover_interrupted(&directory());
-        Self::start_directory_protected(directory(), protect)
+        Self::start_directory_protected(directory(), protect, migrate)
     }
 
     #[cfg(test)]
     fn start_directory(directory: PathBuf) -> Self {
-        Self::start_directory_protected(directory, false)
+        Self::start_directory_protected(directory, false, true)
     }
 
-    fn start_directory_protected(directory: PathBuf, protect: bool) -> Self {
+    fn start_directory_protected(directory: PathBuf, protect: bool, migrate: bool) -> Self {
         let search = SearchIndex::in_memory().ok();
+        let mut commands = VecDeque::from([Command::List]);
+        if migrate {
+            commands.push_front(Command::SetProtection(protect));
+        }
         let shared = Arc::new(Shared {
             state: Mutex::new(WorkState {
-                commands: VecDeque::from([Command::SetProtection(protect), Command::List]),
+                commands,
                 events: VecDeque::new(),
                 stopped: false,
                 failed_saves: BTreeMap::new(),
@@ -1979,9 +2065,43 @@ impl Worker {
     pub fn set_pinned(&self, id: String, pinned: bool) {
         self.enqueue(Command::SetPinned(id, pinned));
     }
-    /// Replies with `ProtectionChanged`.
-    pub fn set_protection(&self, protect: bool) {
-        self.enqueue(Command::SetProtection(protect));
+    /// Stop accepting work, as when the worker has ended.
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopped = true;
+        self.shared.wake.notify_one();
+    }
+
+    /// Replies with `ProtectionChanged`. A protection change is always queued
+    /// while the worker runs, even when the queue is full, because the saved
+    /// preference already depends on it. Returns `false` only if the worker
+    /// has stopped, in which case nothing will change.
+    pub fn set_protection(&self, protect: bool) -> bool {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopped
+            || self
+                .thread
+                .as_ref()
+                .is_none_or(|thread| thread.is_finished())
+        {
+            return false;
+        }
+        // Only the latest choice matters; an earlier queued change is replaced.
+        if let Some(queued) = state
+            .commands
+            .iter_mut()
+            .find(|command| matches!(command, Command::SetProtection(_)))
+        {
+            *queued = Command::SetProtection(protect);
+        } else {
+            state.commands.push_back(Command::SetProtection(protect));
+        }
+        self.shared.wake.notify_one();
+        true
     }
     /// Replies with `RetentionPreview`. `active` sessions are always kept.
     pub fn retention_preview(&self, policy: retention::Policy, active: Vec<String>) {
@@ -2334,7 +2454,17 @@ fn history_worker(
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active_save = None;
         state.active_operation = false;
+        let stale = result.as_ref().is_err_and(|error| error.is::<StaleSave>());
         match (&result, retry) {
+            (Err(_), Some(session)) if stale => {
+                if state
+                    .failed_saves
+                    .get(&session.id)
+                    .is_some_and(|failed| failed.revision <= session.revision)
+                {
+                    state.failed_saves.remove(&session.id);
+                }
+            }
             (Err(_), Some(session)) => {
                 if (state.failed_saves.len() < QUEUE_CAPACITY
                     || state.failed_saves.contains_key(&session.id))
@@ -3362,6 +3492,207 @@ mod tests {
         reopened.set_protection(false).unwrap();
         let disk = fs::read_to_string(history.path(&session.id, "json").unwrap()).unwrap();
         assert!(disk.contains("synthetic-private-edit"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encryption_recovers_interrupted_saves_before_migrating() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = meeting();
+        session.personal_notes = "synthetic-private-committed".into();
+        let session = history.save(session).unwrap();
+        // An interrupted save left a plaintext temporary beside the record.
+        let mut newer = session.clone();
+        newer.personal_notes = "synthetic-private-temporary".into();
+        newer.updated_ms += 10;
+        fs::write(
+            history.path(&session.id, "tmp").unwrap(),
+            encode_record(&newer).unwrap(),
+        )
+        .unwrap();
+        let report = history.set_protection(true).unwrap();
+        assert_eq!(report.failed, 0);
+        for entry in fs::read_dir(&directory.0).unwrap().flatten() {
+            let bytes = fs::read(entry.path()).unwrap();
+            assert!(protect::is_sealed(&bytes), "{:?}", entry.file_name());
+        }
+        // The committed record is intact, so recovery kept it and removed the
+        // plaintext temporary instead of leaving it to be installed later.
+        assert!(!history.path(&session.id, "tmp").unwrap().exists());
+        assert_eq!(
+            history.load(&session.id).unwrap().personal_notes,
+            "synthetic-private-committed"
+        );
+        // A temporary that appears after the change is installed protected.
+        let mut later = newer.clone();
+        later.personal_notes = "synthetic-private-later".into();
+        later.updated_ms += 10;
+        fs::write(
+            history.path(&session.id, "tmp").unwrap(),
+            encode_record(&later).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(history.path(&session.id, "json").unwrap()).unwrap();
+        let reopened = directory.history().with_protection(true);
+        assert_eq!(
+            reopened.load(&session.id).unwrap().personal_notes,
+            "synthetic-private-later"
+        );
+        let main = fs::read(history.path(&session.id, "json").unwrap()).unwrap();
+        assert!(protect::is_sealed(&main));
+        assert!(contains_protected(&directory.0));
+    }
+
+    #[test]
+    fn saves_of_copies_older_than_a_restore_are_rejected() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = Session::new(Kind::Note);
+        session.personal_notes = "Before the restore.".into();
+        let open = history.save(session).unwrap();
+        let mut restored = open.clone();
+        restored.personal_notes = "Restored text.".into();
+        restored.updated_ms = open.updated_ms + 1000;
+        history.install(&restored).unwrap();
+        // The cached copy predates the restore: renaming it must not win.
+        let mut renamed = open.clone();
+        renamed.title = "Renamed".into();
+        let error = history.save(renamed).unwrap_err();
+        assert!(error.is::<StaleSave>());
+        assert_eq!(
+            history.load(&open.id).unwrap().personal_notes,
+            "Restored text."
+        );
+        // A reloaded copy saves normally.
+        let mut reloaded = history.load(&open.id).unwrap();
+        reloaded.title = "Renamed".into();
+        let saved = history.save(reloaded).unwrap();
+        assert_eq!(saved.personal_notes, "Restored text.");
+        let mut again = saved.clone();
+        again.personal_notes = "Edited after reload.".into();
+        history.save(again).unwrap();
+        assert!(!contains_protected(&directory.0));
+    }
+
+    fn describe(event: &Event) -> String {
+        match event {
+            Event::Failed(error) => format!("Failed({error})"),
+            Event::RestoreFinished(result) => format!(
+                "RestoreFinished({:?})",
+                result.as_ref().map(|restored| restored.updated.len())
+            ),
+            Event::Saved { id, .. } => format!("Saved({id})"),
+            Event::Listed(_) => "Listed".into(),
+            Event::ProtectionChanged(_) => "ProtectionChanged".into(),
+            _ => "Other".into(),
+        }
+    }
+
+    #[test]
+    fn worker_reports_stale_saves_without_retrying_them() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let session = history.save(Session::new(Kind::Note)).unwrap();
+        // Only the worker writes from here on, as in the app.
+        let worker = Worker::test_directory(directory.0.clone());
+        let mut restored = session.clone();
+        restored.updated_ms += 1000;
+        // The worker's own store installs the restored copy.
+        let path = directory.0.join("restore.articulate-backup");
+        {
+            let source = TestDirectory::new();
+            let archive_history = source.history();
+            archive_history.install(&restored).unwrap();
+            backup::create(
+                &archive_history,
+                &backup::Request {
+                    destination: path.clone(),
+                    passphrase: None,
+                    settings: serde_json::json!({}),
+                    library: crate::library::export(&[], &[]).unwrap(),
+                    include_audio: false,
+                },
+            )
+            .unwrap();
+        }
+        worker.restore(backup::RestoreRequest {
+            source: path,
+            passphrase: None,
+            replace_older: true,
+            include_settings: false,
+        });
+        worker.save(session.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut events = Vec::new();
+        while !events.iter().any(|event| matches!(event, Event::Failed(_))) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                events.iter().map(describe).collect::<Vec<_>>()
+            );
+            events.extend(worker.drain());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::RestoreFinished(Ok(restored)) if restored.updated.len() == 1
+            )),
+            "{:?}",
+            events.iter().map(describe).collect::<Vec<_>>()
+        );
+        assert!(worker.saves_settled().is_ok());
+    }
+
+    #[test]
+    fn protection_changes_are_queued_even_when_history_is_busy() {
+        let directory = TestDirectory::new();
+        let worker = Worker::test_directory(directory.0.clone());
+        {
+            let mut state = worker.shared.state.lock().unwrap();
+            while state.commands.len() < QUEUE_CAPACITY {
+                state.commands.push_back(Command::Quarantined);
+            }
+        }
+        assert!(worker.set_protection(false));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let events = worker.drain();
+            if let Some(result) = events.into_iter().find_map(|event| match event {
+                Event::ProtectionChanged(result) => Some(result),
+                _ => None,
+            }) {
+                assert!(result.is_ok());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(worker);
+    }
+
+    #[test]
+    fn startup_without_a_confirmed_choice_never_migrates() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let session = history.save(Session::new(Kind::Note)).unwrap();
+        let worker = Worker::start_directory_protected(directory.0.clone(), true, false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut events = Vec::new();
+        while !events.iter().any(|event| matches!(event, Event::Listed(_))) {
+            assert!(std::time::Instant::now() < deadline);
+            events.extend(worker.drain());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ProtectionChanged(_)))
+        );
+        drop(worker);
+        let bytes = fs::read(history.path(&session.id, "json").unwrap()).unwrap();
+        assert!(!protect::is_sealed(&bytes));
     }
 
     #[test]
