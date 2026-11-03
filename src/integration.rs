@@ -328,8 +328,10 @@ mod tests {
                 }
             }
         };
-        // An empty Chromium field reports only its placeholder marker.
-        let start_text = field_text(&field).replace('\u{fffc}', "");
+        // Empty fields report only a marker: U+FFFC for a text area, a line
+        // break for a rich-text paragraph. Neither is part of the text.
+        let visible = |text: String| text.replace(['\u{fffc}', '\n'], "");
+        let start_text = visible(field_text(&field));
         tx.send(Action::Arm(1, before, false)).unwrap();
         tx.send(Action::Insert {
             id: 1,
@@ -339,7 +341,8 @@ mod tests {
             cancel: transcribe_cpp::CancelToken::new(),
         })
         .unwrap();
-        report.push(format!("final insert: {}", wait(&rx, "inserted")));
+        let final_result = wait(&rx, "inserted");
+        report.push(format!("final insert: {final_result}"));
         std::thread::sleep(Duration::from_millis(300));
         let after_final = field_text(&field);
         report.push(format!("field after final: {after_final:?}"));
@@ -365,7 +368,8 @@ mod tests {
             cancel: transcribe_cpp::CancelToken::new(),
         })
         .unwrap();
-        report.push(format!("live final insert: {}", wait(&rx, "inserted")));
+        let live_result = wait(&rx, "inserted");
+        report.push(format!("live final insert: {live_result}"));
         std::thread::sleep(Duration::from_millis(300));
         let after_live = field_text(&field);
         report.push(format!("field after live: {after_live:?}"));
@@ -375,9 +379,17 @@ mod tests {
             "shortcut did not fire for the window"
         );
         assert!(still_focused, "Alt release moved focus out of the field");
-        assert_eq!(after_final, format!("{start_text}alpha beta"));
+        assert!(
+            final_result.starts_with("Ok"),
+            "final insertion reported {final_result}"
+        );
+        assert!(
+            live_result.starts_with("Ok"),
+            "live insertion reported {live_result}"
+        );
+        assert_eq!(visible(after_final), format!("{start_text}alpha beta"));
         assert_eq!(
-            after_live,
+            visible(after_live),
             format!("{start_text}alpha beta gamma delta epsilon")
         );
     }

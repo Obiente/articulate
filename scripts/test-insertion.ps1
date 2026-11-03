@@ -24,7 +24,17 @@ foreach ($target in $Targets.Split(',')) {
         $process = Start-Process powershell -ArgumentList '-NoProfile', '-Command', $code -PassThru
     } else {
         $profile = Join-Path $env:TEMP "articulate-e2e-edge-$PID"
-        New-Item -ItemType Directory -Force $profile | Out-Null; $page = Join-Path $profile 'page.html'; Set-Content -LiteralPath $page -Value '<!doctype html><title>ArticulateInsertTest</title><textarea autofocus style="width:90%;height:200px"></textarea>'; $page = 'file:///' + $page.Replace('\','/')
+        New-Item -ItemType Directory -Force $profile | Out-Null
+        $page = Join-Path $profile 'page.html'
+        # edge: a plain text area. edge-rich: an empty rich-text editor laid out
+        # like ProseMirror or Lexical (a contenteditable with one empty paragraph).
+        $body = if ($target -eq 'edge-rich') {
+            '<div id="e" contenteditable="true" role="textbox" aria-multiline="true" style="width:90%;height:200px;border:1px solid"><p><br></p></div><script>document.getElementById("e").focus()</script>'
+        } else {
+            '<textarea autofocus style="width:90%;height:200px"></textarea>'
+        }
+        Set-Content -LiteralPath $page -Value "<!doctype html><title>ArticulateInsertTest</title>$body"
+        $page = 'file:///' + $page.Replace('\','/')
         $process = Start-Process 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe' -ArgumentList "--user-data-dir=$profile\data", '--no-first-run', '--no-default-browser-check', '--new-window', $page -PassThru
     }
     try {
