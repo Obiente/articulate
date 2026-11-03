@@ -4,7 +4,7 @@
 // `state.discord.participants` or any `{ name, avatar }` pair. Pictures are
 // resolved through the controller's cache; while a picture is loading or
 // pictures are turned off, the initials badge stays in place.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Avatar } from "@mantine/core";
 import { participantAvatar } from "../../bridge.js";
 import { createAvatarCache, participantInitials } from "./avatars.js";
@@ -12,10 +12,21 @@ import "./participants.css";
 
 const cache = createAvatarCache({ load: participantAvatar });
 
+// Drops every cached picture, for example when pictures are turned off or
+// on again; identifiers still on screen are resolved afresh.
+export function clearParticipantAvatars() {
+  cache.clear();
+}
+
 // The URL for an avatar identifier, or null. Updates when it resolves.
 export function useParticipantAvatar(uri) {
   const [url, setUrl] = useState(() => (uri ? cache.peek(uri) : null) ?? null);
+  const shown = useRef(uri);
   useEffect(() => {
+    // A participant whose picture changed leaves the old one behind: it is
+    // forgotten so its URL can be freed once nothing else shows it.
+    if (shown.current && shown.current !== uri) cache.forget(shown.current);
+    shown.current = uri;
     if (!uri) {
       setUrl(null);
       return undefined;

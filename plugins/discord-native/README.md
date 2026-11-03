@@ -70,7 +70,11 @@ There must be no unrelated/public call during the first controlled test.
 
 The bridge first pairs with Articulate through the mutual HMAC handshake
 described in the [Vencord companion notes](../../docs/vencord.md#local-protocol)
-and keeps one persistent connection. It then polls `GET /capture` on that
+and keeps one persistent connection. The session is bound to that connection's
+socket: if the keep-alive agent hands out a different connection, the bridge
+pairs again there before any control request or audio is written, so a listener
+that replaced Articulate on the port cannot arm capture or receive audio without
+the key. It then polls `GET /capture` on that
 session every 250 ms after successful installation. Articulate supplies an active capture nonce, channel ID and allowed
 remote participant IDs as decimal strings. Capture stops when inactive, unavailable,
 disabled or its 1.5-second native lease expires. The hook stays dormant after stop
@@ -106,7 +110,7 @@ connection, so a 20 ms batch no longer opens a TCP connection of its own. Each
 batch contains up to 64 packets within 128 KiB, each preceded by its `u32`
 little-endian byte length. Only one audio request is in flight at a time. A batch
 that gets no reply or a server error is retried up to three times in order; a
-`401` re-pairs once; a `4xx` rejection means the receiver has already stopped
+`401` or a replaced connection re-pairs once; a `4xx` rejection means the receiver has already stopped
 that capture. Only exhausted retries report `audio-transport-unavailable`.
 Receivers retain the single-packet `POST /pcm` route.
 Each packet is a 64-byte little-endian header followed by interleaved signed PCM16:
