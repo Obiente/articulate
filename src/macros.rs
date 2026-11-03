@@ -250,6 +250,9 @@ impl DictationEditor {
     /// Call exactly once per finalized segment, before applying bang macros.
     pub fn apply(&mut self, segment: &str, settings: &EditingSettings) -> String {
         self.notice = None;
+        if !segment.trim().is_empty() && previous_command(segment).is_none() {
+            self.prior = None;
+        }
         if settings.spoken_editing_commands
             && self.segments.is_empty()
             && previous_command(segment).is_some()
@@ -406,6 +409,13 @@ mod editing_tests {
         assert_eq!(e.apply("scratch that", &settings), "");
         assert!(e.notice.is_some());
         let mut e = DictationEditor::default();
+        e.apply("Old recording.", &settings);
+        e.begin_recording(true);
+        assert_eq!(
+            e.apply("New recording. Scratch that. Undo that.", &settings),
+            "New recording."
+        );
+        let mut e = DictationEditor::default();
         assert_eq!(
             e.apply("The price is 1.25.", &settings),
             "The price is 1.25."
@@ -470,5 +480,49 @@ pub fn previous_command(text: &str) -> Option<bool> {
         "scratch that" | "delete that" => Some(false),
         "undo that" => Some(true),
         _ => None,
+    }
+}
+
+/// A replacement is committed only after the field confirms the edit.
+pub struct InsertionHistory {
+    text: String,
+    undo: String,
+}
+impl InsertionHistory {
+    pub fn new(text: String, replaced: String) -> Self {
+        Self {
+            text,
+            undo: replaced,
+        }
+    }
+    pub fn replacement(&self, undo: bool) -> anyhow::Result<String> {
+        if undo {
+            return Ok(self.undo.clone());
+        }
+        anyhow::ensure!(
+            !self.text.is_empty(),
+            "Nothing to remove from the previous insertion."
+        );
+        Ok(String::new())
+    }
+    pub fn commit(&mut self, replacement: String) {
+        self.undo = std::mem::replace(&mut self.text, replacement);
+    }
+}
+#[cfg(test)]
+mod insertion_history_tests {
+    use super::*;
+    #[test]
+    fn undo_restores_replaced_selection_and_removed_text() {
+        let mut history = InsertionHistory::new("New text".into(), "Selected text".into());
+        assert_eq!(history.replacement(true).unwrap(), "Selected text");
+        assert_eq!(history.replacement(false).unwrap(), "");
+        // Preparing an edit does not change history if the field rejects it.
+        assert_eq!(history.replacement(true).unwrap(), "Selected text");
+        history.commit(history.replacement(false).unwrap());
+        assert!(history.replacement(false).is_err());
+        assert_eq!(history.replacement(true).unwrap(), "New text");
+        history.commit(history.replacement(true).unwrap());
+        assert_eq!(history.replacement(true).unwrap(), "");
     }
 }

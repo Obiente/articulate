@@ -299,17 +299,23 @@ fn transfer(
     Ok(())
 }
 fn quarantine(part: &Path) -> Result<()> {
-    let prefix = format!(
-        "{}.invalid-",
-        part.file_stem()
-            .context("Missing artifact name")?
-            .to_string_lossy()
-    );
+    let stem = part
+        .file_stem()
+        .context("Missing artifact name")?
+        .to_string_lossy();
+    let base = stem
+        .rsplit_once('.')
+        .map_or(stem.as_ref(), |(base, _)| base);
     for entry in fs::read_dir(part.parent().context("Missing artifact directory")?)? {
         let path = entry?.path();
         if path
-            .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .and_then(|stem| stem.rsplit_once('.'))
+            .is_some_and(|(candidate, _)| candidate == base)
+            && path
+                .extension()
+                .is_some_and(|ext| ext.to_string_lossy().starts_with("invalid-"))
         {
             ordinary(&path)?;
             fs::remove_file(path)?;
@@ -450,11 +456,19 @@ mod tests {
         let (directory, _, sha) = fixture();
         let part = directory.join(format!("fixture.{sha}.part"));
         fs::write(part.with_extension("invalid-old"), b"old").unwrap();
+        fs::write(
+            directory.join("fixture.previoushash.invalid-old"),
+            b"old version",
+        )
+        .unwrap();
+        let unrelated = directory.join("fixture.other.hash.invalid-old");
+        fs::write(&unrelated, b"unrelated").unwrap();
         for _ in 0..3 {
             fs::write(&part, b"bad").unwrap();
             quarantine(&part).unwrap();
         }
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        assert!(unrelated.exists());
         fs::remove_dir_all(directory).unwrap();
     }
     #[cfg(windows)]
@@ -778,7 +792,8 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("verification"));
         assert!(!path.exists());
         assert!(!path.with_extension(format!("{sha}.part")).exists());
-        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        assert!(unrelated.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 }

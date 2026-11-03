@@ -392,7 +392,7 @@ mod win {
         let _com = initialized.then_some(Com);
         let ui = initialized.then(automation).and_then(Result::ok);
         let mut armed: Option<Armed> = None;
-        let mut previous: Option<(Armed, String, Option<String>)> = None;
+        let mut previous: Option<(Armed, crate::macros::InsertionHistory)> = None;
         let mut line_break = platform::LineBreak::Enter;
         let mut insertion_failure: Option<String> = None;
         let mut watch: Option<Watch> = None;
@@ -416,7 +416,7 @@ mod win {
                         let ui = ui
                             .as_ref()
                             .context("Windows text-field access is unavailable")?;
-                        let (a, text, redo) = previous
+                        let (a, history) = previous
                             .as_mut()
                             .context("Nothing to edit in the previous field.")?;
                         ensure!(
@@ -428,25 +428,14 @@ mod win {
                             .live
                             .as_mut()
                             .context("This field does not support verified spoken edits.")?;
-                        let replacement = if undo {
-                            redo.take().unwrap_or_default()
-                        } else {
-                            ensure!(
-                                !text.is_empty(),
-                                "Nothing to remove from the previous insertion."
-                            );
-                            String::new()
-                        };
+                        let replacement = history.replacement(undo)?;
                         live.update(target, &replacement, || {
                             !cancel.is_cancelled() && same(ui, target, &a.field)
                         })?;
-                        *redo = Some(std::mem::replace(text, replacement));
+                        history.commit(replacement);
                         Ok(())
                     })()
                     .map_err(|e| format!("{e:#}"));
-                    if result.is_err() {
-                        previous = None;
-                    }
                     emit(Event::Edited(id, result));
                 }
                 Ok(Action::StopLearning) => watch = None,
@@ -538,7 +527,13 @@ mod win {
                                 .live
                                 .as_ref()
                                 .map(|live| live.original_selection().to_owned());
-                            (a, text.clone(), before)
+                            (
+                                a,
+                                crate::macros::InsertionHistory::new(
+                                    text.clone(),
+                                    before.unwrap_or_default(),
+                                ),
+                            )
                         });
                     } else {
                         armed = None;

@@ -55,6 +55,20 @@ fn populated_app() -> crate::app::App {
 }
 
 #[test]
+fn call_snapshot_reports_active_endpoints_without_changing_preferences() {
+    let (mut app, _) = app();
+    app.settings.microphone = Some("Preferred mic".into());
+    let control = call_capture::Control::new();
+    *control.active_devices.lock().unwrap() =
+        (Some("Fallback mic".into()), Some("Fallback output".into()));
+    app.call = Some(control);
+    let state = app.desktop_snapshot();
+    assert_eq!(state["call_tools"]["active_microphone"], "Fallback mic");
+    assert_eq!(state["call_tools"]["active_output"], "Fallback output");
+    assert_eq!(app.settings.microphone.as_deref(), Some("Preferred mic"));
+}
+
+#[test]
 fn snapshot_sections_have_a_locked_shape() {
     let app = populated_app();
     let sections: BTreeMap<_, _> = app.desktop_sections().into_iter().collect();

@@ -31,11 +31,11 @@ pub const MAX_BYTES: usize = 1600;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Style {
+    Professional,
+    Casual,
     #[default]
     #[serde(other)]
     Clear,
-    Professional,
-    Casual,
 }
 
 #[derive(Clone)]

@@ -3,10 +3,10 @@ use std::sync::mpsc::Sender;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LineBreak {
+    ShiftEnter,
     #[default]
     #[serde(other)]
     Enter,
-    ShiftEnter,
 }
 
 #[cfg(windows)]

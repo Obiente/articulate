@@ -233,6 +233,7 @@ pub struct App {
     capture_interruption: Option<String>,
     dictation_editor: macros::DictationEditor,
     recording_spoken_editing: bool,
+    last_dictation_text: String,
     microphone_check: desktop::actions::capture::MicrophoneCheck,
     pending_final: Option<Vec<f32>>,
     cleanup_count: usize,
@@ -592,6 +593,7 @@ impl App {
             capture_interruption: None,
             dictation_editor: Default::default(),
             recording_spoken_editing: false,
+            last_dictation_text: String::new(),
             microphone_check: Default::default(),
             pending_final: None,
             cleanup_count: 0,
@@ -734,8 +736,13 @@ impl App {
                     )
                     .unwrap_or_else(|| format!("Listening on {}", recording.device));
                     self.capture_interruption = None;
+                    if !self.recording_spoken_editing {
+                        self.dictation_editor = Default::default();
+                        self.dictation_editor
+                            .apply(&self.text, &macros::EditingSettings::default());
+                    }
                     self.dictation_editor.begin_recording(
-                        self.text == self.edit_baseline
+                        self.text == self.last_dictation_text
                             && self.dictation_app.is_none()
                             && target.is_none(),
                     );
@@ -1348,12 +1355,20 @@ impl App {
                     {
                         self.busy = true;
                         self.integration_inflight = true;
-                        let _ = self.integration_tx.send(integration::Action::EditPrevious {
-                            id: self.utterance,
-                            target,
-                            undo,
-                            cancel: self.insertion_cancel.clone(),
-                        });
+                        if self
+                            .integration_tx
+                            .send(integration::Action::EditPrevious {
+                                id: self.utterance,
+                                target,
+                                undo,
+                                cancel: self.insertion_cancel.clone(),
+                            })
+                            .is_err()
+                        {
+                            self.busy = false;
+                            self.integration_inflight = false;
+                            self.status = "Previous insertion editing is unavailable.".into();
+                        }
                         continue;
                     }
                     if final_pass {
@@ -1401,6 +1416,7 @@ impl App {
                             continue;
                         }
                     }
+                    self.last_dictation_text.clone_from(&self.text);
                     self.dictation_metrics.recognized_words =
                         Some(self.raw.split_whitespace().count() as u64);
                     self.dictation_metrics.dictionary_replacements =
@@ -2506,6 +2522,7 @@ mod tests {
                 capture_interruption: None,
                 dictation_editor: Default::default(),
                 recording_spoken_editing: false,
+                last_dictation_text: String::new(),
                 microphone_check: Default::default(),
                 pending_final: None,
                 cleanup_count: 0,

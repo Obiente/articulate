@@ -68,12 +68,12 @@ impl App {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartMode {
+    /// Start a transcript as soon as a meeting is confirmed.
+    Automatic,
     /// Show a prompt with the consent reminder and wait for the user.
     #[default]
     #[serde(other)]
     Ask,
-    /// Start a transcript as soon as a meeting is confirmed.
-    Automatic,
 }
 
 /// Persisted preferences. Everything is off by default.
