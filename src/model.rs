@@ -266,7 +266,7 @@ pub fn delete_model(id: ModelId) -> Result<()> {
     Ok(())
 }
 
-pub fn acquire_path(path: &std::path::Path) -> ModelLease {
+pub fn acquire_path(path: &std::path::Path) -> Option<ModelLease> {
     let canonical = path.canonicalize().ok();
     let id = [
         ModelId::Speech,
@@ -283,14 +283,18 @@ pub fn acquire_path(path: &std::path::Path) -> ModelLease {
             || canonical
                 .as_ref()
                 .is_some_and(|path| managed.canonicalize().ok().as_ref() == Some(path))
-    })
-    .unwrap_or(ModelId::Speech);
-    acquire(id)
+    });
+    id.map(acquire)
 }
 
 #[cfg(test)]
 mod management_tests {
     use super::*;
+    #[test]
+    fn custom_paths_do_not_lease_managed_models() {
+        assert!(acquire_path(&std::env::temp_dir().join("custom-fixture.gguf")).is_none());
+        assert!(acquire_path(&managed_path(ModelId::Speech)).is_some());
+    }
     #[test]
     fn active_lease_prevents_deletion() {
         let lease = acquire(ModelId::Speech);

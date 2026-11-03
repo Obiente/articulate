@@ -232,6 +232,8 @@ pub struct App {
     preview_audio_seconds: f32,
     capture_interruption: Option<String>,
     dictation_editor: macros::DictationEditor,
+    recording_spoken_editing: bool,
+    last_dictation_text: String,
     microphone_check: desktop::actions::capture::MicrophoneCheck,
     pending_final: Option<Vec<f32>>,
     cleanup_count: usize,
@@ -769,6 +771,8 @@ impl App {
             preview_audio_seconds: 0.0,
             capture_interruption: None,
             dictation_editor: Default::default(),
+            recording_spoken_editing: false,
+            last_dictation_text: String::new(),
             microphone_check: Default::default(),
             pending_final: None,
             cleanup_count: 0,
@@ -905,9 +909,22 @@ impl App {
                     self.history_save_dictation();
                     self.history.dictation = None;
                     self.history.dictation_deleted = false;
-                    self.status = format!("Listening on {}", recording.device);
+                    self.status = audio::device_notice(
+                        self.settings.microphone.as_deref(),
+                        &recording.device,
+                    )
+                    .unwrap_or_else(|| format!("Listening on {}", recording.device));
                     self.capture_interruption = None;
-                    self.dictation_editor = Default::default();
+                    if !self.recording_spoken_editing {
+                        self.dictation_editor = Default::default();
+                        self.dictation_editor
+                            .apply(&self.text, &macros::EditingSettings::default());
+                    }
+                    self.dictation_editor.begin_recording(
+                        self.text == self.last_dictation_text
+                            && self.dictation_app.is_none()
+                            && target.is_none(),
+                    );
                     self.recording = Some(recording);
                     if self.settings.audio_feedback {
                         crate::audio_cues::play(crate::audio_cues::Cue::Started);
@@ -915,6 +932,7 @@ impl App {
                     self.last_seconds = 0;
                     self.target = target;
                     self.dictation_app = target.and_then(platform::app_name);
+                    self.recording_spoken_editing = self.spoken_editing();
                     self.dictation_metrics = crate::insights::DictationMetrics {
                         app: self.dictation_app.clone(),
                         ..Default::default()
@@ -1163,7 +1181,7 @@ impl App {
             })
     }
     fn finalized_text(&mut self, segment: String) {
-        if self.spoken_editing() {
+        if self.recording_spoken_editing {
             let edited = self.dictation_editor.apply(
                 &segment,
                 &macros::EditingSettings {
@@ -1211,9 +1229,9 @@ impl App {
 
     fn preview(&mut self) {
         #[cfg(windows)]
-        if crate::platform::devices::take_changed() {
-            self.microphones = audio::input_devices();
-            self.outputs = call_capture::outputs();
+        if let Some((microphones, outputs)) = crate::platform::devices::refresh() {
+            self.microphones = microphones;
+            self.outputs = outputs;
         }
         if let Some(recording) = self.recording.as_mut() {
             recording.drain();
@@ -1272,6 +1290,12 @@ impl App {
     }
 
     fn publish_live_preview(&mut self) {
+        if self.recording_spoken_editing
+            && self.raw.is_empty()
+            && self.dictation_editor.notice.is_none()
+        {
+            return;
+        }
         if self.live_mode
             && let Some(target) = self.target
         {
@@ -1504,9 +1528,34 @@ impl App {
                             continue;
                         }
                     };
+                    if final_pass
+                        && self.recording_spoken_editing
+                        && self.insert_enabled()
+                        && self.committed_raw.is_empty()
+                        && let Some(undo) = macros::previous_command(&text)
+                        && let Some(target) = self.target.take()
+                    {
+                        self.busy = true;
+                        self.integration_inflight = true;
+                        if self
+                            .integration_tx
+                            .send(integration::Action::EditPrevious {
+                                id: self.utterance,
+                                target,
+                                undo,
+                                cancel: self.insertion_cancel.clone(),
+                            })
+                            .is_err()
+                        {
+                            self.busy = false;
+                            self.integration_inflight = false;
+                            self.status = "Previous insertion editing is unavailable.".into();
+                        }
+                        continue;
+                    }
                     if final_pass {
                         self.finalized_text(text);
-                    } else if !self.spoken_editing() {
+                    } else if !self.recording_spoken_editing {
                         self.update_text(text);
                     }
                     self.elapsed = Some(elapsed);
@@ -1549,12 +1598,15 @@ impl App {
                             continue;
                         }
                     }
+                    self.last_dictation_text.clone_from(&self.text);
                     self.dictation_metrics.recognized_words =
                         Some(self.raw.split_whitespace().count() as u64);
                     self.dictation_metrics.dictionary_replacements =
                         Some(self.words_changed as u64);
                     self.dictation_metrics.cleanup_edits = Some(self.cleanup_count as u64);
-                    self.status = if self.text.is_empty() {
+                    self.status = if let Some(notice) = &self.dictation_editor.notice {
+                        notice.clone()
+                    } else if self.text.is_empty() {
                         "No speech was recognized".into()
                     } else {
                         "Your transcript is ready".into()
@@ -1678,6 +1730,14 @@ impl App {
                     } else if let Some(action) = self.integration_pending.take() {
                         self.queue_integration(action);
                     }
+                }
+                integration::Event::Edited(id, result) if id == self.utterance => {
+                    self.integration_inflight = false;
+                    self.busy = false;
+                    self.status =
+                        result.map_or_else(|e| e, |_| "Previous insertion updated.".into());
+                    self.overlay_message.clone_from(&self.status);
+                    self.overlay_until = Some(Instant::now() + Duration::from_secs(5));
                 }
                 integration::Event::Inserted(id, result) if id == self.utterance => {
                     self.integration_inflight = false;
@@ -2025,6 +2085,69 @@ impl Drop for App {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn command_only_recording_routes_to_verified_previous_field_edit() {
+        let (mut app, _) = app();
+        let (tx, rx) = mpsc::channel();
+        app.integration_tx = tx;
+        app.target = Some(platform::test_target());
+        app.settings.insert = true;
+        app.recording_spoken_editing = true;
+        app.event_tx
+            .send(Event::Text(
+                Ok("Scratch that.".into()),
+                0.1,
+                app.utterance,
+                true,
+            ))
+            .unwrap();
+        app.receive();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            integration::Action::EditPrevious { undo: false, .. }
+        ));
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn newer_settings_preserve_existing_preferences() {
+        let settings: super::Settings = serde_json::from_value(serde_json::json!({
+            "discord_pairing_key": "synthetic-pairing-value",
+            "hotkey": {"key": "F8", "future": true},
+            "hotkey_mode": "future",
+            "polish_style": "future",
+            "meetings": {"start": "future", "extra": 42},
+            "input_profiles": [{"app": "editor.exe", "future": true, "style": "future",
+                "line_break": "future", "hotkey_mode": "future"}],
+            "styles": [{"app": "editor.exe", "style": "future", "extra": 1}]
+        }))
+        .unwrap();
+        assert_eq!(settings.discord_pairing_key, "synthetic-pairing-value");
+        assert_eq!(settings.hotkey.key, "F8");
+        assert_eq!(settings.hotkey_mode, crate::platform::HotkeyMode::default());
+        assert_eq!(
+            settings.input_profiles[0].style,
+            Some(crate::writing_style::WritingStyle::default())
+        );
+    }
+
+    #[test]
+    fn changing_editing_preference_does_not_drop_committed_text() {
+        let (mut app, _) = app();
+        app.recording_spoken_editing = false;
+        app.committed_raw = "First sentence.".into();
+        app.settings.spoken_editing_commands = true;
+        app.finalized_text("Second sentence.".into());
+        assert_eq!(app.raw, "First sentence. Second sentence.");
+        app.recording_spoken_editing = true;
+        app.dictation_editor = Default::default();
+        app.finalized_text("First sentence.".into());
+        app.committed_raw = app.raw.clone();
+        app.settings.spoken_editing_commands = false;
+        app.finalized_text("Second sentence.".into());
+        assert_eq!(app.raw, "First sentence. Second sentence.");
+    }
     use super::*;
 
     #[test]
@@ -2758,6 +2881,8 @@ mod tests {
                 preview_audio_seconds: 0.0,
                 capture_interruption: None,
                 dictation_editor: Default::default(),
+                recording_spoken_editing: false,
+                last_dictation_text: String::new(),
                 microphone_check: Default::default(),
                 pending_final: None,
                 cleanup_count: 0,

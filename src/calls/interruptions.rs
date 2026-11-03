@@ -52,6 +52,8 @@ pub struct Interruption {
     /// The device has not come back yet.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ongoing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_notice: Option<String>,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -81,11 +83,15 @@ impl Interruption {
             cause,
             count: 0,
             ongoing: false,
+            device_notice: None,
         }
     }
 
     /// What happened, without times: "microphone disconnected".
     pub fn reason(&self) -> String {
+        if let Some(notice) = &self.device_notice {
+            return notice.clone();
+        }
         let packets = |noun: &str| {
             if self.count == 1 {
                 format!("1 {noun} packet")
@@ -149,6 +155,9 @@ pub fn record(list: &mut Vec<Interruption>, next: Interruption) {
                 || (next.start_ms >= existing.start_ms
                     && next.start_ms <= existing.end_ms.saturating_add(JOIN_MS)))
     }) {
+        if next.device_notice.is_some() {
+            existing.device_notice.clone_from(&next.device_notice);
+        }
         if existing.start_ms == next.start_ms && (existing.ongoing || next.ongoing) {
             // The same open interruption, reported again as it progresses.
             existing.end_ms = existing.end_ms.max(next.end_ms);
@@ -184,6 +193,18 @@ pub fn close(list: &mut [Interruption], end_ms: u64) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn fallback_notice_survives_recovery_and_serialization() {
+        let mut gap = Interruption::new(0, 100, Source::Microphone, Cause::DeviceLost);
+        gap.ongoing = true;
+        let mut list = vec![gap.clone()];
+        gap.ongoing = false;
+        gap.device_notice = Some("Now using Default microphone.".into());
+        super::record(&mut list, gap);
+        let saved = serde_json::to_string(&list[0]).unwrap();
+        let loaded: Interruption = serde_json::from_str(&saved).unwrap();
+        assert!(loaded.message().contains("Now using Default microphone."));
+    }
     #[test]
     fn messages_name_the_cause_and_time_range() {
         let lost = Interruption::new(723_000, 727_000, Source::Microphone, Cause::DeviceLost);

@@ -205,8 +205,17 @@ The command measures model loading and one inference pass for CPU and Vulkan sep
 
 ## Dictation input preferences
 
-Settings > Dictation includes spoken editing (off by default), app profiles and writing styles. Say a command as its own finalized segment: new line, new paragraph, scratch that, delete that, or undo that. With commands enabled, external live typing waits for finalized segments, so command phrases are never typed provisionally. Embedded command phrases remain literal.
+Settings > Dictation includes spoken editing (off by default), app profiles and writing styles. Say new line, new paragraph, scratch that, delete that, or undo that as a separate sentence. A trailing scratch that removes the preceding sentence, including one spanning capture windows. With commands enabled, external live typing waits for finalized segments, so command phrases are never typed provisionally. Embedded command phrases remain literal. The setting is captured when recording starts; changing it applies to the next recording. A command spoken in a separate recording edits the previous insertion only while its field, text and caret remain unchanged. Unsupported or changed fields show a status instead. Undo restores the replaced selection or the last removed insertion. An empty history shows a specific nothing-to-edit message.
 
 Profiles match executable basenames, ignoring case. Hold/toggle, insertion, live typing, line breaks, writing style and spoken editing may inherit defaults or override them. Discord, Slack, Teams and MS Teams use Shift+Enter by default; other apps use Enter. Explicit profile settings take precedence. Writing styles offer No cleanup, Clean and Casual chat.
 
 Audio settings offers a three-second microphone test with resolved device name, peak/average level, clipping and silence warnings. It does not load speech models. Incomplete dictations show the interruption reason and skip automatic insertion. Copy remains available; Insert in 3 seconds lets you focus a destination field before guarded insertion.
+
+
+### Input and download recovery
+
+Unknown saved preference fields are ignored, including fields in input profiles. Unknown preference enum values use their default instead of invalidating the settings file.
+
+Unrelated artifact downloads may run concurrently. A destination lock still prevents two transfers from writing the same artifact. Invalid downloaded data retains at most one copy for that artifact and is removed by stale-download cleanup after the retention period. Model deletion is rejected while a model is loading; custom model paths do not reserve the managed speech model.
+
+When a selected endpoint disappears, capture continues on the default endpoint and reports its active name. Call interruptions retain the fallback or reconnection notice, and the call tools snapshot exposes the active microphone and output independently of saved preferences. Endpoint property notifications are ignored. Device-list refresh runs off the controller thread and coalesces endpoint changes to once per second.

@@ -556,3 +556,23 @@ pub fn check_devices(
     }
     Ok(results)
 }
+
+/// Explain when a configured endpoint could not be opened.
+pub fn device_notice(selected: Option<&str>, active: &str) -> Option<String> {
+    selected
+        .filter(|name| *name != active)
+        .map(|name| format!("{name} is unavailable. Now using {active}."))
+}
+
+#[cfg(test)]
+mod device_notice_tests {
+    #[test]
+    fn fallback_is_visible_only_for_a_missing_selection() {
+        assert!(super::device_notice(None, "Default").is_none());
+        assert!(super::device_notice(Some("Chosen"), "Chosen").is_none());
+        assert_eq!(
+            super::device_notice(Some("Missing"), "Default").unwrap(),
+            "Missing is unavailable. Now using Default."
+        );
+    }
+}

@@ -14,7 +14,7 @@ pub struct Engine {
     options: RunOptions,
     call_preference: Option<String>,
     pub languages: Vec<String>,
-    _speech_lease: crate::model::ModelLease,
+    _speech_lease: Option<crate::model::ModelLease>,
     _verifier_lease: Option<crate::model::ModelLease>,
 }
 

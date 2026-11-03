@@ -104,6 +104,7 @@ pub mod win {
         pub line_break: platform::LineBreak,
         pattern: IUIAutomationTextPattern,
         selected: String,
+        original_selection: String,
         pub before: String,
         current: String,
         prefix: String,
@@ -180,6 +181,7 @@ pub mod win {
                     line_break: platform::LineBreak::Enter,
                     empty_placeholder,
                     pattern,
+                    original_selection: field.selected.clone(),
                     selected: field.selected,
                     current: field.document.clone(),
                     before: if empty_placeholder {
@@ -203,6 +205,9 @@ pub mod win {
                     &self.suffix,
                 )
             })
+        }
+        pub fn original_selection(&self) -> &str {
+            &self.original_selection
         }
         pub fn current(&self) -> &str {
             &self.current

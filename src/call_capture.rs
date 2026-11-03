@@ -55,6 +55,7 @@ struct Packet {
 pub struct Control {
     origin: OnceLock<Instant>,
     discord: Mutex<Option<Arc<crate::discord::Connection>>>,
+    pub active_devices: Mutex<(Option<String>, Option<String>)>,
     pub stop_ns: AtomicU64,
     pub abort: AtomicBool,
 }
@@ -63,6 +64,7 @@ impl Control {
         Arc::new(Self {
             origin: OnceLock::new(),
             discord: Mutex::new(None),
+            active_devices: Mutex::new((None, None)),
             stop_ns: AtomicU64::new(0),
             abort: AtomicBool::new(false),
         })
@@ -188,6 +190,33 @@ impl Track {
             _ => anyhow::bail!("Unsupported call audio format"),
         };
         stream.play()?;
+        let mut reported = Vec::new();
+        if let Some(notice) = crate::audio::device_notice(selected, &device_name) {
+            let ms = control.elapsed().as_millis() as u64;
+            let mut gap = Interruption::new(
+                ms,
+                ms,
+                if output {
+                    Source::SystemAudio
+                } else {
+                    Source::Microphone
+                },
+                Cause::DeviceLost,
+            );
+            gap.device_notice = Some(notice);
+            reported.push(gap);
+        }
+        {
+            let mut active = control
+                .active_devices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if output {
+                active.1 = Some(device_name.clone());
+            } else {
+                active.0 = Some(device_name.clone());
+            }
+        }
         Ok(Self {
             _stream: stream,
             consumer,
@@ -204,7 +233,7 @@ impl Track {
             gaps: 0,
             recovering: false,
             open_gap: None,
-            reported: Vec::new(),
+            reported,
             device: device_name,
         })
     }
@@ -295,6 +324,10 @@ impl Track {
                     if let Some(mut gap) = self.open_gap.take() {
                         gap.end_ms = gap.end_ms.max((seconds * 1000.0) as u64);
                         gap.ongoing = false;
+                        gap.device_notice = Some(format!(
+                            "Audio device reconnected. Now using {}.",
+                            replacement.device
+                        ));
                         replacement.reported.push(gap);
                     }
                     *self = replacement;

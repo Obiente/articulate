@@ -30,6 +30,9 @@ impl App {
                 }
             }
             Action::ModelDelete { id } => {
+                if self.loading {
+                    return Err("Wait for model loading to finish before deleting a model.".into());
+                }
                 if !self.desktop_active_downloads().is_empty() || self.polish_working() {
                     return Err("Finish or cancel downloads before deleting a model.".into());
                 }
@@ -160,5 +163,20 @@ impl App {
                 error.to_string()
             })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn loading_rejects_deletion_before_disk_access() {
+        let (mut app, _) = crate::app::tests::app();
+        app.loading = true;
+        let error = app
+            .desktop_models_action(super::Action::ModelDelete {
+                id: crate::model::ModelId::Speech,
+            })
+            .unwrap_err();
+        assert!(error.contains("loading"));
     }
 }

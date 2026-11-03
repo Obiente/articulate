@@ -17,6 +17,12 @@ pub enum Action {
         learn: bool,
         cancel: transcribe_cpp::CancelToken,
     },
+    EditPrevious {
+        id: u64,
+        target: Target,
+        undo: bool,
+        cancel: transcribe_cpp::CancelToken,
+    },
     Cancel,
     StopLearning,
 }
@@ -24,6 +30,7 @@ pub enum Event {
     LiveSupport(u64, bool),
     Previewed(u64, Result<(), String>),
     Inserted(u64, Result<bool, String>),
+    Edited(u64, Result<(), String>),
     Learned(Entry, String),
 }
 
@@ -236,7 +243,7 @@ mod win {
         }
         false
     }
-    fn arm(ui: &IUIAutomation, id: u64, target: Target, use_live: bool) -> Result<Armed> {
+    fn arm(ui: &IUIAutomation, id: u64, target: Target, _use_live: bool) -> Result<Armed> {
         let field = unsafe { ui.GetFocusedElement() }
             .context("Windows could not read the focused field. Focus the editor and try again.")?;
         ensure!(
@@ -244,9 +251,7 @@ mod win {
             "Focus changed before dictation started."
         );
         editable(&field)?;
-        let live = use_live
-            .then(|| crate::live::win::Session::new(&field).ok())
-            .flatten();
+        let live = crate::live::win::Session::new(&field).ok();
         Ok(Armed {
             id,
             target,
@@ -312,16 +317,13 @@ mod win {
     }
     fn insert(
         ui: &IUIAutomation,
-        armed: Option<Armed>,
+        armed: &mut Armed,
         id: u64,
         target: Target,
         text: &str,
         learn: bool,
         cancel: &transcribe_cpp::CancelToken,
     ) -> Result<Option<Watch>> {
-        let mut armed = armed.context(
-            "The text field changed or could not be identified. Your transcript is ready to copy.",
-        )?;
         ensure!(
             armed.id == id && armed.target == target && same(ui, target, &armed.field),
             "Focus changed. Your transcript is ready to copy."
@@ -334,7 +336,7 @@ mod win {
             return Ok(if learn {
                 learning::Span::inserted(&live.before, live.current(), text).map(|span| Watch {
                     target,
-                    field: armed.field,
+                    field: armed.field.clone(),
                     span,
                     pending: text.into(),
                     changed: Instant::now(),
@@ -362,7 +364,7 @@ mod win {
             {
                 return Ok(Some(Watch {
                     target,
-                    field: armed.field,
+                    field: armed.field.clone(),
                     span,
                     pending: text.into(),
                     changed: Instant::now(),
@@ -390,6 +392,7 @@ mod win {
         let _com = initialized.then_some(Com);
         let ui = initialized.then(automation).and_then(Result::ok);
         let mut armed: Option<Armed> = None;
+        let mut previous: Option<(Armed, crate::macros::InsertionHistory)> = None;
         let mut line_break = platform::LineBreak::Enter;
         let mut insertion_failure: Option<String> = None;
         let mut watch: Option<Watch> = None;
@@ -400,6 +403,40 @@ mod win {
                     armed = None;
                     insertion_failure = None;
                     watch = None;
+                }
+                Ok(Action::EditPrevious {
+                    id,
+                    target,
+                    undo,
+                    cancel,
+                }) => {
+                    watch = None;
+                    armed = None;
+                    let result = (|| -> Result<()> {
+                        let ui = ui
+                            .as_ref()
+                            .context("Windows text-field access is unavailable")?;
+                        let (a, history) = previous
+                            .as_mut()
+                            .context("Nothing to edit in the previous field.")?;
+                        ensure!(
+                            a.target == target && same(ui, target, &a.field),
+                            "The target field changed. Previous dictation was left unchanged."
+                        );
+                        editable(&a.field)?;
+                        let live = a
+                            .live
+                            .as_mut()
+                            .context("This field does not support verified spoken edits.")?;
+                        let replacement = history.replacement(undo)?;
+                        live.update(target, &replacement, || {
+                            !cancel.is_cancelled() && same(ui, target, &a.field)
+                        })?;
+                        history.commit(replacement);
+                        Ok(())
+                    })()
+                    .map_err(|e| format!("{e:#}"));
+                    emit(Event::Edited(id, result));
                 }
                 Ok(Action::StopLearning) => watch = None,
                 Ok(Action::LineBreak(value)) => line_break = value,
@@ -478,7 +515,30 @@ mod win {
                             }
                             Ok(ui)
                         })
-                        .and_then(|ui| insert(ui, armed.take(), id, target, &text, learn, &cancel));
+                        .and_then(|ui| {
+                            let a = armed
+                                .as_mut()
+                                .context("The text field changed or could not be identified.")?;
+                            insert(ui, a, id, target, &text, learn, &cancel)
+                        });
+                    if result.is_ok() {
+                        previous = armed.take().map(|a| {
+                            let before = a
+                                .live
+                                .as_ref()
+                                .map(|live| live.original_selection().to_owned());
+                            (
+                                a,
+                                crate::macros::InsertionHistory::new(
+                                    text.clone(),
+                                    before.unwrap_or_default(),
+                                ),
+                            )
+                        });
+                    } else {
+                        armed = None;
+                        previous = None;
+                    }
                     let result = result
                         .map(|next| {
                             let learning = next.is_some();

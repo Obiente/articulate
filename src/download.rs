@@ -18,15 +18,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-static TRANSFERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TRANSFERS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-struct DirectoryLock {
+struct ArtifactLock {
     file: Option<fs::File>,
     path: std::path::PathBuf,
 }
-impl DirectoryLock {
-    fn acquire(directory: &Path) -> Result<Self> {
-        let path = directory.join(".download.lock");
+impl ArtifactLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let path = path.to_owned();
         let mut options = OpenOptions::new();
         options.create(true).truncate(false).read(true).write(true);
         #[cfg(windows)]
@@ -36,14 +36,14 @@ impl DirectoryLock {
         }
         let file = options
             .open(&path)
-            .context("Another download or cleanup may be active in this folder")?;
+            .context("Another download or cleanup is active for this artifact")?;
         Ok(Self {
             file: Some(file),
             path,
         })
     }
 }
-impl Drop for DirectoryLock {
+impl Drop for ArtifactLock {
     fn drop(&mut self) {
         drop(self.file.take());
         let _ = fs::remove_file(&self.path);
@@ -52,25 +52,43 @@ impl Drop for DirectoryLock {
 
 /// Remove abandoned prefixes only while no managed transfer is running.
 pub fn prune_stale(directory: &Path, age: Duration) -> Result<()> {
-    let _guard = TRANSFERS
-        .try_lock()
-        .map_err(|_| anyhow::anyhow!("A download is active"))?;
+    let _guard = cleanup_guard(&TRANSFERS)?;
+    prune_files(directory, age)
+}
+fn cleanup_guard(lock: &std::sync::RwLock<()>) -> Result<std::sync::RwLockWriteGuard<'_, ()>> {
+    lock.try_write().or_else(|error| match error {
+        std::sync::TryLockError::Poisoned(error) => Ok(error.into_inner()),
+        std::sync::TryLockError::WouldBlock => Err(anyhow::anyhow!("A download is active")),
+    })
+}
+fn prune_files(directory: &Path, age: Duration) -> Result<()> {
     if !directory.exists() {
         return Ok(());
     }
-    let _directory_lock = DirectoryLock::acquire(directory)?;
+
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.is_file()
             && !metadata.file_type().is_symlink()
-            && path.extension().is_some_and(|e| e == "part")
+            && (path.extension().is_some_and(|e| e == "part")
+                || path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(".invalid-")))
             && metadata
                 .modified()?
                 .elapsed()
                 .is_ok_and(|elapsed| elapsed > age)
         {
+            let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let base = name.rsplit_once('.').map_or(name, |(base, _)| base);
+            let Ok(_lock) = ArtifactLock::acquire(&directory.join(format!("{base}.download.lock")))
+            else {
+                continue;
+            };
             ordinary(&path)?;
             fs::remove_file(&path)?;
             let _ = fs::remove_file(path.with_extension("identity"));
@@ -106,9 +124,6 @@ pub(crate) fn fetch(
     cancel: &Arc<AtomicBool>,
     progress: &mut impl FnMut(&str, Option<f32>),
 ) -> Result<()> {
-    let _guard = TRANSFERS
-        .try_lock()
-        .map_err(|_| anyhow::anyhow!("Another download is active"))?;
     transfer(artifact, cancel, progress, Policy::default())
 }
 fn transfer(
@@ -117,6 +132,7 @@ fn transfer(
     progress: &mut impl FnMut(&str, Option<f32>),
     policy: Policy,
 ) -> Result<()> {
+    let _guard = TRANSFERS.read().unwrap_or_else(|error| error.into_inner());
     check_cancel(cancel)?;
     ensure!(
         a.url.starts_with("https://") || cfg!(test) && a.url.starts_with("http://127.0.0.1:"),
@@ -127,19 +143,12 @@ fn transfer(
         "Invalid download manifest."
     );
     let part = a.destination.with_extension(format!("{}.part", a.sha));
-    let _directory_lock = DirectoryLock::acquire(
-        a.destination
-            .parent()
-            .context("Missing download directory")?,
-    )?;
+    let _directory_lock = ArtifactLock::acquire(&a.destination.with_extension("download.lock"))?;
     if part.exists() {
         ordinary(&part)?;
     }
     if part.metadata().is_ok_and(|m| m.len() > a.size) {
-        fs::rename(
-            &part,
-            part.with_extension(format!("invalid-{}", crate::discord::plugin::new_token()?)),
-        )?;
+        quarantine(&part)?;
     }
     let identity_path = part.with_extension("identity");
     let mut identity = fs::read_to_string(&identity_path).ok();
@@ -278,9 +287,7 @@ fn transfer(
     if let Err(error) = verified(&part, a.size, a.sha, cancel) {
         check_cancel(cancel)?;
         // Keep a failed artifact for diagnosis, but permit a clean retry next time.
-        let invalid =
-            part.with_extension(format!("invalid-{}", crate::discord::plugin::new_token()?));
-        fs::rename(&part, invalid)?;
+        quarantine(&part)?;
         let _ = fs::remove_file(&identity_path);
         return Err(error).context(
             "Downloaded data failed verification. Choose Download again to fetch a fresh copy.",
@@ -288,6 +295,32 @@ fn transfer(
     }
     let _ = fs::remove_file(identity_path);
     fs::rename(&part, a.destination)?;
+    Ok(())
+}
+fn quarantine(part: &Path) -> Result<()> {
+    let stem = part
+        .file_stem()
+        .context("Missing artifact name")?
+        .to_string_lossy();
+    let base = stem
+        .rsplit_once('.')
+        .map_or(stem.as_ref(), |(base, _)| base);
+    for entry in fs::read_dir(part.parent().context("Missing artifact directory")?)? {
+        let path = entry?.path();
+        if path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .and_then(|stem| stem.rsplit_once('.'))
+            .is_some_and(|(candidate, _)| candidate == base)
+            && path
+                .extension()
+                .is_some_and(|ext| ext.to_string_lossy().starts_with("invalid-"))
+        {
+            ordinary(&path)?;
+            fs::remove_file(path)?;
+        }
+    }
+    fs::rename(part, part.with_extension("invalid-latest"))?;
     Ok(())
 }
 fn validate_headers(
@@ -381,26 +414,148 @@ mod tests {
     fn cleanup_is_blocked_during_transfer_and_keeps_finished_files() {
         let (directory, _, _) = fixture();
         fs::write(directory.join("old.part"), b"partial").unwrap();
+        fs::write(directory.join("model.hash.invalid-old"), b"invalid").unwrap();
         fs::write(directory.join("finished.gguf"), b"complete").unwrap();
         {
-            let _guard = TRANSFERS.lock().unwrap();
+            let _guard = TRANSFERS.read().unwrap();
             assert!(prune_stale(&directory, Duration::ZERO).is_err());
             assert!(directory.join("old.part").exists());
         }
         std::thread::sleep(Duration::from_millis(20));
-        prune_stale(&directory, Duration::ZERO).unwrap();
+        prune_files(&directory, Duration::ZERO).unwrap();
+        assert!(!directory.join("model.hash.invalid-old").exists());
         assert!(!directory.join("old.part").exists());
         assert!(directory.join("finished.gguf").exists());
         fs::remove_dir_all(directory).unwrap();
     }
     #[cfg(windows)]
     #[test]
-    fn directory_lock_excludes_another_handle() {
+    fn artifact_lock_excludes_another_handle() {
         let (directory, _, _) = fixture();
-        let lock = DirectoryLock::acquire(&directory).unwrap();
-        assert!(DirectoryLock::acquire(&directory).is_err());
+        let lock = ArtifactLock::acquire(&directory.join("model.download.lock")).unwrap();
+        assert!(ArtifactLock::acquire(&directory.join("model.download.lock")).is_err());
         drop(lock);
-        drop(DirectoryLock::acquire(&directory).unwrap());
+        drop(ArtifactLock::acquire(&directory.join("model.download.lock")).unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn poisoned_cleanup_lock_recovers() {
+        let lock = Arc::new(std::sync::RwLock::new(()));
+        let other = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = other.write().unwrap();
+            panic!("synthetic lock failure");
+        })
+        .join();
+        assert!(cleanup_guard(&lock).is_ok());
+    }
+    #[test]
+    fn quarantine_is_bounded() {
+        let (directory, _, sha) = fixture();
+        let part = directory.join(format!("fixture.{sha}.part"));
+        fs::write(part.with_extension("invalid-old"), b"old").unwrap();
+        fs::write(
+            directory.join("fixture.previoushash.invalid-old"),
+            b"old version",
+        )
+        .unwrap();
+        let unrelated = directory.join("fixture.other.hash.invalid-old");
+        fs::write(&unrelated, b"unrelated").unwrap();
+        for _ in 0..3 {
+            fs::write(&part, b"bad").unwrap();
+            quarantine(&part).unwrap();
+        }
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        assert!(unrelated.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn unrelated_artifacts_can_lock_concurrently() {
+        let (directory, _, _) = fixture();
+        let a = directory.join("a.download.lock");
+        let b = directory.join("b.download.lock");
+        let first = ArtifactLock::acquire(&a).unwrap();
+        let second = ArtifactLock::acquire(&b).unwrap();
+        assert!(ArtifactLock::acquire(&a).is_err());
+        drop((first, second));
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn different_downloads_finish_while_another_transfer_is_paused() {
+        let (directory, data, sha) = fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/model", listener.local_addr().unwrap());
+        let size = data.len() as u64;
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let started = Instant::now();
+                let (mut socket, _) = loop {
+                    match listener.accept() {
+                        Ok(socket) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && started.elapsed() < Duration::from_secs(30) =>
+                        {
+                            thread::sleep(Duration::from_millis(10))
+                        }
+                        Err(error) => panic!("Fixture connection failed: {error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                request(&mut socket);
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                socket.write_all(&data).unwrap();
+            }
+        });
+        let (started, ready) = std::sync::mpsc::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let first_path = directory.join("first");
+        let first_url = url.clone();
+        let first_sha = sha.clone();
+        let first = thread::spawn(move || {
+            let mut waiting = true;
+            fetch(
+                Artifact {
+                    url: &first_url,
+                    destination: &first_path,
+                    size,
+                    sha: &first_sha,
+                    stage: "Testing",
+                },
+                &Arc::new(AtomicBool::new(false)),
+                &mut |_, _| {
+                    if waiting {
+                        waiting = false;
+                        started.send(()).unwrap();
+                        paused.recv_timeout(Duration::from_secs(30)).unwrap();
+                    }
+                },
+            )
+        });
+        ready.recv_timeout(Duration::from_secs(30)).unwrap();
+        let second_path = directory.join("second");
+        let second = fetch(
+            Artifact {
+                url: &url,
+                destination: &second_path,
+                size,
+                sha: &sha,
+                stage: "Testing",
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &mut |_, _| {},
+        );
+        resume.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        server.join().unwrap();
+        second.unwrap();
+        assert!(second_path.is_file());
         fs::remove_dir_all(directory).unwrap();
     }
     fn request(socket: &mut TcpStream) -> String {
