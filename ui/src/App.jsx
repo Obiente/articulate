@@ -229,10 +229,10 @@ export function App() {
   const binding = dictationShortcut(state?.settings?.hotkey);
   const captureBlocked = Boolean(
     state?.recording ||
-    state?.call_recording ||
-    state?.note_recording ||
-    state?.busy ||
-    state?.loading,
+      state?.call_recording ||
+      state?.note_recording ||
+      state?.busy ||
+      state?.loading,
   );
   const controller = state?.controller;
   return (
