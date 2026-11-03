@@ -15,6 +15,7 @@ pub(crate) struct SettingsView<'a> {
     shortcut_error: Option<&'a str>,
     microphone_check: &'a crate::app::desktop::actions::capture::MicrophoneCheck,
     clean_speech: bool,
+    auto_polish: bool,
     insert: bool,
     live_insert: bool,
     cpu: bool,
@@ -63,6 +64,7 @@ pub(crate) fn settings(app: &App) -> Settings<'_> {
             shortcut_error: app.shortcut_error.as_deref(),
             microphone_check: &app.microphone_check,
             clean_speech: settings.clean_speech,
+            auto_polish: settings.auto_polish,
             insert: settings.insert,
             live_insert: settings.live_insert,
             cpu: settings.cpu,
@@ -99,6 +101,7 @@ pub(crate) fn settings(app: &App) -> Settings<'_> {
 
 #[derive(Serialize)]
 pub(crate) struct Vocabulary<'a> {
+    vocabulary_sound_alike: bool,
     assort: crate::app::assort_ui::ReviewStatus<'a>,
     dictionary: &'a [Entry],
     macros: &'a [VoiceMacro],
@@ -106,6 +109,7 @@ pub(crate) struct Vocabulary<'a> {
 
 pub(crate) fn vocabulary(app: &App) -> Vocabulary<'_> {
     Vocabulary {
+        vocabulary_sound_alike: app.settings.vocabulary_sound_alike,
         assort: app.desktop_assort_status(),
         dictionary: &app.settings.entries,
         macros: &app.settings.macros,

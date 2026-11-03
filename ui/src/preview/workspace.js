@@ -172,6 +172,7 @@ export function createPreviewWorkspace(storage) {
     history_loading: false,
     history_error: null,
     saving: false,
+    vocabulary_sound_alike: saved?.vocabulary_sound_alike ?? true,
     dictionary: saved?.dictionary ?? structuredClone(sampleDictionary),
     macros: saved?.macros ?? structuredClone(sampleMacros),
     settings: { ...structuredClone(sampleSettings), ...saved?.settings },
@@ -226,6 +227,7 @@ export function createPreviewWorkspace(storage) {
       JSON.stringify({
         records,
         dictionary: sample.dictionary,
+        vocabulary_sound_alike: sample.vocabulary_sound_alike,
         macros: sample.macros,
         settings: sample.settings,
         storage: {
@@ -410,6 +412,8 @@ export function createPreviewWorkspace(storage) {
           {
             context: "Please ask casey to review the plan.",
             entry: { heard: "casey", wanted: "Casey" },
+            heard: "casey",
+            match_kind: "exact",
           },
         ],
         scores: [{ candidate: 0, replace_score: 0.82 }],
@@ -539,6 +543,9 @@ export function createPreviewWorkspace(storage) {
       records = records.filter((s) => s.id !== action.id);
       if (selected === action.id) selected = null;
     },
+    dictionary_sound_alike({ enabled }) {
+      sample.vocabulary_sound_alike = enabled;
+    },
     dictionary_save(action) {
       const original =
         action.index === undefined ? null : sample.dictionary[action.index];
@@ -557,6 +564,7 @@ export function createPreviewWorkspace(storage) {
         ...original,
         heard: action.heard,
         wanted: action.wanted,
+        sound_alike: action.sound_alike ?? original?.sound_alike ?? true,
         app:
           action.app === undefined
             ? (original?.app ?? null)

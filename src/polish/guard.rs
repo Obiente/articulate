@@ -99,8 +99,129 @@ pub(super) fn protected_occurrences(text: &str, phrase: &str) -> usize {
         .count()
 }
 
+/// A shared sound-alike matcher is being added on another branch; switch to it later.
+fn vocabulary_substitution(
+    removed: &str,
+    inserted: &str,
+    terms: &[super::vocabulary::Term],
+) -> bool {
+    let tokens = words(removed);
+    if words(inserted)
+        .iter()
+        .any(|w| matches!(w.as_str(), "not" | "no" | "never" | "nor"))
+    {
+        return false;
+    }
+    if inserted
+        .chars()
+        .any(|c| !c.is_alphabetic() && !c.is_whitespace())
+    {
+        return false;
+    }
+    !removed
+        .split_whitespace()
+        .any(|w| w.len() == 1 && w.chars().all(char::is_uppercase) && w != "I")
+        && (1..=4).contains(&tokens.len())
+        && !tokens.iter().any(|w| {
+            matches!(w.as_str(), "not" | "no" | "never" | "nor")
+                || w.contains("n't")
+                || w.chars().any(char::is_numeric)
+        })
+        && terms
+            .iter()
+            .any(|term| term.wanted == inserted && super::vocabulary::similar(removed, inserted))
+}
+
+pub(super) fn check_vocabulary(
+    source: &str,
+    candidate: &str,
+    protected: &[String],
+    terms: &[super::vocabulary::Term],
+) -> Result<()> {
+    ensure!(candidate.len() <= 8_000, "The draft was too long.");
+    let cleaned = super::speech::clean(source, protected);
+    let source = cleaned.as_str();
+    let mut normalized = cleaned.clone();
+    // Substitute only at aligned content prefixes. All remaining checks still run
+    // on the resulting source, including symbols and saved phrase counts.
+    for _ in 0..20 {
+        if content(&normalized) == content(candidate) {
+            break;
+        }
+        let mut replacement = None;
+        let spans: Vec<_> = normalized
+            .match_indices(|c: char| c.is_alphanumeric())
+            .filter(|(i, _)| {
+                *i == 0
+                    || !normalized[..*i]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_alphanumeric)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        'search: for start in spans {
+            for (end, c) in normalized
+                .char_indices()
+                .chain(std::iter::once((normalized.len(), ' ')))
+            {
+                if end <= start || c.is_alphanumeric() {
+                    continue;
+                }
+                let removed = &normalized[start..end];
+                if words(removed).len() > 4 {
+                    break;
+                }
+                if removed
+                    .chars()
+                    .any(|c| !c.is_alphabetic() && !c.is_whitespace())
+                {
+                    continue;
+                }
+                if protected
+                    .iter()
+                    .any(|p| !p.is_empty() && protected_occurrences(removed, p) > 0)
+                {
+                    continue;
+                }
+                for term in terms {
+                    if content(removed) == content(&term.wanted)
+                        || !vocabulary_substitution(removed, &term.wanted, terms)
+                    {
+                        continue;
+                    }
+                    for (at, _) in candidate.match_indices(&term.wanted) {
+                        let after = at + term.wanted.len();
+                        if candidate[after..]
+                            .chars()
+                            .next()
+                            .is_some_and(char::is_alphanumeric)
+                        {
+                            continue;
+                        }
+                        if content(&normalized[..start]) == content(&candidate[..at]) {
+                            replacement = Some((start, end, term.wanted.clone()));
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        let Some((start, end, wanted)) = replacement else {
+            break;
+        };
+        normalized.replace_range(start..end, &wanted);
+    }
+    // Numeric expressions and single-letter identifiers are never vocabulary.
+    ensure!(
+        numbers(source) == numbers(&normalized),
+        "Vocabulary changed a number."
+    );
+    check(&normalized, candidate, protected)
+}
+
 /// This is a conservative rejection gate, not proof of preserved meaning.
-/// Review remains mandatory even when every lexical check succeeds.
+/// Sound-alike substitutions remain deliberately narrow.
 pub(super) fn check(source: &str, candidate: &str, protected: &[String]) -> Result<()> {
     // Validate against only the explicit, bounded speech repairs. This permits
     // a repeated amount or a stated correction to disappear, without allowing
@@ -278,5 +399,61 @@ mod tests {
             assert!(check(source, candidate, &[]).is_err(), "{source}");
         }
         assert!(check("Ask The The.", "Ask The.", &["The The".into()]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::*;
+    #[test]
+    fn substitutions_preserve_unrelated_content_and_protection() {
+        let terms = vec![super::super::vocabulary::Term {
+            heard: "luna cord".into(),
+            wanted: "Lunacord".into(),
+            cues: vec![],
+        }];
+        for (source, candidate) in [
+            ("Open luna cord.", "Open Lunacord."),
+            ("Open lu na cord.", "Open Lunacord."),
+            ("Open lu na co rd.", "Open Lunacord."),
+            (
+                "Open luna cord then close luna cord.",
+                "Open Lunacord then close Lunacord.",
+            ),
+            ("Open lunakord.", "Open Lunacord."),
+            ("Open luna cord at 42.", "Open Lunacord at 42."),
+        ] {
+            assert!(
+                check_vocabulary(source, candidate, &["Lunacord".into()], &terms).is_ok(),
+                "{source}"
+            );
+        }
+        for (source, candidate) in [
+            ("Open calendar.", "Open Lunacord."),
+            ("Open luna 東京 cord.", "Open Lunacord."),
+            ("Do not open luna cord.", "Do open Lunacord."),
+            ("Open luna cord at 42.", "Open Lunacord at 24."),
+            ("Open luna cord.", "Open Solarcord."),
+            (
+                "Open luna cord then send it.",
+                "Send it then open Lunacord.",
+            ),
+            ("Choose L una cord.", "Choose Lunacord."),
+        ] {
+            assert!(
+                check_vocabulary(source, candidate, &[], &terms).is_err(),
+                "{source}"
+            );
+        }
+        assert!(check_vocabulary("Open luna cord.", "Open Lunacord.", &[], &[]).is_err());
+        assert!(
+            check_vocabulary(
+                "Open luna cord.",
+                "Open Lunacord.",
+                &["luna cord".into()],
+                &terms
+            )
+            .is_err()
+        );
     }
 }

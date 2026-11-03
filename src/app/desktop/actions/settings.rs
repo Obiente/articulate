@@ -17,6 +17,7 @@ pub(crate) enum Action {
         input_profiles: Option<Vec<crate::writing_style::InputProfile>>,
         styles: Option<Vec<crate::writing_style::StyleRule>>,
         clean_speech: Option<bool>,
+        auto_polish: Option<bool>,
         insert: Option<bool>,
         live_insert: Option<bool>,
         learn_corrections: Option<bool>,
@@ -54,6 +55,7 @@ struct Preferences {
     input_profiles: Option<Vec<crate::writing_style::InputProfile>>,
     styles: Option<Vec<crate::writing_style::StyleRule>>,
     clean_speech: Option<bool>,
+    auto_polish: Option<bool>,
     insert: Option<bool>,
     live_insert: Option<bool>,
     learn_corrections: Option<bool>,
@@ -107,6 +109,7 @@ impl Preferences {
         );
         swap(&mut self.input_profiles, &mut settings.input_profiles);
         swap(&mut self.styles, &mut settings.styles);
+        swap(&mut self.auto_polish, &mut settings.auto_polish);
         swap(&mut self.clean_speech, &mut settings.clean_speech);
         swap(&mut self.insert, &mut settings.insert);
         swap(&mut self.live_insert, &mut settings.live_insert);
@@ -152,6 +155,7 @@ impl App {
             input_profiles,
             styles,
             clean_speech,
+            auto_polish,
             insert,
             live_insert,
             learn_corrections,
@@ -184,6 +188,7 @@ impl App {
             input_profiles,
             styles,
             clean_speech,
+            auto_polish,
             insert,
             live_insert,
             learn_corrections,
@@ -347,6 +352,11 @@ impl App {
         }
         if (hotkey.is_some() || quick_note_hotkey.is_some()) && dictation == quick_note {
             return Err("Choose different shortcuts for dictation and quick notes.".into());
+        }
+        if preferences.auto_polish == Some(true)
+            && !crate::polish::profile_installed(crate::polish::ModelProfile::Polish)
+        {
+            return Err("Install the advanced cleanup model first.".into());
         }
         if preferences.audio_context == Some(true) && !crate::sensevoice::installed() {
             return Err("Install the audio context model first.".into());

@@ -16,7 +16,8 @@ const defaultHotkey = { ctrl: true, alt: true, shift: false, win: false };
 
 // Shortcuts and dictation behavior, plus the spoken-note shortcut.
 export function DictationSettings({ controls }) {
-  const { settings, busy, capturing, patch, toggle, editShortcut } = controls;
+  const { settings, models, busy, capturing, patch, toggle, editShortcut } =
+    controls;
   return (
     <>
       <SettingsSection
@@ -110,6 +111,24 @@ export function DictationSettings({ controls }) {
             description="Say a command on its own: new line, new paragraph, scratch that, delete that, or undo that. With commands on, live typing waits for finalized speech."
           >
             {toggle("spoken_editing_commands", "Spoken editing commands")}
+          </SettingRow>
+          <SettingRow
+            title="Clean up finished dictations automatically"
+            description={
+              models.cleanup_installed
+                ? "Uses the advanced cleanup model and your vocabulary. It can add a moment before text is inserted."
+                : "Install the advanced cleanup model to use automatic cleanup."
+            }
+          >
+            <Switch
+              aria-label="Clean up finished dictations automatically"
+              size="md"
+              checked={Boolean(settings.auto_polish)}
+              disabled={busy || !models.cleanup_installed}
+              onChange={(event) =>
+                patch("auto_polish", event.currentTarget.checked)
+              }
+            />
           </SettingRow>
           <SettingRow
             title="Remember corrections"

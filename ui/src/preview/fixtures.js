@@ -256,6 +256,7 @@ export const sampleDictionary = [
     app: null,
     cues: [],
     enabled: true,
+    sound_alike: true,
   },
   {
     heard: "q wen",
@@ -263,6 +264,7 @@ export const sampleDictionary = [
     app: null,
     cues: ["model"],
     enabled: true,
+    sound_alike: true,
   },
 ];
 
@@ -283,6 +285,7 @@ export const sampleSettings = {
   styles: [{ app: "editor.exe", style: "Clean" }],
   recent_dictation_app: "editor.exe",
   clean_speech: true,
+  auto_polish: false,
   insert: true,
   live_insert: true,
   learn_corrections: true,

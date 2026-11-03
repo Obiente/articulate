@@ -530,6 +530,8 @@ export function App() {
           ) : page === "vocabulary" ? (
             <VocabularyPage
               dictionary={state.dictionary}
+              soundAlike={state.vocabulary_sound_alike}
+              app={state.settings?.recent_dictation_app}
               review={state.assort}
               act={act}
             />

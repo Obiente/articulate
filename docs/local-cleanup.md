@@ -7,7 +7,7 @@ a language model or download. Verbatim keeps the original wording. Enabled
 vocabulary phrases and literal shortcut templates are preserved.
 
 Optional Polish adds a local language-model editing preview for punctuation and
-style. Its additional edits require Apply and update Articulate's saved text;
+style and saved vocabulary. Manual previews require Apply and update Articulate's saved text;
 they do not revise an external app after insertion. Raw transcription stays available.
 
 ## Model and runtime
@@ -65,8 +65,10 @@ server; a later request starts a fresh process.
 
 Clear, Professional and Casual select punctuation, capitalization and spacing
 preferences. They do not authorize adding facts, greetings or invented words.
-The model sees only the selected passage, not other apps, document titles or
-conversation history. Expanded voice shortcuts keep their literal contents and
+The model sees the selected passage and up to 20 enabled vocabulary entries scoped
+to the destination app. Heard/wanted pairs and context words are ranked by spelling
+and sound similarity, then fitted within the 3,500-byte combined prompt budget.
+It does not see other apps, document titles or conversation history. Expanded voice shortcuts keep their literal contents and
 are excluded from Polish.
 
 Polish builds a safe baseline by removing supported fillers such as an isolated
@@ -82,14 +84,30 @@ unfinished output, tool calls, reasoning output and unrequested substantive
 rewrites. If the model result is rejected, the After preview retains the safe baseline
 cleanup and explains that the additional model edit was rejected. When the rules
 find nothing safe to change, that preview can remain identical to the original.
-Nothing is applied without **Apply changes**.
+Manual previews require **Apply changes**.
 
-These checks do not prove semantic equivalence. Users review every accepted
-draft. Small-model trials showed useful punctuation, grammar and repeated-clause
+These checks do not prove semantic equivalence. Manual drafts remain reviewable. Small-model trials showed useful punctuation, grammar and repeated-clause
 editing, but also incorrect handling of ambiguous self-corrections, spoken
 punctuation and quote markers. The bounded rules do not make arbitrary spoken mistakes or paragraph-level
 restarts reliable.
-The model is not used to guess what missing or misrecognized audio meant.
+Saved vocabulary can replace a similar span of one to four words. Matching uses
+normalized letters and a compact phonetic key: at most 20% letter edits with the
+same initial, or 34% with an identical phonetic key. Terms shorter than four
+letters and spans containing non-ASCII letters are excluded. Negations, numbers, identifiers, symbols and existing saved
+phrases remain protected; content order outside the replacement stays unchanged.
+
+## Automatic cleanup
+
+Enable **Clean up finished dictations automatically** in Dictation settings after
+installing the advanced cleanup model. It defaults to off. Eligible finished
+passages run before final insertion, including replacement of live typing previews.
+Verbatim style, snippets and passages beyond the input limits skip this step.
+The total deadline is four seconds, including queueing and cold loading. There is
+no cold-start extension: a slow load, error or rejected draft keeps the existing
+rule-based text. The overlay shows Cleaning up while waiting, then reports the
+insertion result. Cancellation or another dictation abandons the pending result.
+History keeps raw speech and the final text separately. Automatic results are never
+learned as corrections. Manual previews retain their longer request deadline.
 
 ## Validation
 

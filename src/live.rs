@@ -22,10 +22,16 @@ struct FieldText {
 #[cfg(any(windows, test))]
 impl FieldText {
     // Slate exposes an empty editor as a zero-width marker and a synthetic
-    // paragraph break. Both disappear on its first input. Recognize only the
-    // observed empty caret layout, never trim characters from real content.
+    // paragraph break. Chromium exposes an empty text area or input as one
+    // object replacement character after the caret, and an empty rich-text
+    // editor (one empty paragraph) as a lone line break after the caret.
+    // Recognize only these observed empty caret layouts, never trim
+    // characters from real content. Whether the marker's right side survives
+    // the first input differs, so an update into one accepts both results.
     fn empty_placeholder(&self) -> bool {
         self.matches("\u{feff}\n", "\u{feff}", "", "\n")
+            || self.matches("\u{fffc}", "", "", "\u{fffc}")
+            || self.matches("\n", "", "", "\n")
     }
 
     fn consistent(&self) -> bool {
@@ -60,16 +66,25 @@ struct OwnUpdate<'a> {
     inserted: &'a str,
     right: &'a str,
     confirmations: u8,
+    /// When replacing an empty-editor marker, editors differ in whether the
+    /// marker's trailing text survives the first input. This is the right side
+    /// that keeps it; either result acknowledges the update.
+    kept_right: Option<&'a str>,
 }
 
 #[cfg(any(windows, test))]
 impl OwnUpdate<'_> {
+    fn rights(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.right).chain(self.kept_right.filter(|kept| *kept != self.right))
+    }
+
     fn observe(&mut self, field: &FieldText) -> Acknowledgement {
         let wanted_left = format!("{}{}", self.left, self.inserted);
-        let wanted = format!("{}{}", wanted_left, self.right);
-        if field.matches(&wanted, &wanted_left, "", self.right)
-            || (wanted.is_empty() && field.empty_placeholder())
-        {
+        let complete = self
+            .rights()
+            .any(|right| field.matches(&format!("{wanted_left}{right}"), &wanted_left, "", right));
+        let wanted_empty = wanted_left.is_empty() && self.right.is_empty();
+        if complete || (wanted_empty && field.empty_placeholder()) {
             self.confirmations += 1;
             return if self.confirmations >= 2 {
                 Acknowledgement::Confirmed
@@ -81,11 +96,13 @@ impl OwnUpdate<'_> {
         if !field.consistent() || field.document == self.before {
             return Acknowledgement::Pending;
         }
-        let known_progress = field
-            .document
-            .strip_prefix(self.left)
-            .and_then(|value| value.strip_suffix(self.right))
-            .is_some_and(|value| self.inserted.starts_with(value));
+        let known_progress = self.rights().any(|right| {
+            field
+                .document
+                .strip_prefix(self.left)
+                .and_then(|value| value.strip_suffix(right))
+                .is_some_and(|value| self.inserted.starts_with(value))
+        });
         if known_progress {
             Acknowledgement::Pending
         } else {
@@ -302,7 +319,13 @@ pub mod win {
                 } else {
                     &self.selected
                 };
-                range.Select()?;
+                // Only a replacement of earlier words needs a new selection.
+                // Otherwise `range` is the current caret or selection already,
+                // and re-selecting it makes Chromium rich-text editors with an
+                // empty paragraph drop their caret, so typing goes nowhere.
+                if self.written && !old_tail.is_empty() {
+                    range.Select()?;
+                }
                 // Selecting a range also has an asynchronous UIA acknowledgement.
                 // Retry reads only; never send input while a selection is stale.
                 let mut selected = false;
@@ -399,6 +422,7 @@ pub mod win {
                     inserted: new_tail,
                     right: output_suffix,
                     confirmations: 0,
+                    kept_right: replacing_placeholder.then_some(self.suffix.as_str()),
                 };
                 for _ in 0..24 {
                     std::thread::sleep(std::time::Duration::from_millis(25));
@@ -414,12 +438,15 @@ pub mod win {
                                 self.suffix = field.right;
                                 self.empty_placeholder = true;
                                 self.written = false;
+                            } else if replacing_placeholder {
+                                // Record whichever form the editor settled on.
+                                self.current = field.document;
+                                self.prefix.clear();
+                                self.suffix = field.right;
+                                self.empty_placeholder = false;
+                                self.written = true;
                             } else {
                                 self.current = expected;
-                                if replacing_placeholder {
-                                    self.prefix.clear();
-                                    self.suffix.clear();
-                                }
                                 self.empty_placeholder = false;
                                 self.written = true;
                             }
@@ -465,8 +492,9 @@ mod tests {
     fn slate_placeholder_is_exact_and_disappears_only_for_our_empty_editor_update() {
         let placeholder = field("\u{feff}", "", "\n");
         assert!(placeholder.empty_placeholder());
+        // A lone line break after the caret is the empty rich-text paragraph,
+        // covered by its own test below.
         for ordinary in [
-            field("", "", "\n"),
             field("text\u{feff}", "", "\n"),
             field("\u{feff}", "\n", ""),
             field("", "", "\u{feff}\n"),
@@ -479,6 +507,7 @@ mod tests {
             inserted: "Hello.",
             right: "",
             confirmations: 0,
+            kept_right: None,
         };
         assert_eq!(insert.observe(&placeholder), Acknowledgement::Pending);
         assert_eq!(
@@ -495,6 +524,7 @@ mod tests {
             inserted: "",
             right: "",
             confirmations: 0,
+            kept_right: None,
         };
         assert_eq!(remove.observe(&placeholder), Acknowledgement::Pending);
         assert_eq!(remove.observe(&placeholder), Acknowledgement::Confirmed);
@@ -504,9 +534,85 @@ mod tests {
             inserted: "Hello.",
             right: "",
             confirmations: 0,
+            kept_right: None,
         };
         assert_eq!(
             wrong.observe(&field("Other text", "", "")),
+            Acknowledgement::Changed
+        );
+    }
+
+    #[test]
+    fn chromium_empty_field_marker_is_exact_and_disappears_on_first_input() {
+        let empty = field("", "", "\u{fffc}");
+        assert!(empty.empty_placeholder());
+        for ordinary in [
+            field("\u{fffc}", "", ""),
+            field("text", "", "\u{fffc}"),
+            field("", "\u{fffc}", ""),
+            field("", "", "\u{fffc}\u{fffc}"),
+        ] {
+            assert!(!ordinary.empty_placeholder());
+        }
+        // The first insertion replaces the marker rather than keeping it as
+        // the text to the right of the caret.
+        let mut insert = OwnUpdate {
+            before: "\u{fffc}",
+            left: "",
+            inserted: "alpha beta",
+            right: "",
+            confirmations: 0,
+            kept_right: None,
+        };
+        assert_eq!(insert.observe(&empty), Acknowledgement::Pending);
+        assert_eq!(
+            insert.observe(&field("alpha", "", "")),
+            Acknowledgement::Pending
+        );
+        assert_eq!(
+            insert.observe(&field("alpha beta", "", "")),
+            Acknowledgement::Pending
+        );
+        assert_eq!(
+            insert.observe(&field("alpha beta", "", "")),
+            Acknowledgement::Confirmed
+        );
+    }
+
+    #[test]
+    fn empty_rich_text_paragraph_accepts_the_line_break_dropped_or_kept() {
+        let empty = field("", "", "\n");
+        assert!(empty.empty_placeholder());
+        assert!(!field("a", "", "\n").empty_placeholder());
+        assert!(!field("\n", "", "").empty_placeholder());
+        for settled in [field("alpha beta", "", ""), field("alpha beta", "", "\n")] {
+            let mut insert = OwnUpdate {
+                before: "\n",
+                left: "",
+                inserted: "alpha beta",
+                right: "",
+                confirmations: 0,
+                kept_right: Some("\n"),
+            };
+            assert_eq!(insert.observe(&empty), Acknowledgement::Pending);
+            assert_eq!(
+                insert.observe(&field("alpha", "", &settled.right)),
+                Acknowledgement::Pending
+            );
+            assert_eq!(insert.observe(&settled), Acknowledgement::Pending);
+            assert_eq!(insert.observe(&settled), Acknowledgement::Confirmed);
+        }
+        // Without an empty marker, a kept line break is somebody else's text.
+        let mut ordinary = OwnUpdate {
+            before: "x",
+            left: "x",
+            inserted: " y",
+            right: "",
+            confirmations: 0,
+            kept_right: None,
+        };
+        assert_eq!(
+            ordinary.observe(&field("x y", "", "\n")),
             Acknowledgement::Changed
         );
     }
@@ -519,6 +625,7 @@ mod tests {
             inserted: "hn",
             right: " tomorrow",
             confirmations: 0,
+            kept_right: None,
         };
         assert_eq!(
             ack.observe(&field("Send Jo", "n", " tomorrow")),
@@ -560,6 +667,7 @@ mod tests {
                 inserted: "hn",
                 right: " tomorrow",
                 confirmations: 0,
+                kept_right: None,
             };
             assert_eq!(ack.observe(&changed), Acknowledgement::Changed);
         }
@@ -573,6 +681,7 @@ mod tests {
             inserted: "hn",
             right: "",
             confirmations: 0,
+            kept_right: None,
         };
         for _ in 0..24 {
             assert_eq!(
@@ -598,6 +707,7 @@ mod tests {
             inserted: "😃",
             right: " end",
             confirmations: 0,
+            kept_right: None,
         };
         assert_eq!(
             ack.observe(&field("Draft café ", "", " end")),
@@ -617,6 +727,7 @@ mod tests {
             inserted: "",
             right: ".",
             confirmations: 0,
+            kept_right: None,
         };
         assert_eq!(
             ack.observe(&field("Keep this", "", ".")),
@@ -636,6 +747,7 @@ mod tests {
             inserted: "hn",
             right: "",
             confirmations: 0,
+            kept_right: None,
         };
         let mut mixed = field("Jon", "", "");
         mixed.document = "John".into();

@@ -120,6 +120,279 @@ mod tests {
             _ => panic!("Expected a learned correction"),
         }
     }
+
+    /// The focused element, read through UI Automation like the worker does.
+    fn focused_field() -> Option<(
+        windows::Win32::UI::Accessibility::IUIAutomation,
+        windows::Win32::UI::Accessibility::IUIAutomationElement,
+    )> {
+        use windows::Win32::{System::Com::*, UI::Accessibility::*};
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let ui: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+            let field = ui.GetFocusedElement().ok()?;
+            Some((ui, field))
+        }
+    }
+
+    fn field_text(field: &windows::Win32::UI::Accessibility::IUIAutomationElement) -> String {
+        use windows::Win32::UI::Accessibility::*;
+        unsafe {
+            if let Ok(text) =
+                field.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                && let Ok(value) = text.DocumentRange().and_then(|r| r.GetText(-1))
+            {
+                return value.to_string();
+            }
+            field
+                .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                .and_then(|value| value.CurrentValue())
+                .map(|value| value.to_string())
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"))
+        }
+    }
+
+    fn describe(field: &windows::Win32::UI::Accessibility::IUIAutomationElement) -> String {
+        unsafe {
+            format!(
+                "control={:?} name={:?} class={:?}",
+                field.CurrentControlType().map(|c| c.0).unwrap_or_default(),
+                field
+                    .CurrentName()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                field
+                    .CurrentClassName()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default()
+            )
+        }
+    }
+
+    fn send_keys(keys: &[(u16, bool)]) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+        let input: Vec<INPUT> = keys
+            .iter()
+            .map(|&(key, up)| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: key,
+                        wScan: 0,
+                        dwFlags: if up { KEYEVENTF_KEYUP } else { 0 },
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            })
+            .collect();
+        unsafe {
+            SendInput(
+                input.len() as u32,
+                input.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            );
+        }
+    }
+
+    /// End to end against a real window in another process: the dictation
+    /// shortcut is tapped as a toggle press, then final and live insertion run
+    /// and the field is read back. Every stage is reported before asserting.
+    #[test]
+    #[ignore = "Interactive: drives the disposable window in ARTICULATE_E2E_HWND and types into it"]
+    fn shortcut_then_insertion_into_a_disposable_window() {
+        use std::time::Duration;
+        use windows_sys::Win32::{
+            System::Threading::{AttachThreadInput, GetCurrentThreadId},
+            UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        };
+        let handle: isize = std::env::var("ARTICULATE_E2E_HWND")
+            .expect("Set ARTICULATE_E2E_HWND to a disposable window")
+            .parse()
+            .unwrap();
+        let window = handle as windows_sys::Win32::Foundation::HWND;
+        unsafe {
+            let foreground = GetForegroundWindow();
+            let current = GetCurrentThreadId();
+            let other = GetWindowThreadProcessId(foreground, std::ptr::null_mut());
+            AttachThreadInput(current, other, 1);
+            ShowWindow(window, SW_RESTORE);
+            BringWindowToTop(window);
+            SetForegroundWindow(window);
+            AttachThreadInput(current, other, 0);
+        }
+        std::thread::sleep(Duration::from_millis(800));
+        // Put focus in the window's first text field, as a click would.
+        if let Some((ui, _)) = focused_field() {
+            use windows::Win32::UI::Accessibility::*;
+            unsafe {
+                let edit = ui
+                    .ElementFromHandle(windows::Win32::Foundation::HWND(handle as _))
+                    .and_then(|root| {
+                        let all =
+                            root.FindAll(TreeScope_Descendants, &ui.CreateTrueCondition()?)?;
+                        for index in 0..all.Length()? {
+                            let element = all.GetElement(index)?;
+                            // Skip the browser address bar; the page field comes after it.
+                            if element.CurrentControlType()? == UIA_EditControlTypeId
+                                && element.CurrentClassName()? != "OmniboxViewViews"
+                            {
+                                return Ok(Some(element));
+                            }
+                        }
+                        Ok(None)
+                    });
+                match edit {
+                    Ok(Some(edit)) => {
+                        let _ = edit.SetFocus();
+                    }
+                    Ok(None) => println!("No text field found"),
+                    Err(error) => println!("Could not search for a text field: {error}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let mut report = Vec::new();
+        let before = crate::platform::target().expect("The disposable window must have focus");
+        let (ui, field) = focused_field().expect("No focused element");
+        report.push(format!("focused before: {}", describe(&field)));
+
+        // 1. A toggle tap of an Alt chord. F13 avoids a running copy's Alt + Space.
+        let (events, hotkeys) = mpsc::channel();
+        let shortcut = crate::platform::Hotkey {
+            ctrl: false,
+            alt: true,
+            shift: false,
+            win: false,
+            key: "F13".into(),
+        };
+        let updates = crate::platform::hotkey(shortcut, events);
+        loop {
+            match hotkeys.recv_timeout(Duration::from_secs(5)) {
+                Ok(crate::platform::HotkeyEvent::Registered(_)) => break,
+                Ok(crate::platform::HotkeyEvent::Error { message, .. }) => {
+                    panic!("Shortcut unavailable: {message}")
+                }
+                Ok(_) => {}
+                Err(error) => panic!("No registration: {error}"),
+            }
+        }
+        send_keys(&[(VK_MENU, false), (VK_F13, false)]);
+        std::thread::sleep(Duration::from_millis(80));
+        send_keys(&[(VK_F13, true)]);
+        std::thread::sleep(Duration::from_millis(40));
+        send_keys(&[(VK_MENU, true)]);
+        let pressed = loop {
+            match hotkeys.recv_timeout(Duration::from_secs(3)) {
+                Ok(crate::platform::HotkeyEvent::Pressed(target, _)) => break Some(target),
+                Ok(_) => {}
+                Err(_) => break None,
+            }
+        };
+        report.push(format!(
+            "shortcut pressed: {:?}, target matches: {}",
+            pressed.is_some(),
+            pressed == Some(before)
+        ));
+        std::thread::sleep(Duration::from_millis(600));
+        let after = crate::platform::target();
+        let still_focused = unsafe {
+            ui.GetFocusedElement()
+                .and_then(|now| {
+                    report.push(format!("focused after release: {}", describe(&now)));
+                    ui.CompareElements(&field, &now)
+                })
+                .is_ok_and(|same| same.as_bool())
+        };
+        report.push(format!(
+            "after Alt release: same window {}, same field {still_focused}",
+            after == Some(before)
+        ));
+        drop(updates);
+
+        // 2. Final insertion, as hold mode uses.
+        let (tx, rx) = start(|| {});
+        let wait = |rx: &Receiver<Event>, want: &str| -> String {
+            loop {
+                match rx.recv_timeout(Duration::from_secs(10)) {
+                    Ok(Event::Inserted(_, result)) if want == "inserted" => {
+                        break format!("{result:?}");
+                    }
+                    Ok(Event::LiveSupport(_, live)) if want == "live" => break format!("{live}"),
+                    Ok(Event::Previewed(_, result)) if want == "preview" => {
+                        break format!("{result:?}");
+                    }
+                    Ok(_) => {}
+                    Err(error) => break format!("<no event: {error}>"),
+                }
+            }
+        };
+        // Empty fields report only a marker: U+FFFC for a text area, a line
+        // break for a rich-text paragraph. Neither is part of the text.
+        let visible = |text: String| text.replace(['\u{fffc}', '\n'], "");
+        let start_text = visible(field_text(&field));
+        tx.send(Action::Arm(1, before, false)).unwrap();
+        tx.send(Action::Insert {
+            id: 1,
+            target: before,
+            text: "alpha beta".into(),
+            learn: false,
+            cancel: transcribe_cpp::CancelToken::new(),
+        })
+        .unwrap();
+        let final_result = wait(&rx, "inserted");
+        report.push(format!("final insert: {final_result}"));
+        std::thread::sleep(Duration::from_millis(300));
+        let after_final = field_text(&field);
+        report.push(format!("field after final: {after_final:?}"));
+
+        // 3. Live typing, as toggle mode uses.
+        tx.send(Action::Arm(2, before, true)).unwrap();
+        report.push(format!("live supported: {}", wait(&rx, "live")));
+        for (step, text) in [" gamma", " gamma delta"].iter().enumerate() {
+            tx.send(Action::Preview {
+                id: 2,
+                target: before,
+                text: (*text).into(),
+                cancel: transcribe_cpp::CancelToken::new(),
+            })
+            .unwrap();
+            report.push(format!("preview {step}: {}", wait(&rx, "preview")));
+        }
+        tx.send(Action::Insert {
+            id: 2,
+            target: before,
+            text: " gamma delta epsilon".into(),
+            learn: false,
+            cancel: transcribe_cpp::CancelToken::new(),
+        })
+        .unwrap();
+        let live_result = wait(&rx, "inserted");
+        report.push(format!("live final insert: {live_result}"));
+        std::thread::sleep(Duration::from_millis(300));
+        let after_live = field_text(&field);
+        report.push(format!("field after live: {after_live:?}"));
+        println!("E2E REPORT\n{}", report.join("\n"));
+        assert!(
+            pressed == Some(before),
+            "shortcut did not fire for the window"
+        );
+        assert!(still_focused, "Alt release moved focus out of the field");
+        assert!(
+            final_result.starts_with("Ok"),
+            "final insertion reported {final_result}"
+        );
+        assert!(
+            live_result.starts_with("Ok"),
+            "live insertion reported {live_result}"
+        );
+        assert_eq!(visible(after_final), format!("{start_text}alpha beta"));
+        assert_eq!(
+            visible(after_live),
+            format!("{start_text}alpha beta gamma delta epsilon")
+        );
+    }
 }
 
 #[cfg(windows)]
