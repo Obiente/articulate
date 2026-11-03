@@ -449,10 +449,8 @@ impl Tracker {
             for (offset, row) in stream.rows[start..].iter().enumerate() {
                 let provisional = (stream.provisional)(start + offset);
                 let Some(json) = serialize(row, stream.names, provisional) else {
-                    // Force a complete resend once serialization recovers.
+                    // Leave every stream at its last successfully published revision.
                     log::error!("Could not serialize a transcript row");
-                    cache.names.clear();
-                    cache.rows.clear();
                     return false;
                 };
                 rows.push(json);
@@ -601,6 +599,28 @@ mod tests {
     #[test]
     fn later_stream_failure_does_not_consume_earlier_splice() {
         let mut tracker = Tracker::default();
+        let baseline = [row(0, "Original")];
+        let mut initial = Changes::default();
+        tracker.compare_rows(
+            "live_rows",
+            &[
+                RowStream {
+                    key: "call_rows",
+                    rows: &baseline,
+                    names: &[],
+                    provisional: &|_| false,
+                },
+                RowStream {
+                    key: "note_rows",
+                    rows: &baseline,
+                    names: &[],
+                    provisional: &|_| false,
+                },
+            ],
+            &mut initial,
+        );
+        let mut published = Published::default();
+        published.apply(initial);
         let first = [row(0, "First")];
         let second = [row(0, "Second")];
         let streams = [
@@ -631,9 +651,8 @@ mod tests {
             }
         ));
         assert!(changes.is_empty());
-        assert!(tracker.rows.is_empty());
+        assert_eq!(tracker.rows["call_rows"].rows[0].0.text, "Original");
         assert!(tracker.compare_rows("live_rows", &streams, &mut changes));
-        let mut published = Published::default();
         let update = published.apply(changes);
         assert_eq!(
             update.sections["live_rows"].splices.as_ref().unwrap().len(),

@@ -1138,3 +1138,30 @@ fn manual_insertion_rejects_empty_text_before_waiting() {
     let command = action(json!({"type":"insert_text","text":""}));
     assert!(command.run_outside_controller().unwrap().is_err());
 }
+
+#[test]
+fn document_bodies_wait_for_background_pass_and_models_hide_directories() {
+    use super::publish::{Pass, Tracker};
+    let mut app = populated_app();
+    let state = app.desktop_snapshot();
+    for model in state["managed_models"].as_array().unwrap() {
+        let path = model["path"].as_str().unwrap();
+        assert!(!path.contains(['/', '\\']));
+        assert!(!path.is_empty());
+    }
+    let mut tracker = Tracker::default();
+    let mut pass = tracker.pass(Pass::Full);
+    super::view::collect(&app, &mut pass);
+    pass.finish();
+    app.history.selected.as_mut().unwrap().personal_notes = "Large notes. ".repeat(5000);
+    app.history.dictation.as_mut().unwrap().text = "Long dictation. ".repeat(5000);
+    let mut pass = tracker.pass(Pass::Tick);
+    super::view::collect(&app, &mut pass);
+    assert!(pass.finish().is_empty());
+    let mut pass = tracker.pass(Pass::Full);
+    super::view::collect(&app, &mut pass);
+    let mut published = super::publish::Published::default();
+    let update = published.apply(pass.finish());
+    assert!(update.contains("document_body"));
+    assert!(update.contains("capture_bodies"));
+}
