@@ -146,6 +146,13 @@ $env:TRANSCRIBE_TEST_WAV = 'sample.wav'
 cargo test --release --features dynamic-backends engine::tests::local_inference_cancellation_and_reuse -- --ignored --exact
 ```
 
+The interactive insertion test types into disposable windows: a Windows Forms text box and an Edge text area with a temporary profile. It taps an Alt shortcut, then checks that focus stays in the field, and that final and live insertion produce the expected text. Run it after a debug test build, and do not type while it runs:
+
+```powershell
+./scripts/build-windows.ps1 -Debug -Test
+./scripts/test-insertion.ps1 -Targets 'winforms,edge'
+```
+
 An alternative source-build path is `cargo build --release` for a static CPU build, or `cargo build --release --features vulkan` with the Vulkan SDK and a working CMake C++ environment. The supplied Windows script avoids the native CMake build by using the verified upstream runtime. Building and testing the static/source configurations on a hardware matrix remains separate work.
 
 ## Current boundaries

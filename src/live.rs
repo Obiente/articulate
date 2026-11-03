@@ -22,10 +22,13 @@ struct FieldText {
 #[cfg(any(windows, test))]
 impl FieldText {
     // Slate exposes an empty editor as a zero-width marker and a synthetic
-    // paragraph break. Both disappear on its first input. Recognize only the
-    // observed empty caret layout, never trim characters from real content.
+    // paragraph break. Chromium exposes an empty text area or input as one
+    // object replacement character after the caret. Both disappear on the
+    // first input. Recognize only these observed empty caret layouts, never
+    // trim characters from real content.
     fn empty_placeholder(&self) -> bool {
         self.matches("\u{feff}\n", "\u{feff}", "", "\n")
+            || self.matches("\u{fffc}", "", "", "\u{fffc}")
     }
 
     fn consistent(&self) -> bool {
@@ -508,6 +511,42 @@ mod tests {
         assert_eq!(
             wrong.observe(&field("Other text", "", "")),
             Acknowledgement::Changed
+        );
+    }
+
+    #[test]
+    fn chromium_empty_field_marker_is_exact_and_disappears_on_first_input() {
+        let empty = field("", "", "\u{fffc}");
+        assert!(empty.empty_placeholder());
+        for ordinary in [
+            field("\u{fffc}", "", ""),
+            field("text", "", "\u{fffc}"),
+            field("", "\u{fffc}", ""),
+            field("", "", "\u{fffc}\u{fffc}"),
+        ] {
+            assert!(!ordinary.empty_placeholder());
+        }
+        // The first insertion replaces the marker rather than keeping it as
+        // the text to the right of the caret.
+        let mut insert = OwnUpdate {
+            before: "\u{fffc}",
+            left: "",
+            inserted: "alpha beta",
+            right: "",
+            confirmations: 0,
+        };
+        assert_eq!(insert.observe(&empty), Acknowledgement::Pending);
+        assert_eq!(
+            insert.observe(&field("alpha", "", "")),
+            Acknowledgement::Pending
+        );
+        assert_eq!(
+            insert.observe(&field("alpha beta", "", "")),
+            Acknowledgement::Pending
+        );
+        assert_eq!(
+            insert.observe(&field("alpha beta", "", "")),
+            Acknowledgement::Confirmed
         );
     }
 

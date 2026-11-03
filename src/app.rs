@@ -1711,6 +1711,10 @@ impl App {
                 integration::Event::Previewed(id, result) if id == self.utterance => {
                     self.integration_inflight = false;
                     if let Err(error) = result {
+                        log::warn!(
+                            "Live typing stopped in {}: {error}",
+                            self.dictation_app.as_deref().unwrap_or("an unknown app")
+                        );
                         self.insertion_cancel.cancel();
                         self.integration_pending = None;
                         self.target = None;
@@ -1741,7 +1745,14 @@ impl App {
                                 .into()
                         }
                         Ok(false) => "Text inserted. Ready for your next dictation.".into(),
-                        Err(error) => error,
+                        Err(error) => {
+                            // Messages describe the field, never the dictated text.
+                            log::warn!(
+                                "Insertion failed in {}: {error}",
+                                self.dictation_app.as_deref().unwrap_or("an unknown app")
+                            );
+                            error
+                        }
                     };
                     self.overlay_message.clone_from(&self.status);
                     self.overlay_until = Some(Instant::now() + Duration::from_secs(5));
