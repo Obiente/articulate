@@ -42,11 +42,15 @@ THE SOFTWARE.
 
 
 def is_notice(path):
-    name = PurePosixPath(str(path).replace("\\", "/")).name.lower()
+    posix = PurePosixPath(str(path).replace("\\", "/"))
+    name = posix.name.lower()
+    directories = [part.lower() for part in posix.parts[:-1]]
     return (
         any(word in name for word in ("license", "licence", "copying", "copyright", "notice"))
         or name in ("ofl", "ofl.txt", "ufl", "ufl.txt")
-        or ("fonts" in PurePosixPath(str(path).replace("\\", "/")).parts and name.endswith(".txt"))
+        or ("fonts" in posix.parts and name.endswith(".txt"))
+        # REUSE projects keep their terms as LICENSES/<SPDX id>.txt.
+        or (bool(directories) and directories[-1] in ("licenses", "licences"))
     ) and not name.endswith((".rs", ".py", ".html", ".svg", ".json", ".toml"))
 
 
@@ -241,6 +245,27 @@ def collect(metadata_file, output, runtime_tree_file=None):
                 + "Published authors: " + "; ".join(package.get("authors", [])) + "\n"
                 + "Published license declaration: MIT\n"
                 + "Source: https://github.com/HEnquist/realfft/tree/d0d4eee0525fd27c96c8a046d6d107acd5ed84a6\n\n"
+                + "This release contains no separate copyright or license text.\n"
+                + "The following standard MIT terms accompany its published declaration;\n"
+                + "they are not represented as an upstream license file.\n"
+                + "Terms reference: https://spdx.org/licenses/MIT.html\n\n"
+                + MIT_TERMS
+            )
+            notices["MIT-declaration-and-terms.txt"] = notice.encode("utf-8")
+        if not notices and label == "io_tee-0.1.1" and package.get("license") == "MIT OR Apache-2.0":
+            # This exact release and its upstream commit declare MIT OR Apache-2.0
+            # but contain no license file or author list. MIT is elected; its
+            # standard terms are supplied without inventing a copyright notice.
+            root = Path(package["manifest_path"]).parent
+            vcs = json.loads((root / ".cargo_vcs_info.json").read_text(encoding="utf-8"))
+            revision = "8a7adecebf3429cbc58a0368751d1851dfaf58ed"
+            if vcs.get("git", {}).get("sha1") != revision:
+                raise ValueError("Unexpected io_tee source revision")
+            notice = (
+                "io_tee 0.1.1\n"
+                + "Published authors: none declared\n"
+                + "Published license declaration: MIT OR Apache-2.0 (MIT elected)\n"
+                + "Source: https://github.com/TheOnlyMrCat/io_tee/tree/" + revision + "\n\n"
                 + "This release contains no separate copyright or license text.\n"
                 + "The following standard MIT terms accompany its published declaration;\n"
                 + "they are not represented as an upstream license file.\n"
