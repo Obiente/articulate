@@ -99,6 +99,10 @@ fn snapshot_sections_have_a_locked_shape() {
             ]),
         ),
         ("live", set(&["call_session", "note_session"])),
+        (
+            "capture_bodies",
+            set(&["dictation_body", "call_body", "note_body"]),
+        ),
         ("live_rows", set(&["call_rows", "note_rows"])),
         ("document", set(&["selected"])),
         (
@@ -138,7 +142,6 @@ fn snapshot_sections_have_a_locked_shape() {
         "id",
         "title",
         "kind",
-        "personal_notes",
         "audio_packets_lost",
         "created_ms",
         "updated_ms",
@@ -158,11 +161,14 @@ fn snapshot_sections_have_a_locked_shape() {
     assert_eq!(keys(&state["call_session"]), session_meta);
     assert_eq!(
         keys(&state["selected_body"]),
-        set(&["id", "text", "original", "rows"])
+        set(&["id", "text", "original", "rows", "personal_notes"])
     );
-    let mut full_session = session_meta.clone();
-    full_session.extend(set(&["text", "original", "rows"]));
-    assert_eq!(keys(&state["dictation_session"]), full_session);
+    assert_eq!(keys(&state["dictation_session"]), session_meta);
+    assert_eq!(
+        keys(&state["dictation_body"]),
+        keys(&state["selected_body"])
+    );
+    assert_eq!(keys(&state["call_body"]), keys(&state["selected_body"]));
     let row_keys = set(&[
         "start_ms",
         "end_ms",

@@ -28,8 +28,12 @@ pub(super) fn collect(app: &App, out: &mut Collector<'_>) {
     use Cadence::{Background, Live};
     out.section("shell", Live, || shell::shell(app));
     out.section("capture", Live, || capture::capture(app));
-    out.section("dictation", Live, || capture::dictation(app));
-    out.section("live", Live, || capture::live_sessions(app));
+    let dictation_changed = out.section("dictation", Live, || capture::dictation(app));
+    let live_changed = out.section("live", Live, || capture::live_sessions(app));
+    if dictation_changed || live_changed {
+        out.include_background();
+    }
+    out.section("capture_bodies", Background, || capture::bodies(app));
     capture::live_rows(app, out);
     // A newly opened or replaced document needs its body in the same update.
     if out.section("document", Live, || library::document(app)) {
@@ -37,7 +41,7 @@ pub(super) fn collect(app: &App, out: &mut Collector<'_>) {
     }
     out.section("notes", Live, || models::notes(app));
     out.section("settings", Live, || settings::settings(app));
-    out.section("models", Live, || models::models(app));
+    out.section("models", Background, || models::models(app));
     out.section("discord", Live, || discord::discord(app));
     out.section("meetings", Live, || meetings::meetings(app));
     out.section("updater", Live, || updates::updater(app));

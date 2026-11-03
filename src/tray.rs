@@ -8,10 +8,7 @@ use tauri::{
 pub(crate) struct QuitRequested(pub AtomicBool);
 pub(crate) fn setting(app: &tauri::AppHandle, key: &str) -> bool {
     let bridge = app.state::<Arc<Bridge>>();
-    let value = serde_json::to_value(bridge.snapshot(None)).unwrap_or_default();
-    value["sections"]["settings"]["data"]["settings"][key]
-        .as_bool()
-        .unwrap_or(false)
+    bridge.setting_bool(key)
 }
 pub(crate) fn setup(app: &mut tauri::App) -> tauri::Result<()> {
     app.manage(QuitRequested(AtomicBool::new(false)));

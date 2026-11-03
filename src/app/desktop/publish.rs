@@ -152,8 +152,36 @@ pub(crate) struct Published {
 }
 
 impl Published {
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
+    pub(crate) fn revision(&self) -> HashMap<String, u64> {
+        self.sections
+            .iter()
+            .map(|(name, entry)| ((*name).to_owned(), entry.revision))
+            .collect()
+    }
+
+    pub(crate) fn setting_bool(&self, key: &str) -> bool {
+        let Some(Entry {
+            content: Content::Data(data),
+            ..
+        }) = self.sections.get("settings")
+        else {
+            return false;
+        };
+        let value: serde_json::Value = serde_json::from_str(data.0.get()).unwrap_or_default();
+        value["settings"][key].as_bool().unwrap_or(false)
+    }
+
+    pub(crate) fn health(&mut self, health: &impl Serialize) {
+        if let Some(data) = Json::of(health) {
+            self.revision += 1;
+            self.sections.insert(
+                "controller",
+                Entry {
+                    revision: self.revision,
+                    content: Content::Data(data),
+                },
+            );
+        }
     }
 
     /// Store a pass's changes and return them as a renderer update.
@@ -166,6 +194,15 @@ impl Published {
                     revision,
                     data,
                 } => {
+                    let revision = if name == "controller" {
+                        revision.max(
+                            self.sections
+                                .get(name)
+                                .map_or(0, |entry| entry.revision + 1),
+                        )
+                    } else {
+                        revision
+                    };
                     self.revision = self.revision.max(revision);
                     sections.insert(
                         name,
@@ -282,7 +319,7 @@ pub(crate) struct RowStream<'a> {
     pub provisional: &'a dyn Fn(usize) -> bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RowCache {
     names: Vec<String>,
     rows: Vec<(calls::Row, bool)>,
@@ -371,10 +408,24 @@ impl Tracker {
         streams: &[RowStream<'_>],
         changes: &mut Changes,
     ) -> bool {
+        self.compare_rows_with(name, streams, changes, |row, names, provisional| {
+            Json::of(&RowView::new(row, names, provisional))
+        })
+    }
+
+    fn compare_rows_with(
+        &mut self,
+        name: &'static str,
+        streams: &[RowStream<'_>],
+        changes: &mut Changes,
+        mut serialize: impl FnMut(&calls::Row, &[String], bool) -> Option<Json>,
+    ) -> bool {
         let first = !self.revisions.contains_key(name);
         let mut splices = BTreeMap::new();
+        let mut pending_rows = HashMap::new();
+        let empty = RowCache::default();
         for stream in streams {
-            let cache = self.rows.entry(stream.key).or_default();
+            let cache = self.rows.get(stream.key).unwrap_or(&empty);
             let renamed = cache.names.as_slice() != stream.names;
             let start = if renamed {
                 0
@@ -392,11 +443,12 @@ impl Tracker {
             if !first && !renamed && start == cache.rows.len() && start == stream.rows.len() {
                 continue;
             }
+            let mut cache = cache.clone();
             cache.rows.truncate(start);
             let mut rows = Vec::with_capacity(stream.rows.len() - start);
             for (offset, row) in stream.rows[start..].iter().enumerate() {
                 let provisional = (stream.provisional)(start + offset);
-                let Some(json) = Json::of(&RowView::new(row, stream.names, provisional)) else {
+                let Some(json) = serialize(row, stream.names, provisional) else {
                     // Force a complete resend once serialization recovers.
                     log::error!("Could not serialize a transcript row");
                     cache.names.clear();
@@ -409,11 +461,13 @@ impl Tracker {
             if renamed {
                 cache.names = stream.names.to_vec();
             }
+            pending_rows.insert(stream.key, cache);
             splices.insert(stream.key, Splice { start, rows });
         }
         if splices.is_empty() {
             return false;
         }
+        self.rows.extend(pending_rows);
         let base = self.revisions.get(name).copied().unwrap_or(0);
         self.revision += 1;
         self.revisions.insert(name, self.revision);
@@ -542,6 +596,64 @@ mod tests {
             text: text.into(),
             cues: Vec::new(),
         }
+    }
+
+    #[test]
+    fn later_stream_failure_does_not_consume_earlier_splice() {
+        let mut tracker = Tracker::default();
+        let first = [row(0, "First")];
+        let second = [row(0, "Second")];
+        let streams = [
+            RowStream {
+                key: "call_rows",
+                rows: &first,
+                names: &[],
+                provisional: &|_| false,
+            },
+            RowStream {
+                key: "note_rows",
+                rows: &second,
+                names: &[],
+                provisional: &|_| false,
+            },
+        ];
+        let mut changes = Changes::default();
+        assert!(!tracker.compare_rows_with(
+            "live_rows",
+            &streams,
+            &mut changes,
+            |row, names, provisional| {
+                if row.text == "Second" {
+                    None
+                } else {
+                    Json::of(&RowView::new(row, names, provisional))
+                }
+            }
+        ));
+        assert!(changes.is_empty());
+        assert!(tracker.rows.is_empty());
+        assert!(tracker.compare_rows("live_rows", &streams, &mut changes));
+        let mut published = Published::default();
+        let update = published.apply(changes);
+        assert_eq!(
+            update.sections["live_rows"].splices.as_ref().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn revision_probe_includes_older_sections_and_settings_reads_are_scoped() {
+        let mut tracker = Tracker::default();
+        let mut published = Published::default();
+        published.apply(tracker.single(
+            "settings",
+            &serde_json::json!({"settings": {"close_to_tray": true}}),
+        ));
+        published.apply(tracker.single("shell", &serde_json::json!({"ready": true})));
+        assert_eq!(published.revision()["settings"], 1);
+        assert_eq!(published.revision()["shell"], 2);
+        assert!(published.setting_bool("close_to_tray"));
+        assert!(!published.setting_bool("missing"));
     }
 
     #[test]

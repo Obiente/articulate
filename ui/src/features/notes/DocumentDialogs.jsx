@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button, Group, Modal, Select } from "@mantine/core";
 import { sourceMoveAction } from "../../actions.js";
 
@@ -74,19 +74,37 @@ export function MoveSourceDialog({ source, topics, blocked, act, onClose }) {
 }
 
 export function DeleteDocumentDialog({ opened, noun, onClose, onConfirm }) {
+  const [pending, setPending] = useState(false);
+  const busy = useRef(false);
+  const confirm = async () => {
+    if (busy.current) return;
+    busy.current = true;
+    setPending(true);
+    try {
+      await onConfirm();
+    } finally {
+      busy.current = false;
+      setPending(false);
+    }
+  };
   return (
     <Modal
       opened={opened}
-      onClose={onClose}
+      onClose={() => !busy.current && onClose()}
       title={`Delete this ${noun}?`}
       size="sm"
     >
       <p>The saved transcript and notes will be removed from this device.</p>
       <Group justify="flex-end" mt="xl">
-        <Button variant="default" onClick={onClose}>
+        <Button variant="default" disabled={pending} onClick={onClose}>
           Keep {noun}
         </Button>
-        <Button color="red" onClick={onConfirm}>
+        <Button
+          color="red"
+          loading={pending}
+          disabled={pending}
+          onClick={confirm}
+        >
           Delete {noun}
         </Button>
       </Group>

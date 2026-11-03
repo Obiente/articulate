@@ -45,10 +45,15 @@ export function useCloseHandshake({ documents, report }) {
       }
       await acknowledgeClose(id).catch(() => {});
       beginTransition();
+      const progress = setInterval(
+        () => void acknowledgeClose(id).catch(() => {}),
+        500,
+      );
       try {
         if (!(await closeApp()))
           await acknowledgeClose(id, true).catch(() => {});
       } finally {
+        clearInterval(progress);
         endTransition();
       }
     })

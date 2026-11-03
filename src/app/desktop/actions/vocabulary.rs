@@ -39,6 +39,16 @@ pub(crate) enum Action {
 
 impl App {
     pub(crate) fn desktop_vocabulary_action(&mut self, action: Action) -> Result<(), String> {
+        self.desktop_vocabulary_save(action, Self::save_preferences)
+    }
+
+    fn desktop_vocabulary_save(
+        &mut self,
+        action: Action,
+        save: impl FnOnce(&Self) -> anyhow::Result<()>,
+    ) -> Result<(), String> {
+        let entries = self.settings.entries.clone();
+        let macros = self.settings.macros.clone();
         match action {
             Action::DictionarySave {
                 heard,
@@ -82,7 +92,11 @@ impl App {
                     }
                 }
                 dictionary::save(&mut self.settings.entries, entry, original.as_ref());
-                self.save_preferences().map_err(|e| e.to_string())?;
+                if let Err(error) = save(self) {
+                    self.settings.entries = entries;
+                    self.settings.macros = macros;
+                    return Err(error.to_string());
+                }
             }
             Action::DictionaryDelete {
                 index,
@@ -96,7 +110,11 @@ impl App {
                     return Err("Vocabulary changed. Refresh and try again.".into());
                 }
                 self.settings.entries.remove(index);
-                self.save_preferences().map_err(|e| e.to_string())?;
+                if let Err(error) = save(self) {
+                    self.settings.entries = entries;
+                    self.settings.macros = macros;
+                    return Err(error.to_string());
+                }
             }
             Action::MacroSave {
                 trigger,
@@ -137,7 +155,11 @@ impl App {
                 } else {
                     self.settings.macros.push(item);
                 }
-                self.save_preferences().map_err(|e| e.to_string())?;
+                if let Err(error) = save(self) {
+                    self.settings.entries = entries;
+                    self.settings.macros = macros;
+                    return Err(error.to_string());
+                }
             }
             Action::MacroDelete {
                 index,
@@ -151,9 +173,49 @@ impl App {
                     return Err("Snippets changed. Refresh and try again.".into());
                 }
                 self.settings.macros.remove(index);
-                self.save_preferences().map_err(|e| e.to_string())?;
+                if let Err(error) = save(self) {
+                    self.settings.entries = entries;
+                    self.settings.macros = macros;
+                    return Err(error.to_string());
+                }
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn failed_preferences_save_restores_vocabulary_and_snippets() {
+        let (mut app, _) = crate::app::tests::app();
+        app.settings.entries = vec![dictionary::validate("heard", "wanted").unwrap()];
+        app.settings.macros = vec![macros::validate("trigger", "expansion", "").unwrap()];
+        let entries = serde_json::to_value(&app.settings.entries).unwrap();
+        let snippets = serde_json::to_value(&app.settings.macros).unwrap();
+        for action in [
+            json!({"type":"dictionary_save", "heard":"new", "wanted":"word"}),
+            json!({"type":"dictionary_delete", "index":0, "expected_heard":"heard", "expected_entry":entries[0]}),
+            json!({"type":"macro_save", "trigger":"new", "expansion":"words"}),
+            json!({"type":"macro_delete", "index":0, "expected_trigger":"trigger", "expected_macro":snippets[0]}),
+        ] {
+            let action = serde_json::from_value(action).unwrap();
+            assert!(
+                app.desktop_vocabulary_save(action, |_| anyhow::bail!("synthetic save failure"))
+                    .unwrap_err()
+                    .contains("synthetic save failure")
+            );
+            assert_eq!(
+                serde_json::to_value(&app.settings.entries).unwrap(),
+                entries
+            );
+            assert_eq!(
+                serde_json::to_value(&app.settings.macros).unwrap(),
+                snippets
+            );
+        }
     }
 }

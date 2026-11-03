@@ -64,13 +64,12 @@ fn preview(text: &str) -> &str {
         .map_or(text, |(index, _)| &text[..index])
 }
 
-/// Document metadata and personal notes, without transcript text or rows.
+/// Document metadata, without notes, transcript text or rows.
 #[derive(Serialize)]
 pub(crate) struct SessionMeta<'a> {
     id: &'a str,
     title: &'a str,
     kind: Kind,
-    personal_notes: &'a str,
     audio_packets_lost: u64,
     created_ms: u64,
     updated_ms: u64,
@@ -114,7 +113,6 @@ impl<'a> SessionMeta<'a> {
             id: &session.id,
             title: &session.title,
             kind: session.kind,
-            personal_notes: &session.personal_notes,
             audio_packets_lost: session.audio_packets_lost,
             created_ms: session.created_ms,
             updated_ms: session.updated_ms,
@@ -143,6 +141,7 @@ impl<'a> SessionMeta<'a> {
 /// Transcript text and rows of a saved document.
 #[derive(Serialize)]
 pub(crate) struct SessionBody<'a> {
+    personal_notes: &'a str,
     id: &'a str,
     text: &'a str,
     original: &'a str,
@@ -150,34 +149,13 @@ pub(crate) struct SessionBody<'a> {
 }
 
 impl<'a> SessionBody<'a> {
-    fn new(session: &'a Session) -> Self {
+    pub(crate) fn new(session: &'a Session) -> Self {
         Self {
             id: &session.id,
+            personal_notes: &session.personal_notes,
             text: &session.text,
             original: &session.original,
             rows: RowView::saved(&session.rows, &session.speaker_names),
-        }
-    }
-}
-
-/// A complete document: metadata, notes, text and rows.
-#[derive(Serialize)]
-pub(crate) struct SessionView<'a> {
-    #[serde(flatten)]
-    meta: SessionMeta<'a>,
-    text: &'a str,
-    original: &'a str,
-    rows: Vec<RowView<'a>>,
-}
-
-impl<'a> SessionView<'a> {
-    pub(crate) fn new(session: &'a Session) -> Self {
-        let body = SessionBody::new(session);
-        Self {
-            meta: SessionMeta::new(session),
-            text: body.text,
-            original: body.original,
-            rows: body.rows,
         }
     }
 }

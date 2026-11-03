@@ -55,7 +55,17 @@ pub(crate) fn models(app: &App) -> Models<'_> {
     })
     .flatten();
     Models {
-        managed_models: model::list_models(),
+        managed_models: model::list_models()
+            .into_iter()
+            .map(|mut model| {
+                model.path = model
+                    .path
+                    .file_name()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default();
+                model
+            })
+            .collect(),
         cleanup: app.desktop_cleanup_status(),
         model_status: ModelStatus {
             speech_installed: path.is_file(),
