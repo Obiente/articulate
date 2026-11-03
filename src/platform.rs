@@ -684,18 +684,24 @@ mod win {
     /// Releasing Alt (or Win) with no other key seen since it went down opens
     /// the app's menu (or Start). The shortcut key itself is swallowed by the
     /// hotkey, so the target app sees exactly that: Alt alone. Its menu then
-    /// takes focus from the text field and insertion is refused. Tapping an
-    /// unassigned key while the modifier is still held makes the release an
-    /// ordinary chord release.
+    /// takes focus from the text field and insertion is refused. Tapping other
+    /// keys while the modifier is still held makes the release an ordinary
+    /// chord release.
     fn mask_modifier_release(shortcut: &Hotkey) {
         let held = |key: VIRTUAL_KEY| unsafe { GetAsyncKeyState(key as i32) < 0 };
-        if !needs_release_mask(shortcut, held(VK_MENU), held(VK_LWIN) || held(VK_RWIN)) {
+        let keys = release_mask_keys(
+            shortcut,
+            held(VK_MENU),
+            held(VK_LWIN) || held(VK_RWIN),
+            held(VK_CONTROL),
+        );
+        let input: Vec<INPUT> = keys
+            .iter()
+            .flat_map(|&key| [selection_key(key, 0), selection_key(key, KEYEVENTF_KEYUP)])
+            .collect();
+        if input.is_empty() {
             return;
         }
-        let input = [
-            selection_key(MASK_KEY, 0),
-            selection_key(MASK_KEY, KEYEVENTF_KEYUP),
-        ];
         unsafe {
             SendInput(
                 input.len() as u32,
@@ -705,8 +711,24 @@ mod win {
         }
     }
 
-    fn needs_release_mask(shortcut: &Hotkey, alt_held: bool, win_held: bool) -> bool {
-        (shortcut.alt && alt_held) || (shortcut.win && win_held)
+    /// Classic menus count the unassigned key, but Chromium and Electron apps
+    /// drop unknown keys and still see Alt alone, so Ctrl is tapped too. Ctrl
+    /// is skipped while it is physically held: an injected release would end
+    /// the user's own Ctrl press.
+    fn release_mask_keys(
+        shortcut: &Hotkey,
+        alt_held: bool,
+        win_held: bool,
+        ctrl_held: bool,
+    ) -> Vec<VIRTUAL_KEY> {
+        if !((shortcut.alt && alt_held) || (shortcut.win && win_held)) {
+            return Vec::new();
+        }
+        let mut keys = vec![MASK_KEY];
+        if !ctrl_held {
+            keys.push(VK_CONTROL);
+        }
+        keys
     }
 
     unsafe fn modifiers_released() -> bool {
@@ -976,16 +998,22 @@ mod win {
                 key: "Space".into(),
             };
             // Alt + Space alone would open the target app's menu on release.
-            assert!(needs_release_mask(&chord(false, true, false), true, false));
-            assert!(needs_release_mask(&chord(true, true, false), true, false));
-            assert!(needs_release_mask(&chord(false, false, true), false, true));
+            assert_eq!(
+                release_mask_keys(&chord(false, true, false), true, false, false),
+                [MASK_KEY, VK_CONTROL]
+            );
+            assert_eq!(
+                release_mask_keys(&chord(false, false, true), false, true, false),
+                [MASK_KEY, VK_CONTROL]
+            );
+            // A held Ctrl already breaks up the release and must stay held.
+            assert_eq!(
+                release_mask_keys(&chord(true, true, false), true, false, true),
+                [MASK_KEY]
+            );
             // Already released, or not part of the chord: nothing to mask.
-            assert!(!needs_release_mask(
-                &chord(false, true, false),
-                false,
-                false
-            ));
-            assert!(!needs_release_mask(&chord(true, false, false), true, true));
+            assert!(release_mask_keys(&chord(false, true, false), false, false, false).is_empty());
+            assert!(release_mask_keys(&chord(true, false, false), true, true, true).is_empty());
         }
 
         #[test]
