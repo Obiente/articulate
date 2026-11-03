@@ -39,6 +39,7 @@ pub fn parse(input: &str) -> anyhow::Result<Library> {
         valid.cues = dictionary::cue_words(&entry.cues.join(","))?;
         valid.ignore_case = entry.ignore_case;
         valid.enabled = entry.enabled;
+        valid.sound_alike = entry.sound_alike;
         anyhow::ensure!(
             entry.contexts.len() <= 32,
             "Use up to 32 additional context rules per correction"
@@ -89,6 +90,13 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn portable_vocabulary_preserves_sound_rejections() {
+        let mut entry = dictionary::validate("obi ante", "Obiente").unwrap();
+        entry.sound_alike = false;
+        let restored = parse(&export(&[entry.clone()], &[]).unwrap()).unwrap();
+        assert!(restored.corrections == [entry]);
+    }
     #[test]
     fn portable_library_keeps_scope_and_disabled_rules() {
         let mut entry = dictionary::validate("Jon", "John").unwrap();

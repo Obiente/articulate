@@ -9,6 +9,7 @@ import {
   Paper,
   SimpleGrid,
   Stack,
+  Switch,
   Table,
   Text,
   TextInput,
@@ -25,9 +26,21 @@ import {
 import { DeleteDialog, Empty, Heading } from "../../components/Page.jsx";
 import { formatCount } from "../../lib/format.js";
 
-const emptyEntry = { heard: "", wanted: "", app: "", cues: "" };
+const emptyEntry = {
+  heard: "",
+  wanted: "",
+  app: "",
+  cues: "",
+  sound_alike: true,
+};
 
-export function VocabularyPage({ dictionary, act, review }) {
+export function VocabularyPage({
+  dictionary,
+  act,
+  review,
+  soundAlike = true,
+  app,
+}) {
   const [search, setSearch] = useState("");
   const [editor, setEditor] = useState(null);
   const [deletion, setDeletion] = useState(null);
@@ -81,7 +94,19 @@ export function VocabularyPage({ dictionary, act, review }) {
       >
         Your names, terms, and spellings. Remembered wherever you dictate.
       </Heading>
-      <VocabularyReview review={review} act={act} />
+      <Switch
+        label="Match similar-sounding words"
+        description="Use close pronunciations of your saved names and unusual terms."
+        checked={soundAlike}
+        mb="lg"
+        onChange={(event) =>
+          void act({
+            type: "dictionary_sound_alike",
+            enabled: event.currentTarget.checked,
+          }).catch(() => {})
+        }
+      />
+      <VocabularyReview review={review} act={act} app={app} />
       <Paper className="secondary-tip" withBorder radius="lg">
         <ThemeIcon size={42} radius="md" variant="light">
           <BookOpen size={23} />
@@ -134,6 +159,13 @@ export function VocabularyPage({ dictionary, act, review }) {
                     </Table.Td>
                     <Table.Td>
                       <Text className="secondary-accent">{entry.wanted}</Text>
+                      {soundAlike &&
+                        entry.enabled !== false &&
+                        entry.sound_alike && (
+                          <Badge size="xs" variant="light">
+                            sounds like
+                          </Badge>
+                        )}
                       {entry.cues?.length > 0 && (
                         <Text c="dimmed" size="xs" mt={5}>
                           Near: {entry.cues.join(", ")}
@@ -156,6 +188,7 @@ export function VocabularyPage({ dictionary, act, review }) {
                               setEditor({
                                 heard: entry.heard,
                                 wanted: entry.wanted,
+                                sound_alike: entry.sound_alike ?? false,
                                 app: entry.app || "",
                                 cues: (entry.cues || []).join(", "),
                                 index: entry.index,
@@ -262,6 +295,17 @@ export function VocabularyPage({ dictionary, act, review }) {
               value={editor?.cues || ""}
               onChange={(event) =>
                 setEditor({ ...editor, cues: event.currentTarget.value })
+              }
+            />
+            <Switch
+              label="Match similar-sounding words"
+              description="Available for unusual English names and terms. Common words and numbers stay unchanged."
+              checked={editor?.sound_alike ?? true}
+              onChange={(event) =>
+                setEditor({
+                  ...editor,
+                  sound_alike: event.currentTarget.checked,
+                })
               }
             />
             <Group justify="flex-end" mt="sm">

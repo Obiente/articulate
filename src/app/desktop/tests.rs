@@ -144,7 +144,10 @@ fn snapshot_sections_have_a_locked_shape() {
         ("people", set(&["people", "people_error"])),
         ("history", set(&["history"])),
         ("document_body", set(&["selected_body"])),
-        ("vocabulary", set(&["dictionary", "macros", "assort"])),
+        (
+            "vocabulary",
+            set(&["dictionary", "macros", "assort", "vocabulary_sound_alike"]),
+        ),
         ("insights", set(&["insights"])),
         ("search", set(&["search"])),
         ("storage", set(&["storage", "library_notice"])),

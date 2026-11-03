@@ -8,11 +8,15 @@ use serde_json::Value;
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Action {
+    DictionarySoundAlike {
+        enabled: bool,
+    },
     DictionarySave {
         heard: String,
         wanted: String,
         app: Option<String>,
         cues: Option<String>,
+        sound_alike: Option<bool>,
         index: Option<usize>,
         expected_heard: Option<String>,
         expected_entry: Option<Value>,
@@ -50,11 +54,20 @@ impl App {
         let entries = self.settings.entries.clone();
         let macros = self.settings.macros.clone();
         match action {
+            Action::DictionarySoundAlike { enabled } => {
+                let previous = self.settings.vocabulary_sound_alike;
+                self.settings.vocabulary_sound_alike = enabled;
+                if let Err(error) = save(self) {
+                    self.settings.vocabulary_sound_alike = previous;
+                    return Err(error.to_string());
+                }
+            }
             Action::DictionarySave {
                 heard,
                 wanted,
                 app,
                 cues,
+                sound_alike,
                 index,
                 expected_heard,
                 expected_entry,
@@ -91,6 +104,10 @@ impl App {
                         entry.app.clone_from(&original.app);
                     }
                 }
+                entry.sound_alike = sound_alike
+                    .or_else(|| original.as_ref().map(|e| e.sound_alike))
+                    .unwrap_or(entry.sound_alike)
+                    && crate::sound_alike::is_distinctive(&entry.wanted);
                 dictionary::save(&mut self.settings.entries, entry, original.as_ref());
                 if let Err(error) = save(self) {
                     self.settings.entries = entries;
@@ -189,6 +206,47 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn sound_settings_migrate_roundtrip_and_save_transactionally() {
+        let legacy: crate::app::Settings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.vocabulary_sound_alike);
+        let (mut app, _) = crate::app::tests::app();
+        assert!(
+            app.desktop_vocabulary_save(
+                Action::DictionarySoundAlike { enabled: false },
+                |_| anyhow::bail!("synthetic save failure")
+            )
+            .is_err()
+        );
+        assert!(app.settings.vocabulary_sound_alike);
+        app.desktop_vocabulary_save(Action::DictionarySoundAlike { enabled: false }, |_| Ok(()))
+            .unwrap();
+        let restored: crate::app::Settings =
+            serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
+        assert!(!restored.vocabulary_sound_alike);
+        let action = serde_json::from_value(json!({"type":"dictionary_save", "heard":"obi ante", "wanted":"Obiente", "sound_alike":false})).unwrap();
+        app.desktop_vocabulary_save(action, |_| Ok(())).unwrap();
+        assert!(!app.settings.entries[0].sound_alike);
+        let original = serde_json::to_value(&app.settings.entries[0]).unwrap();
+        let action = serde_json::from_value(json!({"type":"dictionary_save", "index":0, "expected_heard":"obi ante", "expected_entry":original, "heard":"obi ante", "wanted":"Obiente", "sound_alike":true})).unwrap();
+        app.desktop_vocabulary_save(action, |_| Ok(())).unwrap();
+        assert!(app.settings.entries[0].sound_alike);
+        let action = serde_json::from_value(json!({"type":"dictionary_save", "heard":"pro ject", "wanted":"Project", "sound_alike":true})).unwrap();
+        app.desktop_vocabulary_save(action, |_| Ok(())).unwrap();
+        assert!(!app.settings.entries[1].sound_alike);
+        assert!(
+            serde_json::from_value::<Action>(
+                json!({"type":"dictionary_sound_alike", "enabled":"true"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Action>(
+                json!({"type":"dictionary_save", "heard":"word", "wanted":"term", "sound_alike":0})
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn failed_preferences_save_restores_vocabulary_and_snippets() {
         let (mut app, _) = crate::app::tests::app();

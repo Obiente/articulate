@@ -29,6 +29,48 @@ The worker checks field identity roughly every 300 ms, with 500 ms UI Automation
 
 App edits are learned for that executable, for example `discord.exe`. Entries learned in the built-in transcript remain global unless the transcript originated in another app. Existing dictionaries keep their global behavior. You can add comma-separated cues, such as `crate, compiler`, to require a whole-word cue in the same sentence within 120 characters of a replacement. App and cue conditions both apply. App-specific rules take priority over otherwise equal global rules. This uses the dictated sentence and executable basename, not surrounding documents, browser history, or a semantic correction model. Browser sites share the browser executable's scope.
 
+### Sound-alike vocabulary
+
+`dictionary::apply_in` retains exact whole-word matching. Dictation uses
+`apply_with_sound` after writing-style cleanup for previews and final text.
+Exact matches have priority, including inside a possible wider sound span.
+Case-only changes to the saved heard phrase still require its capitalization policy.
+Output is never matched again. Saved wanted phrases are reserved against sound
+replacement, even when another entry offers a close pronunciation.
+
+`sound_alike::similar(a, b)` and `sound_alike::is_distinctive(term)` are shared
+public helpers. The dependency-free simplified Metaphone key ignores spaces,
+folds consonant groups and suppresses interior vowels. Initial w/v confusion
+supports names such as Vencord. The score weights normalized sound-key edit
+similarity at 75% and letter edit similarity at 25%, with a 0.92 minimum and a
+separate 0.70 letter minimum. This favors matching pronunciations with nearby
+spellings. Equal best alternatives abstain. Candidate spans contain one to four
+space-separated words, never cross punctuation, and obey the existing app and
+120-character same-sentence cue policies.
+
+Only unusual English terms qualify. At least four letters are required, with
+five letters or capitalization; a conservative common-word list excludes ordinary
+prose even when capitalized. Numbers, number names, negations, weekdays, articles
+and pronouns are shared protections with correction learning. Non-ASCII terms,
+punctuation and digit-bearing spans use exact matching only. This is an English
+spelling heuristic, not a pronunciation dictionary or a general homophone repair.
+Generic speech cleanup remains unchanged.
+
+Entries persist `sound_alike`; omitted values derive from term eligibility.
+Settings persist `vocabulary_sound_alike`, defaulting to true. A per-thread cache
+rebuilds keys and lookup buckets only when the ordered entries change, including
+context edits, imports, learning and undo. It retains vocabulary, never transcript
+text. The timing test measures a median cached pass with 200 entries and about
+200 words against a one-millisecond budget.
+
+Learning merges similar corrected-away forms for the same destination and app.
+A reversal must match a recorded sound replacement before disabling that entry's
+fallback, leaving its exact pair available. The existing five-change undo stack
+restores the previous dictionary. Review candidates carry their actual heard
+span and match kind; only exact pairs are submitted for preference scoring.
+Sound-only review works without a scoring package. The review action uses the
+last dictation's destination app.
+
 ## Voice macros
 
 Open **Shortcuts**, enter a trigger and expansion, try the preview, then save. Say the word **bang** followed by your trigger as a separate dictation:

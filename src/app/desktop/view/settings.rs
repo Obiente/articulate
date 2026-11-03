@@ -99,6 +99,7 @@ pub(crate) fn settings(app: &App) -> Settings<'_> {
 
 #[derive(Serialize)]
 pub(crate) struct Vocabulary<'a> {
+    vocabulary_sound_alike: bool,
     assort: crate::app::assort_ui::ReviewStatus<'a>,
     dictionary: &'a [Entry],
     macros: &'a [VoiceMacro],
@@ -106,6 +107,7 @@ pub(crate) struct Vocabulary<'a> {
 
 pub(crate) fn vocabulary(app: &App) -> Vocabulary<'_> {
     Vocabulary {
+        vocabulary_sound_alike: app.settings.vocabulary_sound_alike,
         assort: app.desktop_assort_status(),
         dictionary: &app.settings.entries,
         macros: &app.settings.macros,

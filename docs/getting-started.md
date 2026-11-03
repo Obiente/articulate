@@ -38,6 +38,18 @@ vocabulary rules. Review or change remembered spellings in Vocabulary.
 Short corrections made in an external app can also be learned when **Remember
 corrections** is enabled in Settings. Those learning notices offer Undo.
 
+Vocabulary also matches close pronunciations of unusual English names and terms,
+such as `Obi Yente` for `Obiente` or `when cord` for `Vencord`. Turn **Match
+similar-sounding words** on or off for each entry or for the whole vocabulary.
+The **sounds like** badge marks active entries. Exact saved pairs still work
+when this option is off. App and context-word restrictions apply to both kinds
+of match. Common words, numbers and ambiguous choices stay unchanged.
+
+Corrections to the same term share context instead of adding a row for each
+pronunciation. Reversing an automatic sound match disables that entry's similar
+sounds; Undo restores it. **Review vocabulary** also shows sound matches for an
+explicit choice, without a preference score.
+
 In Shortcuts, save a trigger such as `signature` and a text expansion. Say “bang signature” as its own dictation. A template can contain one `{text}` slot for words spoken after the trigger. Macros expand text only; they never execute commands or send Enter.
 
 ## Clean up dictation

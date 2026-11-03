@@ -256,6 +256,7 @@ export const sampleDictionary = [
     app: null,
     cues: [],
     enabled: true,
+    sound_alike: true,
   },
   {
     heard: "q wen",
@@ -263,6 +264,7 @@ export const sampleDictionary = [
     app: null,
     cues: ["model"],
     enabled: true,
+    sound_alike: true,
   },
 ];
 

@@ -15,9 +15,17 @@ pub const MAX_CANDIDATES: usize = 8;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Candidate {
+    pub match_kind: dictionary::MatchKind,
+    pub heard: String,
     pub entry: Entry,
     pub proposed: String,
     pub context: String,
+}
+
+impl Candidate {
+    fn ignore_case(&self) -> bool {
+        self.match_kind == dictionary::MatchKind::SoundAlike || self.entry.ignore_case
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -171,6 +179,8 @@ pub fn prepare(text: &str, entries: &[Entry], app: Option<&str>) -> Result<Reque
             entry.cues.join(", ")
         );
         request.candidates.push(Candidate {
+            match_kind: dictionary::MatchKind::Exact,
+            heard: text[occurrences(text, &entry.heard, entry.ignore_case)[0].clone()].into(),
             entry: entry.clone(),
             proposed,
             context,
@@ -178,6 +188,42 @@ pub fn prepare(text: &str, entries: &[Entry], app: Option<&str>) -> Result<Reque
         if request.candidates.len() == MAX_CANDIDATES {
             break;
         }
+    }
+    let applied = dictionary::apply_with_sound(text, entries, app_ref(&request), true);
+    for found in &applied.matches {
+        if request.candidates.len() == MAX_CANDIDATES {
+            break;
+        }
+        if found.kind != dictionary::MatchKind::SoundAlike
+            || applied
+                .matches
+                .iter()
+                .filter(|m| m.entry == found.entry)
+                .count()
+                != 1
+        {
+            continue;
+        }
+        let heard = &text[found.range.clone()];
+        if occurrences(text, heard, true).len() != 1 {
+            continue;
+        }
+        let entry = &entries[found.entry];
+        if protected(heard) != protected(&entry.wanted) {
+            continue;
+        }
+        let mut proposed = text.to_owned();
+        proposed.replace_range(found.range.clone(), &entry.wanted);
+        if request.candidates.iter().any(|c| c.proposed == proposed) {
+            continue;
+        }
+        request.candidates.push(Candidate {
+            match_kind: dictionary::MatchKind::SoundAlike,
+            heard: heard.into(),
+            entry: entry.clone(),
+            proposed,
+            context: excerpt(text, heard, true),
+        });
     }
     validate(&request)?;
     Ok(request)
@@ -212,25 +258,23 @@ pub(crate) fn validate(request: &Request) -> Result<()> {
             "Invalid correction candidate."
         );
         ensure!(
-            protected(&candidate.entry.heard) == protected(&candidate.entry.wanted),
+            protected(&candidate.heard) == protected(&candidate.entry.wanted),
             "This correction changes a protected number or negation."
         );
-        let (expected, count) = dictionary::apply_in(
+        let applied = dictionary::apply_with_sound(
             &request.original,
             std::slice::from_ref(&candidate.entry),
             app_ref(request),
+            candidate.match_kind == dictionary::MatchKind::SoundAlike,
         );
         ensure!(
-            count == 1
-                && occurrences(
-                    &request.original,
-                    &candidate.entry.heard,
-                    candidate.entry.ignore_case
-                )
-                .len()
+            applied.changed == 1
+                && applied.matches[0].kind == candidate.match_kind
+                && request.original[applied.matches[0].range.clone()] == candidate.heard
+                && occurrences(&request.original, &candidate.heard, candidate.ignore_case()).len()
                     == 1
-                && expected != request.original
-                && expected == candidate.proposed,
+                && applied.text != request.original
+                && applied.text == candidate.proposed,
             "This correction is not eligible in the supplied app and sentence."
         );
     }
@@ -306,10 +350,19 @@ pub fn accept(
         .get(index)
         .ok_or_else(|| anyhow::anyhow!("Unknown correction suggestion."))?;
     ensure!(
-        entries
-            .iter()
-            .flat_map(Entry::variants)
-            .any(|entry| entry == candidate.entry),
+        if candidate.match_kind == dictionary::MatchKind::SoundAlike {
+            entries.contains(&candidate.entry)
+                && prepare(text, entries, app)?.candidates.iter().any(|c| {
+                    c.match_kind == candidate.match_kind
+                        && c.entry == candidate.entry
+                        && c.proposed == candidate.proposed
+                })
+        } else {
+            entries
+                .iter()
+                .flat_map(Entry::variants)
+                .any(|entry| entry == candidate.entry)
+        },
         "The vocabulary rule changed. Review it again before applying a suggestion."
     );
     Ok(candidate.proposed.clone())
@@ -357,8 +410,8 @@ pub fn literal_context(review: &Review, index: usize) -> bool {
     };
     let Some(span) = occurrences(
         &review.request.original,
-        &candidate.entry.heard,
-        candidate.entry.ignore_case,
+        &candidate.heard,
+        candidate.ignore_case(),
     )
     .into_iter()
     .next() else {
@@ -433,7 +486,7 @@ pub fn apply_choice(
         "The edited preview changed. Review it again first."
     );
     let candidate = &review.request.candidates[index];
-    let original = occurrences(raw, &candidate.entry.heard, candidate.entry.ignore_case);
+    let original = occurrences(raw, &candidate.heard, candidate.ignore_case());
     ensure!(
         original.len() == 1,
         "This phrase is no longer uniquely identifiable."
@@ -444,8 +497,8 @@ pub fn apply_choice(
     } else {
         (candidate.entry.wanted.as_str(), heard)
     };
-    let matches = occurrences(preview, from, candidate.entry.ignore_case);
-    let target_matches = occurrences(preview, to, candidate.entry.ignore_case);
+    let matches = occurrences(preview, from, candidate.ignore_case());
+    let target_matches = occurrences(preview, to, candidate.ignore_case());
     if matches.is_empty() && target_matches.len() == 1 {
         return Ok(preview.to_owned());
     }
@@ -466,6 +519,61 @@ mod tests {
         dictionary::validate("cube win", "Qwen").unwrap()
     }
 
+    #[test]
+    fn sound_review_preserves_actual_span_kind_scope_and_explicit_choices() {
+        let mut entry = dictionary::validate("obi ante", "Obiente").unwrap();
+        entry.app = Some("editor.exe".into());
+        entry.cues = vec!["website".into()];
+        let entries = [entry];
+        let raw = "Visit Obi Yente website.";
+        assert!(prepare(raw, &entries, None).is_err());
+        let request = prepare(raw, &entries, Some("editor.exe")).unwrap();
+        assert_eq!(
+            request.candidates[0].match_kind,
+            dictionary::MatchKind::SoundAlike
+        );
+        assert_eq!(request.candidates[0].heard, "Obi Yente");
+        let review = Review {
+            request,
+            scores: vec![],
+        };
+        let saved = "Visit Obiente website.";
+        assert_eq!(
+            accept(&review, 0, raw, &entries, Some("editor.exe")).unwrap(),
+            saved
+        );
+        assert_eq!(
+            apply_choice(
+                &review,
+                0,
+                false,
+                Preview {
+                    raw,
+                    text: saved,
+                    baseline: saved
+                },
+                &entries,
+                Some("editor.exe")
+            )
+            .unwrap(),
+            raw
+        );
+        let mut changed = entries.to_vec();
+        changed[0].sound_alike = false;
+        assert!(accept(&review, 0, raw, &changed, Some("editor.exe")).is_err());
+    }
+    #[test]
+    fn sound_review_rejects_forged_spans_and_competing_terms() {
+        let entries = [dictionary::validate("obi ante", "Obiente").unwrap()];
+        let mut request = prepare("obi yente", &entries, None).unwrap();
+        request.candidates[0].heard = "other words".into();
+        assert!(validate(&request).is_err());
+        let entries = [
+            dictionary::validate("same alias", "Obiente").unwrap(),
+            dictionary::validate("same alias", "Obiante").unwrap(),
+        ];
+        assert!(prepare("saim alias", &entries, None).is_err());
+    }
     #[test]
     fn merged_context_review_keeps_the_matching_case_policy_and_rejects_removed_clause() {
         let mut entry = entry();
