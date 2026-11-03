@@ -2325,6 +2325,31 @@ mod tests {
     }
 
     #[test]
+    fn restored_settings_keep_this_devices_discord_state() {
+        let current = Settings {
+            discord_debugger_port: 9229,
+            discord_flavor: "ptb".into(),
+            microphone: Some("Local microphone".into()),
+            ..Default::default()
+        };
+        let merged = merge_restored_settings(
+            &current,
+            Some(serde_json::json!({
+                "discord_debugger_port": 1234,
+                "discord_flavor": "canary",
+                "microphone": "Archived microphone",
+                "transcription_language": "fr",
+            })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(merged.discord_debugger_port, 9229);
+        assert_eq!(merged.discord_flavor, "ptb");
+        assert_eq!(merged.microphone.as_deref(), Some("Local microphone"));
+        assert_eq!(merged.transcription_language, "fr");
+    }
+
+    #[test]
     fn restored_settings_keep_local_secrets_and_merge_vocabulary() {
         let current = Settings {
             discord_pairing_key: "local-secret".into(),
