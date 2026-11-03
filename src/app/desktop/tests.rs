@@ -178,6 +178,7 @@ fn snapshot_sections_have_a_locked_shape() {
         "speaker_undo",
         "audio",
         "transcript_versions",
+        "transcript_revision",
     ]);
     assert_eq!(keys(&state["selected"]), session_meta);
     assert_eq!(keys(&state["call_session"]), session_meta);

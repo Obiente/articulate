@@ -208,7 +208,9 @@ export function ConversationSettings({ controls, renderAvatar }) {
         centered
       >
         <Text c="dimmed">
-          The list of known people is removed from this device. Names already in
+          The list of {people.length}{" "}
+          {people.length === 1 ? "known person" : "known people"} is removed
+          from this device, with any damaged copies of it. Names already in
           saved conversations stay as they are.
         </Text>
         <Group justify="flex-end" mt="xl">
@@ -219,7 +221,12 @@ export function ConversationSettings({ controls, renderAvatar }) {
             color="red"
             loading={controls.pending === "people_clear"}
             onClick={async () => {
-              if (await controls.action("people_clear")) setClearing(false);
+              if (
+                await controls.action("people_clear", {
+                  confirm: { count: people.length },
+                })
+              )
+                setClearing(false);
             }}
           >
             Forget everyone

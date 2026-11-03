@@ -16,6 +16,21 @@ pub(crate) struct RowRef {
     start_ms: u64,
 }
 
+/// What the delete confirmation showed: the session and its audio size.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AudioConfirmation {
+    id: String,
+    bytes: u64,
+}
+
+/// What the forget-everyone confirmation showed: how many people.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeopleConfirmation {
+    count: usize,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Action {
@@ -49,7 +64,9 @@ pub(crate) enum Action {
     PersonDelete {
         id: String,
     },
-    PeopleClear,
+    PeopleClear {
+        confirm: PeopleConfirmation,
+    },
     AudioImportChoose,
     AudioImportStart {
         kind: ImportKind,
@@ -66,13 +83,17 @@ pub(crate) enum Action {
     AudioStop,
     AudioDelete {
         id: String,
+        confirm: AudioConfirmation,
     },
     TranscriptRebuild {
         id: String,
     },
+    /// `version` is a `transcript_versions[].id`; `expected` the document's
+    /// `transcript_revision` when the choice was made.
     TranscriptRestore {
         id: String,
-        index: usize,
+        version: String,
+        expected: String,
     },
 }
 
@@ -115,8 +136,8 @@ impl App {
             }
             Action::SpeakerUndo { id } => self.calls_speaker_edit(&id, SpeakerOp::Undo),
             Action::PersonSave { id, name } => self.calls_people_save(id.as_deref(), &name),
-            Action::PersonDelete { id } => self.calls_people_delete(Some(&id)),
-            Action::PeopleClear => self.calls_people_delete(None),
+            Action::PersonDelete { id } => self.calls_people_delete(&id),
+            Action::PeopleClear { confirm } => self.calls_people_clear(confirm.count),
             // Handled outside the controller; nothing to do here.
             Action::AudioImportChoose => Ok(()),
             Action::AudioImportStart { kind, keep_audio } => {
@@ -135,9 +156,15 @@ impl App {
                 self.calls_stop_playback();
                 Ok(())
             }
-            Action::AudioDelete { id } => self.calls_delete_audio(&id),
+            Action::AudioDelete { id, confirm } => {
+                self.calls_delete_audio(&id, &confirm.id, confirm.bytes)
+            }
             Action::TranscriptRebuild { id } => self.calls_rebuild(&id),
-            Action::TranscriptRestore { id, index } => self.calls_restore_version(&id, index),
+            Action::TranscriptRestore {
+                id,
+                version,
+                expected,
+            } => self.calls_restore_version(&id, &version, &expected),
         }
     }
 }

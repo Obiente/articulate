@@ -79,6 +79,10 @@ impl App {
                 if self.call.is_some() {
                     return Err("Finish the call using its recording control.".into());
                 }
+                // An import or re-transcription has its own cancel.
+                if self.calls_file_job_running() {
+                    return Err("Cancel the import or re-transcription from its progress.".into());
+                }
                 self.cancel_dictation();
             }
             Action::CallStart {

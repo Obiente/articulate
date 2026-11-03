@@ -3,7 +3,9 @@
 //! Audio is decoded and played in Rust; the renderer only asks to start or
 //! stop and reads the position. Decoding runs ahead of the output callback
 //! through a lock-free ring buffer. The output stream is created and dropped
-//! on the playback thread.
+//! on the playback thread. A device error ends playback: the callback stops
+//! consuming, so the feeding and draining loops watch for it as well as for
+//! a stop request.
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{
@@ -32,11 +34,25 @@ pub struct Player {
 
 type Shared = Arc<Mutex<Option<String>>>;
 
+/// Why playback should end early: a stop request or a failed device.
+#[derive(Clone, Default)]
+struct Halt {
+    stop: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+}
+
+impl Halt {
+    fn now(&self) -> bool {
+        self.stop.load(Ordering::Relaxed) || self.failed.load(Ordering::Relaxed)
+    }
+}
+
 /// Open the output and start a stream that plays mono samples from the ring.
 fn open(
     output: Option<&str>,
     played: Arc<AtomicU64>,
     error: Shared,
+    failed: Arc<AtomicBool>,
 ) -> Result<(cpal::Stream, u32, ringbuf::HeapProd<f32>)> {
     let host = cpal::default_host();
     let device = output
@@ -68,6 +84,7 @@ fn open(
     let on_error = move |problem: cpal::StreamError| {
         *error.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(format!("Playback stopped: {problem}"));
+        failed.store(true, Ordering::Relaxed);
     };
     let stream_config: cpal::StreamConfig = config.clone().into();
     let stream = match config.sample_format() {
@@ -106,34 +123,40 @@ impl Player {
         from_ms: u64,
         output: Option<String>,
     ) -> Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
+        let halt = Halt::default();
+        let stop = halt.stop.clone();
         let played = Arc::new(AtomicU64::new(0));
         let error: Shared = Arc::new(Mutex::new(None));
         let (ready_tx, ready) = mpsc::channel::<Result<u32>>();
-        let thread_stop = stop.clone();
         let thread_played = played.clone();
         let thread_error = error.clone();
         let thread = std::thread::Builder::new()
             .name("retained-audio-playback".into())
             .spawn(move || {
-                let (stream, rate, mut producer) =
-                    match open(output.as_deref(), thread_played, thread_error.clone()) {
-                        Ok(opened) => opened,
-                        Err(problem) => {
-                            let _ = ready_tx.send(Err(problem));
-                            return;
-                        }
-                    };
+                let (stream, rate, mut producer) = match open(
+                    output.as_deref(),
+                    thread_played,
+                    thread_error.clone(),
+                    halt.failed.clone(),
+                ) {
+                    Ok(opened) => opened,
+                    Err(problem) => {
+                        let _ = ready_tx.send(Err(problem));
+                        return;
+                    }
+                };
                 let _ = ready_tx.send(Ok(rate));
-                if let Err(problem) = feed(&path, from_ms, rate, &mut producer, &thread_stop) {
-                    *thread_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(format!("{problem:#}"));
+                if let Err(problem) = feed(&path, from_ms, rate, &mut producer, &halt) {
+                    let mut error = thread_error.lock().unwrap_or_else(|e| e.into_inner());
+                    // A device error explains more than the decoder stopping.
+                    if error.is_none() {
+                        *error = Some(format!("{problem:#}"));
+                    }
                 }
-                // Let the device play what is buffered, then stop.
-                while !thread_stop.load(Ordering::Relaxed) && !producer.is_empty() {
-                    std::thread::sleep(Duration::from_millis(50));
+                drain(&producer, &halt);
+                if !halt.failed.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(150));
                 }
-                std::thread::sleep(Duration::from_millis(150));
                 drop(stream);
             })
             .context("Could not start playback")?;
@@ -240,12 +263,20 @@ impl Converter {
     }
 }
 
+/// Let the device play what is buffered, unless playback was stopped or the
+/// device failed and will never consume it.
+fn drain(producer: &impl Observer, halt: &Halt) {
+    while !halt.now() && !producer.is_empty() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn feed(
     path: &Path,
     from_ms: u64,
     rate: u32,
     producer: &mut impl Producer<Item = f32>,
-    stop: &AtomicBool,
+    halt: &Halt,
 ) -> Result<()> {
     let start_frame = from_ms * u64::from(crate::audio_store::RATE) / 1000;
     let mut converter = Converter::new(rate);
@@ -253,20 +284,55 @@ fn feed(
         let skip = start_frame.saturating_sub(start) as usize;
         let more = converter.convert(&channels, skip, |sample| {
             while producer.try_push(sample).is_err() {
-                if stop.load(Ordering::Relaxed) {
+                if halt.now() {
                     return false;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             true
         });
-        Ok(more && !stop.load(Ordering::Relaxed))
+        Ok(more && !halt.now())
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_device_ends_feeding_and_draining() {
+        let folder = std::env::temp_dir().join(format!(
+            "articulate-playback-{}-{}",
+            std::process::id(),
+            crate::history::now_ms()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = crate::audio_store::path(&folder, "0123456789abcdef0123456789abcdef");
+        let recorder =
+            crate::audio_store::Recorder::start(path.clone(), vec!["recording".into()], false)
+                .unwrap();
+        recorder.push(0, vec![0.2; 3 * 16_000]);
+        recorder.finish().unwrap();
+        // The device stopped consuming: the ring fills and stays full.
+        let (mut producer, _consumer) = HeapRb::<f32>::new(1_000).split();
+        let halt = Halt::default();
+        let failing = halt.failed.clone();
+        let started = std::time::Instant::now();
+        let failer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            failing.store(true, Ordering::Relaxed);
+        });
+        feed(&path, 0, 48_000, &mut producer, &halt).unwrap();
+        failer.join().unwrap();
+        assert!(producer.is_full());
+        drain(&producer, &halt);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // A stop request ends draining as before.
+        let stopped = Halt::default();
+        stopped.stop.store(true, Ordering::Relaxed);
+        drain(&producer, &stopped);
+        let _ = std::fs::remove_dir_all(folder);
+    }
 
     #[test]
     fn conversion_mixes_channels_and_keeps_rate_continuous() {

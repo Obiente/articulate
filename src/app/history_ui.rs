@@ -476,15 +476,17 @@ impl App {
                     self.history_notify(format!("{error} ({file_name})"), true);
                 }
                 HistoryEvent::Pinned(summary) => self.history.upsert(*summary),
+                // Settings copies are counted here; known people and
+                // recordings in progress are added before it is reported
+                // (see call_tools).
                 HistoryEvent::ProtectionChanged(mut result) => {
-                    self.history.storage.encryption_working = false;
                     if let (Ok(report), Some(settings)) =
                         (&mut result, self.history.storage.settings_migration.take())
                     {
                         report.changed += settings.changed;
                         report.failed += settings.failed;
                     }
-                    self.history.protection = Some(result);
+                    self.calls_protection_changed(result);
                 }
                 HistoryEvent::RetentionPreview(result) => {
                     self.history.storage.retention_preview_working = false;
@@ -808,11 +810,9 @@ impl App {
         }
         self.history.storage.settings_migration =
             Some(migrate_settings_copies(&model::data_dir(), enabled));
-        // Known people follow the same protection; retained audio is
-        // migrated with the history files.
-        if let Err(error) = self.call_tools.people.set_protection(enabled) {
-            log::warn!("{error:#}");
-        }
+        // Known people and recordings in progress follow the same protection;
+        // retained audio is migrated with the history files.
+        self.calls_set_protection(enabled);
         self.history.protection = None;
         self.history.storage.encryption_working = true;
         Ok(())

@@ -92,6 +92,7 @@ impl App {
         if !self.ready
             || self.loading
             || self.busy
+            || self.calls_file_job_running()
             || self.recording.is_some()
             || self.call.is_some()
             || self.downloading.is_some()

@@ -11,14 +11,71 @@
 //! could recognize the same voice in another recording.
 //!
 //! Stored in `people.json`, sealed for the current Windows account when
-//! encryption at rest is on. Not included in backups.
+//! encryption at rest is on. Not included in backups. A damaged list is set
+//! aside as `people.corrupt-<time>.json`, and an interrupted save can leave a
+//! `.people.json.<n>.partial`; protection changes convert the set-aside
+//! copies too, and forgetting everyone removes them.
 use crate::{discord::avatar::Avatar, discord_attribution::NamedSpeaker, history::protect};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const MAX_PEOPLE: usize = 500;
 const VERSION: u32 = 1;
+/// Larger files are not a people list this version wrote.
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The outcome of converting the people files to the current protection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Migration {
+    pub changed: usize,
+    pub failed: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Copy {
+    /// A damaged list moved aside.
+    SetAside,
+    /// What an interrupted atomic save left.
+    Temporary,
+}
+
+/// Other files holding the list at `path`, or part of it.
+fn copies(path: &Path) -> Vec<(PathBuf, Copy)> {
+    let (Some(folder), Some(name), Some(stem)) = (
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
+        path.file_stem().and_then(|stem| stem.to_str()),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    let set_aside = format!("{stem}.corrupt-");
+    let temporary = format!(".{name}.");
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let file = entry.file_name().to_str()?.to_owned();
+            let kind = if file.starts_with(&set_aside) && file.ends_with(".json") {
+                Copy::SetAside
+            } else if file.starts_with(&temporary) && file.ends_with(".partial") {
+                Copy::Temporary
+            } else {
+                return None;
+            };
+            Some((entry.path(), kind))
+        })
+        .collect()
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscordLink {
@@ -82,6 +139,8 @@ impl Directory {
     }
 
     /// Load `path`, tolerating a missing file. A damaged file is moved aside.
+    /// A list stored in the other protection is due to be rewritten; see
+    /// `migrate`.
     pub fn load(path: PathBuf, protect: bool) -> Self {
         let mut directory = Self {
             path: Some(path.clone()),
@@ -91,12 +150,16 @@ impl Directory {
             blocked: None,
         };
         match std::fs::read(&path) {
-            Ok(bytes) => match protect::open(bytes)
-                .and_then(|plain| Ok(serde_json::from_slice::<Stored>(&plain)?))
-            {
-                Ok(stored) if stored.version <= VERSION => {
+            Ok(bytes) => match {
+                let sealed = protect::is_sealed(&bytes);
+                protect::open(bytes)
+                    .and_then(|plain| Ok((sealed, serde_json::from_slice::<Stored>(&plain)?)))
+            } {
+                Ok((sealed, stored)) if stored.version <= VERSION => {
                     directory.people = stored.people;
                     directory.people.truncate(MAX_PEOPLE);
+                    // The setting counts, not whatever form the file is in.
+                    directory.dirty = sealed != protect;
                 }
                 Ok(_) => {
                     directory.blocked =
@@ -150,16 +213,57 @@ impl Directory {
         Ok(())
     }
 
-    /// Rewrite the file in the requested form.
-    pub fn set_protection(&mut self, protect: bool) -> Result<()> {
-        if self.protect == protect {
-            return Ok(());
+    /// Use `protect` for later saves. `migrate` converts what is stored.
+    pub fn set_protect(&mut self, protect: bool) {
+        if self.protect != protect {
+            self.protect = protect;
+            self.dirty |= !self.people.is_empty();
         }
-        self.protect = protect;
-        if self.path.as_ref().is_some_and(|path| path.exists()) || !self.people.is_empty() {
-            self.save()?;
+    }
+
+    /// Bring every stored copy to the current protection, judged from the
+    /// files themselves: the list, copies set aside as damaged, and
+    /// temporaries an interrupted save left (removed). Safe to repeat.
+    pub fn migrate(&mut self) -> Migration {
+        let mut migration = Migration::default();
+        let Some(path) = self.path.clone() else {
+            return migration;
+        };
+        let mut count = |result: Result<bool>| match result {
+            Ok(true) => migration.changed += 1,
+            Ok(false) => {}
+            Err(_) => migration.failed += 1,
+        };
+        let stored = match std::fs::read(&path) {
+            Ok(bytes) => Some(protect::is_sealed(&bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                count(Err(error.into()));
+                Some(self.protect)
+            }
+        };
+        let protect_list = self.protect;
+        match stored {
+            // A list this version cannot read is converted as it is.
+            Some(sealed) if self.blocked.is_some() => {
+                if sealed != protect_list {
+                    count(protect::migrate_file(&path, protect_list, MAX_FILE_BYTES));
+                }
+            }
+            Some(sealed) if sealed != protect_list || self.dirty => {
+                count(self.save().map(|()| true));
+            }
+            None if self.dirty && self.blocked.is_none() => count(self.save().map(|()| true)),
+            _ => {}
         }
-        Ok(())
+        for (copy, kind) in copies(&path) {
+            count(match kind {
+                Copy::SetAside => protect::migrate_file(&copy, protect_list, MAX_FILE_BYTES),
+                // Saves finish before returning, so none of these is in use.
+                Copy::Temporary => remove_if_present(&copy).map(|()| false).map_err(Into::into),
+            });
+        }
+        migration
     }
 
     fn touch(&mut self) {
@@ -369,6 +473,21 @@ impl Directory {
         self.people.clear();
         self.touch();
     }
+
+    /// Forget everyone: save an empty list, replacing even a file that could
+    /// not be read, and remove damaged copies and leftovers of the list.
+    pub fn forget_everyone(&mut self) -> Result<()> {
+        self.clear();
+        self.blocked = None;
+        self.save()?;
+        if let Some(path) = &self.path {
+            for (copy, _) in copies(path) {
+                remove_if_present(&copy)
+                    .with_context(|| format!("Could not remove {}", copy.display()))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The Discord user ID of an attributed speaker: live rows carry it; saved
@@ -475,7 +594,13 @@ mod tests {
         let mut reloaded = at(&dir, true);
         assert_eq!(reloaded.list().len(), 2);
         assert!(reloaded.remove(&id));
-        reloaded.set_protection(false).unwrap();
+        assert_eq!(
+            protect_as(&mut reloaded, false),
+            Migration {
+                changed: 1,
+                failed: 0
+            }
+        );
         assert!(
             String::from_utf8_lossy(&std::fs::read(dir.join("people.json")).unwrap())
                 .contains("Morgan")
@@ -493,6 +618,80 @@ mod tests {
         let people = at(&dir, false);
         assert!(people.list().is_empty() && people.error().is_none());
         assert!(!dir.join("people.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What an encryption change does: `set_protect`, then `migrate`.
+    fn protect_as(people: &mut Directory, protect: bool) -> Migration {
+        people.set_protect(protect);
+        people.migrate()
+    }
+
+    fn sealed(path: &Path) -> bool {
+        protect::is_sealed(&std::fs::read(path).unwrap())
+    }
+
+    #[test]
+    fn startup_and_repeated_requests_fix_a_list_in_the_wrong_protection() {
+        let dir = folder("mismatch");
+        let file = dir.join("people.json");
+        let mut people = at(&dir, false);
+        people.remember_name("Morgan");
+        people.save().unwrap();
+        // Encryption is on, but the file was left in plaintext (say a
+        // rewrite failed before the app closed).
+        let mut people = at(&dir, true);
+        assert!(people.dirty(), "the plaintext list is due to be rewritten");
+        assert!(!sealed(&file));
+        // Asking again for the current protection does not return early.
+        assert_eq!(
+            protect_as(&mut people, true),
+            Migration {
+                changed: 1,
+                failed: 0
+            }
+        );
+        assert!(sealed(&file) && !people.dirty());
+        assert_eq!(people.migrate(), Migration::default());
+        // A list this version cannot read is still converted as it is.
+        let newer = br#"{"version":99,"people":[]}"#;
+        std::fs::write(&file, newer).unwrap();
+        let mut blocked = at(&dir, true);
+        assert!(blocked.error().is_some());
+        assert_eq!(blocked.migrate().changed, 1);
+        assert!(sealed(&file));
+        assert_eq!(protect::open(std::fs::read(&file).unwrap()).unwrap(), newer);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn set_aside_and_leftover_copies_follow_protection_and_forgetting() {
+        let dir = folder("copies");
+        let file = dir.join("people.json");
+        std::fs::write(&file, b"{damaged Morgan").unwrap();
+        let mut people = at(&dir, false);
+        let aside = copies(&file);
+        assert_eq!(aside.len(), 1);
+        assert_eq!(aside[0].1, Copy::SetAside);
+        let leftover = dir.join(".people.json.77-3.partial");
+        std::fs::write(&leftover, br#"{"people":[{"name":"Casey"}]}"#).unwrap();
+        std::fs::write(dir.join("settings.corrupt-1.json"), b"unrelated").unwrap();
+        people.remember_name("Sam");
+        let migration = protect_as(&mut people, true);
+        assert_eq!(migration.failed, 0);
+        assert!(sealed(&aside[0].0), "the damaged copy is sealed too");
+        assert!(
+            !leftover.exists(),
+            "an interrupted save's leftover is removed"
+        );
+        assert!(sealed(&file));
+        // Forgetting everyone leaves no copy of anyone behind.
+        std::fs::write(&leftover, b"Casey").unwrap();
+        people.forget_everyone().unwrap();
+        assert!(people.list().is_empty());
+        assert!(copies(&file).is_empty());
+        assert!(dir.join("settings.corrupt-1.json").exists());
+        assert!(at(&dir, true).list().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

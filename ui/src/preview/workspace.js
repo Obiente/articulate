@@ -60,16 +60,30 @@ function labelRows(record) {
   });
 }
 
+// Stand-ins for the controller's transcript revision and version identity.
+function textRevision(text = "") {
+  let hash = 5381;
+  for (let index = 0; index < text.length; index++)
+    hash = (hash * 33 + text.charCodeAt(index)) >>> 0;
+  return hash.toString(16);
+}
+const versionId = (version) =>
+  `${version.replaced_ms}-${textRevision(version.text)}`;
+
 function presented(record) {
   if (!record) return record;
+  const versions = record.transcript_versions ?? [];
   return {
     ...record,
     rows: labelRows(record),
     speaker_undo: record.speaker_history?.at(-1)?.summary ?? null,
     interruptions: record.interruptions ?? [],
-    transcript_versions: (record.transcript_versions ?? []).map(
-      (version, index) => ({ ...version, index }),
-    ),
+    transcript_versions: versions.map((version, index) => ({
+      ...version,
+      id: versionId(version),
+      index,
+    })),
+    transcript_revision: versions.length ? textRevision(record.text) : null,
     audio: record.audio ?? null,
   };
 }
@@ -764,7 +778,9 @@ export function createPreviewWorkspace(storage) {
     person_delete(action) {
       sample.people = sample.people.filter((p) => p.id !== action.id);
     },
-    people_clear() {
+    people_clear(action) {
+      if (action.confirm?.count !== sample.people.length)
+        throw Error("The list of people changed. Review it and confirm again.");
       sample.people = [];
     },
     audio_import_choose() {
@@ -883,23 +899,38 @@ export function createPreviewWorkspace(storage) {
     },
     audio_delete(action) {
       const document = record(action.id);
+      if (!document?.audio) throw Error("This recording has no kept audio.");
+      if (
+        action.confirm?.id !== action.id ||
+        action.confirm?.bytes !== document.audio.bytes
+      )
+        throw Error("The kept audio changed. Confirm deleting it again.");
       if (sample.playback.session_id === action.id) stopPlayback();
-      if (document) document.audio = null;
+      document.audio = null;
     },
     transcript_rebuild() {
       throw Error("Re-transcription runs in the desktop app.");
     },
     transcript_restore(action) {
       const document = record(action.id);
-      const version = document?.transcript_versions?.[action.index];
-      if (!version) throw Error("That version is no longer available.");
-      document.transcript_versions.splice(action.index, 1, {
+      if (!document || textRevision(document.text) !== action.expected)
+        throw Error(
+          "The transcript changed. Review the earlier transcripts again.",
+        );
+      const versions = document.transcript_versions ?? [];
+      const index = versions.findIndex(
+        (version) => versionId(version) === action.version,
+      );
+      if (index < 0) throw Error("That version is no longer available.");
+      const [version] = versions.splice(index, 1);
+      versions.push({
         replaced_ms: Date.now(),
         model: "",
         text: document.text,
         rows: document.rows,
         preview: document.text.slice(0, 160),
       });
+      document.transcript_versions = versions;
       document.text = version.text;
       document.rows = version.rows;
     },

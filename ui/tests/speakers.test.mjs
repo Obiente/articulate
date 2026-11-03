@@ -143,3 +143,62 @@ test("the preview workspace corrects speakers and undoes changes", async () => {
   );
   await assert.rejects(workspace.action({ type: "speaker_undo", id }));
 });
+
+test("destructive conversation actions repeat what their confirmation showed", async () => {
+  const { prepareAction } = await import("../src/actions.js");
+  assert.throws(() => prepareAction({ type: "audio_delete", id: "a" }));
+  assert.throws(() =>
+    prepareAction({
+      type: "audio_delete",
+      id: "a",
+      confirm: { id: "b", bytes: 10 },
+    }),
+  );
+  prepareAction({
+    type: "audio_delete",
+    id: "a",
+    confirm: { id: "a", bytes: 10 },
+  });
+  assert.throws(() => prepareAction({ type: "people_clear" }));
+  prepareAction({ type: "people_clear", confirm: { count: 0 } });
+  assert.throws(() =>
+    prepareAction({ type: "transcript_restore", id: "a", index: 0 }),
+  );
+  prepareAction({
+    type: "transcript_restore",
+    id: "a",
+    version: "v",
+    expected: "r",
+  });
+
+  const { createPreviewWorkspace } = await import(
+    "../src/preview/workspace.js"
+  );
+  const storage = new Map();
+  const workspace = createPreviewWorkspace({
+    getItem: (key) => storage.get(key) ?? null,
+    setItem: (key, value) => storage.set(key, value),
+  });
+  const id = "sample-call-1";
+  await workspace.action({ type: "history_open", id });
+  const audio = workspace.snapshot().selected.audio;
+  await assert.rejects(
+    workspace.action({
+      type: "audio_delete",
+      id,
+      confirm: { id, bytes: audio.bytes + 1 },
+    }),
+  );
+  await workspace.action({
+    type: "audio_delete",
+    id,
+    confirm: { id, bytes: audio.bytes },
+  });
+  assert.equal(workspace.snapshot().selected.audio, null);
+  const count = workspace.snapshot().people.length;
+  await assert.rejects(
+    workspace.action({ type: "people_clear", confirm: { count: count + 1 } }),
+  );
+  await workspace.action({ type: "people_clear", confirm: { count } });
+  assert.equal(workspace.snapshot().people.length, 0);
+});

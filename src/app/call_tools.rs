@@ -4,11 +4,14 @@
 use super::*;
 use crate::{
     audio_store, file_pipeline,
-    history::{Kind, Session, TranscriptVersion},
+    history::{Kind, MigrationReport, Session, TranscriptVersion},
     people, playback,
-    speaker_edits::{self, Edit, LiveRule, Target},
+    speaker_edits::{self, Edit, LiveRule, RowBefore, Target},
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 /// A file offered for import by the open dialog or a drop on the window,
 /// handed from the IPC or window thread to the controller.
@@ -97,16 +100,35 @@ pub(super) enum FileJob {
         path: PathBuf,
         kind: ImportKind,
         session: Box<Session>,
-        /// Where to keep the audio, when the user chose to.
-        keep: Option<(PathBuf, bool)>,
+        /// Keeps the audio when the user chose to. It is published only when
+        /// the import succeeds; the controller holds it too, so it follows
+        /// encryption changes made while the import runs.
+        recorder: Option<Arc<audio_store::Recorder>>,
         cpu: bool,
+        /// The saved transcription language; see `call_language`.
+        language: Option<String>,
     },
     Rebuild {
         session: Box<Session>,
         audio: PathBuf,
-        model: String,
         cpu: bool,
+        language: Option<String>,
     },
+}
+
+/// How a file job treats the saved transcription language. Conversations,
+/// like live calls and spoken notes, detect the language of each utterance
+/// and use the saved language only to break ties (`Some`); a dictation keeps
+/// the language it is set to (`None`).
+fn call_language(job: &FileJob) -> Option<Option<String>> {
+    match job {
+        FileJob::Import { kind, language, .. } => {
+            (*kind == ImportKind::Call).then(|| language.clone())
+        }
+        FileJob::Rebuild {
+            session, language, ..
+        } => (session.kind != Kind::Dictation).then(|| language.clone()),
+    }
 }
 
 pub(super) enum FileEvent {
@@ -122,6 +144,8 @@ pub(super) struct ImportState {
     pub working: bool,
     /// Which session a running re-transcription belongs to.
     pub rebuilding: Option<String>,
+    /// What that re-transcription read: the transcript revision and the model.
+    pub rebuild_from: Option<(String, String)>,
     pub file_name: Option<String>,
     pub progress: Option<f32>,
     pub stage: &'static str,
@@ -130,6 +154,8 @@ pub(super) struct ImportState {
     /// The saved session of the most recent import, to open it.
     pub session_id: Option<String>,
     pub cancel: Option<CancelToken>,
+    /// The running import's retained audio.
+    pub recorder: Option<Arc<audio_store::Recorder>>,
 }
 
 pub(super) struct State {
@@ -144,6 +170,11 @@ pub(super) struct State {
     /// The next capture's choice to keep audio, from call setup.
     pub keep_audio: Option<bool>,
     people_saved: Option<Instant>,
+    /// An encryption change's result, held until recordings in progress
+    /// have converted the audio they already wrote.
+    protection_report: Option<Result<MigrationReport, String>>,
+    /// Recordings that finished without converting all their audio.
+    protection_failures: usize,
 }
 
 impl Default for State {
@@ -158,6 +189,8 @@ impl Default for State {
             playback_error: None,
             keep_audio: None,
             people_saved: None,
+            protection_report: None,
+            protection_failures: 0,
         }
     }
 }
@@ -175,6 +208,11 @@ impl State {
         self.history_dir
             .as_ref()
             .map(|directory| audio_store::path(directory, id))
+    }
+
+    /// Recorders writing audio now.
+    fn recorders(&self) -> impl Iterator<Item = &Arc<audio_store::Recorder>> {
+        self.recorder.iter().chain(self.import.recorder.iter())
     }
 }
 
@@ -213,8 +251,91 @@ fn file_title(path: &std::path::Path) -> String {
     }
 }
 
+fn digest(hash: impl FnOnce(&mut std::hash::DefaultHasher)) -> String {
+    use std::hash::Hasher;
+    let mut hasher = std::hash::DefaultHasher::new();
+    hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Identifies the current transcript of a session: its text, original,
+/// speaker names and rows. Changes whenever any of them does.
+pub(crate) fn transcript_revision(session: &Session) -> String {
+    use std::hash::Hash;
+    digest(|hasher| {
+        session.text.hash(hasher);
+        session.original.hash(hasher);
+        session.speaker_names.hash(hasher);
+        session.rows.len().hash(hasher);
+        for row in &session.rows {
+            (
+                row.start_ms,
+                row.end_ms,
+                row.microphone,
+                &row.speakers,
+                &row.text,
+            )
+                .hash(hasher);
+            for speaker in row.discord.iter().flat_map(|named| &named.speakers) {
+                speaker.name.hash(hasher);
+            }
+        }
+    })
+}
+
+/// A stable identity for an earlier transcript, unlike its position, which
+/// changes when a version is restored or another is added.
+pub(crate) fn version_id(version: &TranscriptVersion) -> String {
+    use std::hash::Hash;
+    digest(|hasher| {
+        (
+            version.replaced_ms,
+            &version.model,
+            &version.text,
+            &version.original,
+            &version.speaker_names,
+            version.rows.len(),
+        )
+            .hash(hasher);
+    })
+}
+
+/// Keep `recorder`'s audio only if `work` succeeds. Cancellation, a failed
+/// decode and a failed final transcription all remove the recording, so no
+/// audio outlives an import that saves nothing.
+fn keeping<T>(
+    recorder: Option<&audio_store::Recorder>,
+    work: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<(T, Option<audio_store::Info>)> {
+    let value = match work() {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(recorder) = recorder {
+                recorder.discard();
+            }
+            return Err(error);
+        }
+    };
+    let info = recorder.map(audio_store::Recorder::finish).transpose()?;
+    Ok((value, info))
+}
+
 /// Run a file job on the speech worker. Progress is reported through `update`.
 pub(super) fn run_file_job(
+    engine: &mut Engine,
+    job: FileJob,
+    cancel: &CancelToken,
+    update: &mut dyn FnMut(FileEvent),
+) -> anyhow::Result<Box<Session>> {
+    match call_language(&job) {
+        Some(language) => engine.with_call_preference(language, |engine| {
+            run_file_job_with(engine, job, cancel, update)
+        }),
+        None => run_file_job_with(engine, job, cancel, update),
+    }
+}
+
+fn run_file_job_with(
     engine: &mut Engine,
     job: FileJob,
     cancel: &CancelToken,
@@ -225,83 +346,72 @@ pub(super) fn run_file_job(
             path,
             kind,
             mut session,
-            keep,
+            recorder,
             cpu,
+            language: _,
         } => {
-            let stop = std::sync::atomic::AtomicBool::new(false);
-            let recorder = match &keep {
-                Some((audio, protect)) => Some(audio_store::Recorder::start(
-                    audio.clone(),
-                    vec!["recording".into()],
-                    *protect,
-                )?),
-                None => None,
-            };
-            let mut dictation = file_pipeline::Dictation::new(true);
-            let (tracker, _) = if kind == ImportKind::Call {
-                update(FileEvent::Progress(0.0, "Loading speaker identification"));
-                file_pipeline::Call::speakers(cpu)
-            } else {
-                (None, None)
-            };
-            let mut call = file_pipeline::Call::new(tracker);
-            let mut rows = Vec::new();
-            let mut decoded = 0usize;
-            let fraction = std::cell::Cell::new(0.0f32);
-            update(FileEvent::Progress(0.0, "Transcribing"));
-            let result = crate::media::stream_file(
-                &path,
-                crate::media::Layout::Mono,
-                &stop,
-                |progress| fraction.set(progress),
-                |chunk| {
-                    anyhow::ensure!(!cancel.is_cancelled(), "Import cancelled");
-                    let pcm = chunk.into_iter().next().unwrap_or_default();
-                    decoded += pcm.len();
-                    if let Some(recorder) = &recorder {
-                        recorder.push(0, pcm.clone());
-                    }
-                    match kind {
-                        ImportKind::Call => {
-                            calls::append_rows(&mut rows, call.push(engine, &[], &pcm)?);
+            // Probing and decoding stop with the job, not only between chunks.
+            let token = cancel.clone();
+            let stop: crate::media::Cancel = Arc::new(move || token.is_cancelled());
+            let recorder = recorder.as_deref();
+            let ((), audio) = keeping(recorder, || {
+                let mut dictation = file_pipeline::Dictation::new(true);
+                let (tracker, _) = if kind == ImportKind::Call {
+                    update(FileEvent::Progress(0.0, "Loading speaker identification"));
+                    file_pipeline::Call::speakers(cpu)
+                } else {
+                    (None, None)
+                };
+                let mut call = file_pipeline::Call::new(tracker);
+                let mut rows = Vec::new();
+                let mut decoded = 0usize;
+                let fraction = std::cell::Cell::new(0.0f32);
+                update(FileEvent::Progress(0.0, "Transcribing"));
+                crate::media::stream_file(
+                    &path,
+                    crate::media::Layout::Mono,
+                    &stop,
+                    |progress| fraction.set(progress),
+                    |chunk| {
+                        anyhow::ensure!(!cancel.is_cancelled(), "Import cancelled");
+                        let pcm = chunk.into_iter().next().unwrap_or_default();
+                        decoded += pcm.len();
+                        if let Some(recorder) = recorder {
+                            recorder.push(0, pcm.clone());
                         }
-                        ImportKind::Dictation => dictation.push(engine, &pcm)?,
+                        match kind {
+                            ImportKind::Call => {
+                                calls::append_rows(&mut rows, call.push(engine, &[], &pcm)?);
+                            }
+                            ImportKind::Dictation => dictation.push(engine, &pcm)?,
+                        }
+                        update(FileEvent::Progress(
+                            fraction.get().min(0.99),
+                            "Transcribing",
+                        ));
+                        Ok(())
+                    },
+                )?;
+                update(FileEvent::Progress(0.99, "Finishing"));
+                let duration_ms = decoded as u64 / 16;
+                match kind {
+                    ImportKind::Call => {
+                        calls::append_rows(&mut rows, call.finish(engine)?);
+                        session.rows = rows;
+                        session.text = calls::text(&session.rows, &session.speaker_names);
                     }
-                    update(FileEvent::Progress(
-                        fraction.get().min(0.99),
-                        "Transcribing",
-                    ));
-                    Ok(())
-                },
-            );
-            if let Err(error) = result {
-                if let Some(recorder) = recorder {
-                    let _ = recorder.finish();
+                    ImportKind::Dictation => {
+                        session.text = dictation.finish(engine)?;
+                        session.original.clone_from(&session.text);
+                        session.metrics.audio_duration_ms = Some(duration_ms);
+                        session.metrics.recognized_words =
+                            Some(session.text.split_whitespace().count() as u64);
+                    }
                 }
-                if let Some((audio, _)) = &keep {
-                    let _ = std::fs::remove_file(audio);
-                }
-                return Err(error);
-            }
-            update(FileEvent::Progress(0.99, "Finishing"));
-            let duration_ms = decoded as u64 / 16;
-            match kind {
-                ImportKind::Call => {
-                    calls::append_rows(&mut rows, call.finish(engine)?);
-                    session.rows = rows;
-                    session.text = calls::text(&session.rows, &session.speaker_names);
-                }
-                ImportKind::Dictation => {
-                    session.text = dictation.finish(engine)?;
-                    session.original.clone_from(&session.text);
-                    session.metrics.audio_duration_ms = Some(duration_ms);
-                    session.metrics.recognized_words =
-                        Some(session.text.split_whitespace().count() as u64);
-                }
-            }
-            if let Some(recorder) = recorder {
-                session.audio = Some(recorder.finish()?);
-            }
+                anyhow::ensure!(!cancel.is_cancelled(), "Import cancelled");
+                Ok(())
+            })?;
+            session.audio = audio;
             session.title = file_title(&path);
             session.title_is_manual = true;
             Ok(session)
@@ -309,15 +419,16 @@ pub(super) fn run_file_job(
         FileJob::Rebuild {
             mut session,
             audio,
-            model,
             cpu,
+            language: _,
         } => {
+            // Only the transcript is rebuilt here; `merge_rebuilt` installs
+            // it into the latest copy of the session.
             let info = session
                 .audio
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("This recording has no retained audio"))?;
             let duration = info.duration_ms.max(1);
-            let previous = TranscriptVersion::of(&session, &model);
             let microphone_channel = info.channels.iter().position(|c| c == "microphone");
             let remote_channel = info.channels.iter().position(|c| c != "microphone").or(
                 if microphone_channel.is_none() {
@@ -353,10 +464,6 @@ pub(super) fn run_file_job(
                     session.rows = rows;
                     session.speaker_names = calls::empty_speaker_names();
                     session.text = calls::text(&session.rows, &session.speaker_names);
-                    session.notes = session
-                        .notes
-                        .as_ref()
-                        .map(|_| crate::notes::Notes::build(&session.rows));
                 }
                 _ => {
                     let mut dictation = file_pipeline::Dictation::new(true);
@@ -380,17 +487,105 @@ pub(super) fn run_file_job(
                     session.original.clone_from(&session.text);
                 }
             }
-            // Corrections referred to the replaced rows.
-            session.speaker_edits.clear();
-            session.transcript_versions.push(previous);
-            let excess = session
-                .transcript_versions
-                .len()
-                .saturating_sub(crate::history::MAX_TRANSCRIPT_VERSIONS);
-            session.transcript_versions.drain(..excess);
             Ok(session)
         }
     }
+}
+
+/// Install the transcript of `rebuilt` into `latest`, the newest copy of the
+/// same session. Only transcript fields change; the title, notes, personal
+/// notes and filing in `latest` stay. If the transcript changed after the
+/// re-transcription read it (`started_from` is no longer its revision), it
+/// is kept, and the rebuilt transcript becomes an earlier version instead.
+/// Returns whether the rebuilt transcript is now the current one.
+pub(super) fn merge_rebuilt(
+    latest: &mut Session,
+    rebuilt: &Session,
+    started_from: &str,
+    model: &str,
+) -> bool {
+    let current = transcript_revision(latest) == started_from;
+    let replaced = if current {
+        TranscriptVersion::of(latest, model)
+    } else {
+        TranscriptVersion::of(rebuilt, model)
+    };
+    latest.transcript_versions.push(replaced);
+    let excess = latest
+        .transcript_versions
+        .len()
+        .saturating_sub(crate::history::MAX_TRANSCRIPT_VERSIONS);
+    latest.transcript_versions.drain(..excess);
+    if current {
+        latest.text.clone_from(&rebuilt.text);
+        latest.original.clone_from(&rebuilt.original);
+        latest.rows.clone_from(&rebuilt.rows);
+        latest.speaker_names.clone_from(&rebuilt.speaker_names);
+        // Corrections referred to the replaced rows.
+        latest.speaker_edits.clear();
+        latest.notes = latest
+            .notes
+            .as_ref()
+            .map(|_| crate::notes::Notes::build(&latest.rows));
+        if latest.kind == Kind::Call {
+            speaker_edits::refresh_derived(latest);
+        }
+    }
+    current
+}
+
+/// How a committed live row came to have its speaker, by start time.
+enum Mark<'a> {
+    /// A correction changed it; it never absorbs later speech.
+    Edited,
+    /// A live rule re-attributed it on arrival, with this provenance.
+    Arrived(&'a str),
+}
+
+fn live_marks(edits: &[Edit]) -> HashMap<u64, Mark<'_>> {
+    let mut marks = HashMap::new();
+    for before in edits.iter().flat_map(|edit| &edit.rows) {
+        match &before.arrival {
+            Some(tag) => {
+                marks.entry(before.start_ms).or_insert(Mark::Arrived(tag));
+            }
+            None => {
+                marks.insert(before.start_ms, Mark::Edited);
+            }
+        }
+    }
+    marks
+}
+
+/// Append live rows so a turn only continues a turn of the same provenance:
+/// a row a correction changed keeps its boundary, so undo never hands later
+/// speech to the old speaker, and rows a live rule re-attributed only
+/// continue rows re-attributed the same way. `arriving` holds the provenance
+/// of incoming re-attributed rows by start time.
+fn append_live(
+    transcript: &mut Vec<calls::Row>,
+    rows: Vec<calls::Row>,
+    edits: &[Edit],
+    arriving: &HashMap<u64, String>,
+) {
+    let marks = live_marks(edits);
+    calls::append_rows_where(transcript, rows, |last, row| {
+        let incoming = arriving.get(&row.start_ms).map(String::as_str);
+        match marks.get(&last.start_ms) {
+            Some(Mark::Edited) => false,
+            Some(Mark::Arrived(tag)) => incoming == Some(*tag),
+            None => incoming == arriving.get(&last.start_ms).map(String::as_str),
+        }
+    });
+}
+
+/// A row a live rule re-attributed as it arrived.
+struct Arrival {
+    start_ms: u64,
+    /// The rules that changed it and the speaker it arrived with.
+    tag: String,
+    /// Per rule, the row's identity just before that rule.
+    inverses: Vec<(u64, RowBefore)>,
 }
 
 impl App {
@@ -435,11 +630,12 @@ impl App {
         Ok(())
     }
 
-    /// Prepare rows arriving from capture: chosen participant names and the
-    /// corrections made during this call.
-    pub(super) fn calls_prepare_rows(&mut self, rows: &mut [calls::Row]) {
+    /// Rows arriving from capture get the chosen participant names and the
+    /// corrections made during this call. Returns the rows a live rule
+    /// re-attributed.
+    fn calls_prepare(&mut self, rows: &mut [calls::Row]) -> Vec<Arrival> {
         if self.is_note_capture() {
-            return;
+            return Vec::new();
         }
         for speaker in rows
             .iter()
@@ -449,7 +645,94 @@ impl App {
             self.call_tools.people.observe(speaker);
         }
         self.call_tools.people.apply(rows);
-        speaker_edits::apply_rules(rows, &self.call_tools.live_rules, &self.speaker_names);
+        let mut arrivals = Vec::new();
+        for row in rows {
+            let arrived_as = speaker_edits::row_keys(row).join("+");
+            let inverses = speaker_edits::apply_rules_traced(
+                row,
+                &self.call_tools.live_rules,
+                &self.speaker_names,
+            );
+            if inverses.is_empty() {
+                continue;
+            }
+            let rules: Vec<String> = inverses.iter().map(|(id, _)| id.to_string()).collect();
+            arrivals.push(Arrival {
+                start_ms: row.start_ms,
+                tag: format!("{}|{arrived_as}", rules.join(",")),
+                inverses,
+            });
+        }
+        arrivals
+    }
+
+    /// Commit rows from capture to the live transcript. Rows a live rule
+    /// re-attributed are added to the inverse of that rule's correction, so
+    /// undoing it restores them too.
+    pub(super) fn calls_commit_rows(&mut self, mut rows: Vec<calls::Row>) {
+        if self.is_note_capture() {
+            // Keep source identities and timestamps immutable so live note
+            // updates can reuse earlier model sections.
+            self.call_committed.extend(rows);
+            return;
+        }
+        let arrivals = self.calls_prepare(&mut rows);
+        let tags: HashMap<u64, String> = arrivals
+            .iter()
+            .map(|arrival| (arrival.start_ms, arrival.tag.clone()))
+            .collect();
+        let edits = self
+            .history
+            .call
+            .as_ref()
+            .map_or(&[][..], |session| session.speaker_edits.as_slice());
+        append_live(&mut self.call_committed, rows, edits, &tags);
+        let Some(session) = &mut self.history.call else {
+            return;
+        };
+        for arrival in arrivals {
+            // A row that continued one of the same provenance is covered by it.
+            let Some(index) = self
+                .call_committed
+                .iter()
+                .rposition(|row| row.start_ms == arrival.start_ms)
+            else {
+                continue;
+            };
+            for (rule, before) in arrival.inverses {
+                if let Some(edit) = session
+                    .speaker_edits
+                    .iter_mut()
+                    .find(|edit| edit.rule.as_ref().is_some_and(|live| live.id == rule))
+                {
+                    edit.rows.push(RowBefore {
+                        index,
+                        arrival: Some(arrival.tag.clone()),
+                        ..before
+                    });
+                }
+            }
+        }
+    }
+
+    /// Show provisional rows from capture after the committed transcript.
+    pub(super) fn calls_preview_rows(&mut self, mut rows: Vec<calls::Row>) {
+        let arrivals = self.calls_prepare(&mut rows);
+        self.call_rows.clone_from(&self.call_committed);
+        if self.is_note_capture() {
+            calls::append_rows(&mut self.call_rows, rows);
+            return;
+        }
+        let tags: HashMap<u64, String> = arrivals
+            .into_iter()
+            .map(|arrival| (arrival.start_ms, arrival.tag))
+            .collect();
+        let edits = self
+            .history
+            .call
+            .as_ref()
+            .map_or(&[][..], |session| session.speaker_edits.as_slice());
+        append_live(&mut self.call_rows, rows, edits, &tags);
     }
 
     pub(super) fn calls_interruption(&mut self, gap: calls::Interruption) {
@@ -496,6 +779,14 @@ impl App {
         }
     }
 
+    /// Note a finished recorder whose audio kept part of an old protection.
+    fn calls_finished_recorder(&mut self, recorder: &audio_store::Recorder) {
+        if let audio_store::Protection::Failed(error) = recorder.protection() {
+            log::warn!("Could not convert kept audio: {error}");
+            self.call_tools.protection_failures += 1;
+        }
+    }
+
     /// Finish retained audio and open interruptions when capture ends.
     pub(super) fn calls_capture_finished(&mut self) {
         self.call_tools.live_rules.clear();
@@ -503,11 +794,11 @@ impl App {
             .call
             .as_ref()
             .map_or(0, |control| (control.end_seconds() * 1000.0) as u64);
-        let info = self
-            .call_tools
-            .recorder
-            .take()
-            .map(|recorder| recorder.finish());
+        let recorder = self.call_tools.recorder.take();
+        let info = recorder.as_ref().map(|recorder| recorder.finish());
+        if let Some(recorder) = &recorder {
+            self.calls_finished_recorder(recorder);
+        }
         if let Some(session) = &mut self.history.call {
             calls::interruptions::close(&mut session.interruptions, end_ms);
             match info {
@@ -526,6 +817,65 @@ impl App {
                 selected.interruptions.clone_from(&session.interruptions);
             }
         }
+    }
+
+    /// Encryption at rest is changing: later saves of known people and
+    /// recordings in progress, including what they already wrote, use the
+    /// new protection. Called before the history migration starts.
+    pub(super) fn calls_set_protection(&mut self, protect: bool) {
+        self.call_tools.people.set_protect(protect);
+        for recorder in self.call_tools.recorders() {
+            recorder.set_protection(protect);
+        }
+    }
+
+    /// The history migration finished (also once at startup). Known people
+    /// are converted, judged from their files, and the result is reported
+    /// only once recordings in progress have converted their audio too, with
+    /// every failure counted.
+    pub(super) fn calls_protection_changed(&mut self, result: Result<MigrationReport, String>) {
+        self.call_tools
+            .people
+            .set_protect(self.settings.encrypt_at_rest);
+        let people = self.call_tools.people.migrate();
+        if people.failed > 0 {
+            log::warn!("Could not convert {} known people files", people.failed);
+        }
+        self.call_tools.protection_report = Some(result.map(|mut report| {
+            report.changed += people.changed;
+            report.failed += people.failed;
+            report
+        }));
+        self.calls_release_protection();
+    }
+
+    fn calls_release_protection(&mut self) {
+        if self.call_tools.protection_report.is_none() {
+            return;
+        }
+        let mut failed = 0;
+        for recorder in self.call_tools.recorders() {
+            match recorder.protection() {
+                audio_store::Protection::Settled => {}
+                audio_store::Protection::Pending => return,
+                audio_store::Protection::Failed(error) => {
+                    log::warn!("Could not convert kept audio: {error}");
+                    failed += 1;
+                }
+            }
+        }
+        failed += std::mem::take(&mut self.call_tools.protection_failures);
+        let result = self
+            .call_tools
+            .protection_report
+            .take()
+            .expect("checked above")
+            .map(|mut report| {
+                report.failed += failed;
+                report
+            });
+        self.history.storage.encryption_working = false;
+        self.history.protection = Some(result);
     }
 
     /// Save known people now and then, and pick up offered files.
@@ -561,6 +911,13 @@ impl App {
             self.call_tools.playback_error = player.error();
             self.call_tools.player = None;
         }
+        self.calls_release_protection();
+    }
+
+    /// A file import or re-transcription is using the speech worker.
+    /// Capture must not start, and only its own cancel stops it.
+    pub(super) fn calls_file_job_running(&self) -> bool {
+        self.call_tools.import.working
     }
 
     pub(crate) fn calls_dragging(&self) -> bool {
@@ -593,7 +950,7 @@ impl App {
         }
         let mut rows = std::mem::take(&mut session.rows);
         let mut names = std::mem::take(&mut session.speaker_names);
-        let result = self.calls_apply(&mut rows, &mut names, &mut session.speaker_edits, op);
+        let result = self.calls_apply(&mut rows, &mut names, &mut session.speaker_edits, op, false);
         session.rows = rows;
         session.speaker_names = names;
         result?;
@@ -616,7 +973,7 @@ impl App {
             .unwrap_or_default();
         let mut rows = std::mem::take(&mut self.call_committed);
         let mut names = std::mem::take(&mut self.speaker_names);
-        let result = self.calls_apply(&mut rows, &mut names, &mut session_edits, op);
+        let result = self.calls_apply(&mut rows, &mut names, &mut session_edits, op, true);
         self.call_committed = rows;
         self.speaker_names = names;
         if let Some(session) = &mut self.history.call {
@@ -648,22 +1005,30 @@ impl App {
         Ok(())
     }
 
-    /// Apply one operation, recording or popping its undo entry.
+    /// Apply one operation, recording or popping its undo entry. Only an
+    /// edit of the call being recorded (`live`) adds or removes the rules
+    /// later turns of that call follow; corrections to any other
+    /// conversation never reach them.
     fn calls_apply(
         &mut self,
         rows: &mut [calls::Row],
         names: &mut Vec<String>,
         edits: &mut Vec<Edit>,
         op: SpeakerOp,
+        live: bool,
     ) -> Result<(), String> {
         let text = |error: anyhow::Error| error.to_string();
         let mut edit = match op {
             SpeakerOp::Undo => {
                 let edit = edits.pop().ok_or("There is nothing to undo.")?;
                 speaker_edits::undo(rows, names, &edit);
-                if let Some(rule) = &edit.rule
-                    && let Some(position) =
-                        self.call_tools.live_rules.iter().rposition(|r| r == rule)
+                if live
+                    && let Some(rule) = &edit.rule
+                    && let Some(position) = self
+                        .call_tools
+                        .live_rules
+                        .iter()
+                        .rposition(|live_rule| live_rule.id == rule.id)
                 {
                     self.call_tools.live_rules.remove(position);
                 }
@@ -717,9 +1082,7 @@ impl App {
                 speaker_edits::reassign(rows, names, &selection, &target).map_err(text)?
             }
         };
-        if self.call.is_some()
-            && let Some(rule) = edit.rule.clone()
-        {
+        if live && let Some(rule) = edit.rule.clone() {
             self.call_tools.live_rules.push(rule);
         } else {
             edit.rule = None;
@@ -756,30 +1119,41 @@ impl App {
             ImportKind::Call => Kind::Call,
             ImportKind::Dictation => Kind::Dictation,
         });
-        let keep = if keep_audio {
-            Some((
-                self.call_tools
-                    .audio_path(&session.id)
-                    .ok_or("Local history is unavailable.")?,
+        let recorder = if keep_audio {
+            let audio = self
+                .call_tools
+                .audio_path(&session.id)
+                .ok_or("Local history is unavailable.")?;
+            let recorder = audio_store::Recorder::start(
+                audio,
+                vec!["recording".into()],
                 self.settings.encrypt_at_rest,
-            ))
+            )
+            .map_err(|error| format!("{error:#}"))?;
+            Some(Arc::new(recorder))
         } else {
             None
         };
         session.title = file_title(&path);
         let cancel = CancelToken::new();
-        self.commands
-            .send(Command::File(
-                FileJob::Import {
-                    path,
-                    kind,
-                    session: Box::new(session),
-                    keep,
-                    cpu: self.settings.cpu,
-                },
-                cancel.clone(),
-            ))
-            .map_err(|_| "The speech worker stopped. Restart the app.")?;
+        let job = FileJob::Import {
+            path,
+            kind,
+            session: Box::new(session),
+            recorder: recorder.clone(),
+            cpu: self.settings.cpu,
+            language: self.calls_saved_language(),
+        };
+        if self
+            .commands
+            .send(Command::File(job, cancel.clone()))
+            .is_err()
+        {
+            if let Some(recorder) = &recorder {
+                recorder.discard();
+            }
+            return Err("The speech worker stopped. Restart the app.".into());
+        }
         let import = &mut self.call_tools.import;
         import.pending = None;
         import.working = true;
@@ -789,8 +1163,15 @@ impl App {
         import.message = "Importing…".into();
         import.cancel = Some(cancel);
         import.session_id = None;
+        import.recorder = recorder;
         self.busy = true;
         Ok(())
+    }
+
+    /// The saved transcription language, as live calls receive it.
+    fn calls_saved_language(&self) -> Option<String> {
+        (!self.settings.transcription_language.is_empty())
+            .then(|| self.settings.transcription_language.clone())
     }
 
     pub(crate) fn calls_import_dismiss(&mut self) {
@@ -839,13 +1220,14 @@ impl App {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let revision = transcript_revision(&session);
         self.commands
             .send(Command::File(
                 FileJob::Rebuild {
                     session: Box::new(session),
                     audio,
-                    model,
                     cpu: self.settings.cpu,
+                    language: self.calls_saved_language(),
                 },
                 cancel.clone(),
             ))
@@ -854,6 +1236,7 @@ impl App {
         import.working = true;
         import.failed = false;
         import.rebuilding = Some(id.to_owned());
+        import.rebuild_from = Some((revision, model));
         import.progress = Some(0.0);
         import.stage = "Preparing";
         import.message = "Re-transcribing…".into();
@@ -862,8 +1245,15 @@ impl App {
         Ok(())
     }
 
-    /// Swap the current transcript with a kept earlier version.
-    pub(crate) fn calls_restore_version(&mut self, id: &str, index: usize) -> Result<(), String> {
+    /// Swap the current transcript with a kept earlier version. `version`
+    /// is the version's `version_id`, and `expected` the `transcript_revision`
+    /// the renderer showed, so a repeated or stale request changes nothing.
+    pub(crate) fn calls_restore_version(
+        &mut self,
+        id: &str,
+        version: &str,
+        expected: &str,
+    ) -> Result<(), String> {
         let mut session = self
             .history
             .selected
@@ -877,9 +1267,14 @@ impl App {
         if self.call_tools.import.rebuilding.as_deref() == Some(id) {
             return Err("Wait for re-transcription to finish.".into());
         }
-        if index >= session.transcript_versions.len() {
-            return Err("That version is no longer available.".into());
+        if transcript_revision(&session) != expected {
+            return Err("The transcript changed. Review the earlier transcripts again.".into());
         }
+        let index = session
+            .transcript_versions
+            .iter()
+            .position(|kept| version_id(kept) == version)
+            .ok_or("That version is no longer available.")?;
         let restored = session.transcript_versions.remove(index);
         let current = TranscriptVersion::of(&session, "");
         session.text = restored.text;
@@ -901,8 +1296,14 @@ impl App {
         self.calls_store(session)
     }
 
-    /// Delete retained audio but keep the transcript.
-    pub(crate) fn calls_delete_audio(&mut self, id: &str) -> Result<(), String> {
+    /// Delete retained audio but keep the transcript. `confirm_id` and
+    /// `bytes` repeat the session and audio size the confirmation showed.
+    pub(crate) fn calls_delete_audio(
+        &mut self,
+        id: &str,
+        confirm_id: &str,
+        bytes: u64,
+    ) -> Result<(), String> {
         if self.calls_is_live(id) || self.call_tools.import.rebuilding.as_deref() == Some(id) {
             return Err("Wait for recording and transcription to finish.".into());
         }
@@ -913,18 +1314,22 @@ impl App {
             .filter(|session| session.id == id)
             .cloned()
             .ok_or("Open the recording first.")?;
+        let audio = session
+            .audio
+            .as_ref()
+            .ok_or("This recording has no kept audio.")?;
+        if confirm_id != id || audio.bytes != bytes {
+            return Err("The kept audio changed. Confirm deleting it again.".into());
+        }
         if let Some(player) = &mut self.call_tools.player
             && player.session_id == id
         {
             player.stop();
             self.call_tools.player = None;
         }
-        if let Some(path) = self.call_tools.audio_path(id) {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("Could not delete the audio: {error}")),
-            }
+        if let Some(directory) = &self.call_tools.history_dir {
+            audio_store::remove(directory, id)
+                .map_err(|error| format!("Could not delete the audio: {error}"))?;
         }
         session.audio = None;
         self.calls_store(session)
@@ -967,7 +1372,8 @@ impl App {
         }
     }
 
-    /// A finished file job: save the new or rebuilt session.
+    /// A finished file job: save the new session, or install a rebuilt
+    /// transcript into the latest copy of its session.
     pub(super) fn calls_file_event(&mut self, event: FileEvent) {
         match event {
             FileEvent::Progress(progress, stage) => {
@@ -976,25 +1382,40 @@ impl App {
             }
             FileEvent::Finished(result) => {
                 self.busy = false;
-                let rebuilding = self.call_tools.import.rebuilding.take();
                 let import = &mut self.call_tools.import;
+                let rebuilding = import.rebuilding.take();
+                let rebuild_from = import.rebuild_from.take();
+                let recorder = import.recorder.take();
                 import.working = false;
                 import.cancel = None;
                 import.progress = None;
-                match result {
-                    Ok(session) => {
+                let outcome = match result {
+                    Err(error) => Err(error),
+                    Ok(rebuilt) => match (rebuilding, rebuild_from) {
+                        (Some(id), Some((revision, model))) => self
+                            .calls_install_rebuilt(&id, *rebuilt, &revision, &model)
+                            .map(|message| (id, message)),
+                        _ => {
+                            let id = rebuilt.id.clone();
+                            self.calls_store(*rebuilt)
+                                .map(|()| (id, "Import finished".to_owned()))
+                        }
+                    },
+                };
+                if let Some(recorder) = &recorder {
+                    match &outcome {
+                        // Nothing was saved, so nothing of it is kept.
+                        Err(_) => recorder.discard(),
+                        Ok(_) => self.calls_finished_recorder(recorder),
+                    }
+                }
+                let import = &mut self.call_tools.import;
+                match outcome {
+                    Ok((id, message)) => {
                         import.failed = false;
-                        import.message = if rebuilding.is_some() {
-                            "Transcript rebuilt. The previous version is kept.".into()
-                        } else {
-                            "Import finished".into()
-                        };
-                        import.session_id = Some(session.id.clone());
-                        if let Err(error) = self.calls_store(*session) {
-                            let import = &mut self.call_tools.import;
-                            import.failed = true;
-                            import.message = error;
-                        } else if let Some(worker) = &self.history.worker {
+                        import.message = message;
+                        import.session_id = Some(id);
+                        if let Some(worker) = &self.history.worker {
                             worker.list();
                         }
                     }
@@ -1005,6 +1426,54 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Install a rebuilt transcript with `merge_rebuilt`: into the open or
+    /// current copy when there is one (they hold the newest edits and save
+    /// as usual), otherwise into the stored copy on the history worker,
+    /// after any saves already queued.
+    fn calls_install_rebuilt(
+        &mut self,
+        id: &str,
+        rebuilt: Session,
+        started_from: &str,
+        model: &str,
+    ) -> Result<String, String> {
+        let open = self
+            .history
+            .selected
+            .as_ref()
+            .filter(|session| session.id == id)
+            .or_else(|| {
+                self.history
+                    .call
+                    .as_ref()
+                    .filter(|session| session.id == id && self.call.is_none())
+            })
+            .cloned();
+        if let Some(mut latest) = open {
+            let current = merge_rebuilt(&mut latest, &rebuilt, started_from, model);
+            self.calls_store(latest)?;
+            return Ok(if current {
+                "Transcript rebuilt. The previous version is kept.".into()
+            } else {
+                "The transcript changed while it was re-transcribed, so it was kept. The new transcript is under Earlier transcripts.".into()
+            });
+        }
+        let worker = self
+            .history
+            .worker
+            .as_ref()
+            .ok_or("Local history is unavailable.")?;
+        let (started_from, model) = (started_from.to_owned(), model.to_owned());
+        worker.update(
+            id.to_owned(),
+            Box::new(move |latest| {
+                merge_rebuilt(latest, &rebuilt, &started_from, &model);
+                Ok(())
+            }),
+        );
+        Ok("Re-transcription finished. Earlier transcripts are kept.".into())
     }
 
     pub(crate) fn calls_people_save(&mut self, id: Option<&str>, name: &str) -> Result<(), String> {
@@ -1018,18 +1487,25 @@ impl App {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn calls_people_delete(&mut self, id: Option<&str>) -> Result<(), String> {
-        match id {
-            Some(id) => {
-                if !self.call_tools.people.remove(id) {
-                    return Err("This person is no longer in the list.".into());
-                }
-            }
-            None => self.call_tools.people.clear(),
+    pub(crate) fn calls_people_delete(&mut self, id: &str) -> Result<(), String> {
+        if !self.call_tools.people.remove(id) {
+            return Err("This person is no longer in the list.".into());
         }
         self.call_tools
             .people
             .save()
+            .map_err(|error| error.to_string())
+    }
+
+    /// Forget everyone. `count` repeats how many people the confirmation
+    /// showed.
+    pub(crate) fn calls_people_clear(&mut self, count: usize) -> Result<(), String> {
+        if count != self.call_tools.people.list().len() {
+            return Err("The list of people changed. Review it and confirm again.".into());
+        }
+        self.call_tools
+            .people
+            .forget_everyone()
             .map_err(|error| error.to_string())
     }
 }
@@ -1051,6 +1527,40 @@ mod tests {
         }
     }
 
+    fn folder(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "articulate-call-tools-{label}-{}-{}",
+            std::process::id(),
+            crate::history::now_ms()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn action(value: serde_json::Value) -> crate::app::desktop::Action {
+        serde_json::from_value(value).expect("a valid renderer action")
+    }
+
+    /// Wait for the history worker to finish what it was given.
+    fn settle(app: &App) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.history.worker.as_ref().unwrap().saves_settled() != Ok(true) {
+            assert!(Instant::now() < deadline, "history did not settle");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A live call with two committed turns.
+    fn live_call(app: &mut App) -> String {
+        let session = Session::new(Kind::Call);
+        let id = session.id.clone();
+        app.history.call = Some(session);
+        app.call = Some(call_capture::Control::new());
+        app.call_committed = vec![row(0, &[1], "One."), row(2000, &[2], "Two.")];
+        app.call_rows = app.call_committed.clone();
+        id
+    }
+
     #[test]
     fn saved_corrections_update_text_and_undo_restores_labels() {
         let (mut app, _) = app();
@@ -1068,12 +1578,7 @@ mod tests {
             app.calls_speaker_edit(&id, rename),
             Err("Local history is unavailable.".into())
         );
-        app.history.worker = Some(crate::history::Worker::test_directory(
-            std::env::temp_dir().join(format!(
-                "articulate-call-tools-{}",
-                crate::history::now_ms()
-            )),
-        ));
+        app.history.worker = Some(crate::history::Worker::test_directory(folder("saved")));
         app.calls_speaker_edit(
             &id,
             SpeakerOp::Rename {
@@ -1112,13 +1617,7 @@ mod tests {
     #[test]
     fn live_merges_cover_later_turns_and_undo_removes_the_rule() {
         let (mut app, _) = app();
-        let mut session = Session::new(Kind::Call);
-        let id = session.id.clone();
-        session.rows.clear();
-        app.history.call = Some(session);
-        app.call = Some(call_capture::Control::new());
-        app.call_committed = vec![row(0, &[1], "One."), row(2000, &[2], "Two.")];
-        app.call_rows = app.call_committed.clone();
+        let id = live_call(&mut app);
         app.call_rows.push(row(4000, &[2], "Draft."));
         app.calls_speaker_edit(
             &id,
@@ -1130,15 +1629,14 @@ mod tests {
         .unwrap();
         assert_eq!(app.call_committed[1].speakers, [1]);
         assert_eq!(app.call_rows[2].speakers, [1], "provisional rows follow");
-        let mut later = vec![row(9000, &[2], "Later.")];
-        app.calls_prepare_rows(&mut later);
-        assert_eq!(later[0].speakers, [1]);
+        app.calls_preview_rows(vec![row(9000, &[2], "Later.")]);
+        assert_eq!(app.call_rows.last().unwrap().speakers, [1]);
         // Provisional rows cannot be reassigned.
         assert!(
             app.calls_speaker_edit(
                 &id,
                 SpeakerOp::Reassign {
-                    rows: vec![(2, 4000)],
+                    rows: vec![(2, 9000)],
                     target: Target::Existing("s1".into()),
                 },
             )
@@ -1146,17 +1644,88 @@ mod tests {
         );
         app.calls_speaker_edit(&id, SpeakerOp::Undo).unwrap();
         assert_eq!(app.call_committed[1].speakers, [2]);
-        let mut later = vec![row(9000, &[2], "Later.")];
-        app.calls_prepare_rows(&mut later);
-        assert_eq!(later[0].speakers, [2]);
+        assert!(app.call_tools.live_rules.is_empty());
+        app.calls_preview_rows(vec![row(9000, &[2], "Later.")]);
+        assert_eq!(app.call_rows.last().unwrap().speakers, [2]);
+    }
+
+    #[test]
+    fn live_undo_keeps_later_speech_with_its_own_speaker() {
+        let (mut app, _) = app();
+        let id = live_call(&mut app);
+        app.calls_speaker_edit(
+            &id,
+            SpeakerOp::Merge {
+                from: "s2".into(),
+                into: "s1".into(),
+            },
+        )
+        .unwrap();
+        // Genuine speech from the merged-into speaker right after the
+        // corrected turn starts a turn of its own.
+        app.calls_commit_rows(vec![row(3100, &[1], "Three.")]);
+        assert_eq!(app.call_committed.len(), 3);
+        assert_eq!(app.call_committed[1].text, "Two.");
+        // Speech from the merged speaker is re-attributed on arrival, kept
+        // apart from genuine speech, and continues only its own kind.
+        app.calls_commit_rows(vec![row(4200, &[2], "Four.")]);
+        app.calls_commit_rows(vec![row(5300, &[2], "Five.")]);
+        assert_eq!(app.call_committed.len(), 4);
+        assert_eq!(app.call_committed[3].speakers, [1]);
+        assert_eq!(app.call_committed[3].text, "Four. Five.");
+        app.calls_speaker_edit(&id, SpeakerOp::Undo).unwrap();
+        let speakers: Vec<_> = app
+            .call_committed
+            .iter()
+            .map(|row| (row.text.as_str(), row.speakers.clone()))
+            .collect();
+        assert_eq!(
+            speakers,
+            [
+                ("One.", vec![1]),
+                ("Two.", vec![2]),
+                ("Three.", vec![1]),
+                ("Four. Five.", vec![2]),
+            ]
+        );
+        // Without corrections, turns continue as before.
+        app.calls_commit_rows(vec![row(6400, &[2], "Six.")]);
+        assert_eq!(app.call_committed[3].text, "Four. Five. Six.");
+    }
+
+    #[test]
+    fn saved_conversation_corrections_never_reach_another_live_call() {
+        let (mut app, _) = app();
+        app.history.worker = Some(crate::history::Worker::test_directory(folder("isolated")));
+        live_call(&mut app);
+        let mut saved = Session::new(Kind::Call);
+        saved.rows = vec![row(0, &[1], "Saved one."), row(2000, &[2], "Saved two.")];
+        let saved_id = saved.id.clone();
+        app.history.selected = Some(saved);
+        app.calls_speaker_edit(
+            &saved_id,
+            SpeakerOp::Merge {
+                from: "s2".into(),
+                into: "s1".into(),
+            },
+        )
+        .unwrap();
+        assert!(app.call_tools.live_rules.is_empty());
+        app.calls_commit_rows(vec![row(9000, &[2], "Live speech.")]);
+        assert_eq!(app.call_committed.last().unwrap().speakers, [2]);
+        assert!(
+            app.history.selected.as_ref().unwrap().speaker_edits[0]
+                .rule
+                .is_none()
+        );
+        app.calls_speaker_edit(&saved_id, SpeakerOp::Undo).unwrap();
+        assert!(app.call_tools.live_rules.is_empty());
     }
 
     #[test]
     fn corrections_to_a_finished_call_survive_later_saves_of_that_call() {
         let (mut app, _) = app();
-        app.history.worker = Some(crate::history::Worker::test_directory(
-            std::env::temp_dir().join(format!("articulate-call-sync-{}", crate::history::now_ms())),
-        ));
+        app.history.worker = Some(crate::history::Worker::test_directory(folder("sync")));
         let mut session = Session::new(Kind::Call);
         session.rows = vec![row(0, &[1], "Hello.")];
         let id = session.id.clone();
@@ -1229,5 +1798,280 @@ mod tests {
         );
         app.calls_import_dismiss();
         assert!(app.call_tools.import.pending.is_none());
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_import_keeps_no_audio() {
+        let directory = folder("orphan");
+        let audio = audio_store::path(&directory, &Session::new(Kind::Call).id);
+        let recorder =
+            audio_store::Recorder::start(audio.clone(), vec!["recording".into()], false).unwrap();
+        // The final transcription fails after all audio was written.
+        let result = keeping(Some(&recorder), || -> anyhow::Result<()> {
+            recorder.push(0, vec![0.25; 40 * 16_000]);
+            anyhow::bail!("Transcription cancelled")
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        // A successful import publishes its audio.
+        let recorder =
+            audio_store::Recorder::start(audio.clone(), vec!["recording".into()], false).unwrap();
+        let ((), info) = keeping(Some(&recorder), || {
+            recorder.push(0, vec![0.25; 16_000]);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(info.unwrap().duration_ms, 1000);
+        assert!(audio.exists());
+        // If the session cannot be saved, the controller discards it.
+        let (mut app, _) = app();
+        app.call_tools.import.working = true;
+        app.call_tools.import.recorder = Some(Arc::new(recorder));
+        let session = Session::new(Kind::Dictation);
+        app.calls_file_event(FileEvent::Finished(Ok(Box::new(session))));
+        assert!(app.call_tools.import.failed);
+        assert!(!audio.exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn conversations_from_files_use_call_language_handling() {
+        let import = |kind| FileJob::Import {
+            path: PathBuf::from("meeting.m4a"),
+            kind,
+            session: Box::new(Session::new(Kind::Call)),
+            recorder: None,
+            cpu: true,
+            language: Some("en".into()),
+        };
+        let rebuild = |kind| FileJob::Rebuild {
+            session: Box::new(Session::new(kind)),
+            audio: PathBuf::from("audio"),
+            cpu: true,
+            language: None,
+        };
+        assert_eq!(
+            call_language(&import(ImportKind::Call)),
+            Some(Some("en".into()))
+        );
+        assert_eq!(call_language(&import(ImportKind::Dictation)), None);
+        assert_eq!(call_language(&rebuild(Kind::Call)), Some(None));
+        assert_eq!(call_language(&rebuild(Kind::Note)), Some(None));
+        assert_eq!(call_language(&rebuild(Kind::Dictation)), None);
+        let (mut app, commands) = app();
+        app.settings.transcription_language = "fr".into();
+        app.ready = true;
+        let directory = folder("language");
+        let file = directory.join("meeting.wav");
+        std::fs::write(&file, b"RIFF").unwrap();
+        app.call_tools.import.pending = Some(file);
+        app.calls_import_start(ImportKind::Call, false).unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::File(FileJob::Import { language: Some(language), .. }, _)) if language == "fr"
+        ));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_rebuild_changes_only_the_transcript_of_the_latest_copy() {
+        let mut started = Session::new(Kind::Call);
+        started.title = "Original title".into();
+        started.rows = vec![row(0, &[1], "Old words.")];
+        started.text = calls::text(&started.rows, &started.speaker_names);
+        let revision = transcript_revision(&started);
+        let mut rebuilt = started.clone();
+        rebuilt.rows = vec![row(0, &[2], "New words.")];
+        rebuilt.text = calls::text(&rebuilt.rows, &rebuilt.speaker_names);
+        // Edited while the re-transcription ran.
+        let mut latest = started.clone();
+        latest.title = "Renamed meanwhile".into();
+        latest.personal_notes = "Typed meanwhile.".into();
+        assert!(merge_rebuilt(&mut latest, &rebuilt, &revision, "model"));
+        assert_eq!(latest.title, "Renamed meanwhile");
+        assert_eq!(latest.personal_notes, "Typed meanwhile.");
+        assert!(latest.text.contains("New words."));
+        assert_eq!(latest.transcript_versions.len(), 1);
+        assert!(latest.transcript_versions[0].text.contains("Old words."));
+        // A transcript that changed meanwhile is kept; the rebuilt one waits
+        // under earlier transcripts.
+        let mut changed = started.clone();
+        changed.text = "Edited meanwhile.".into();
+        assert!(!merge_rebuilt(&mut changed, &rebuilt, &revision, "model"));
+        assert_eq!(changed.text, "Edited meanwhile.");
+        assert!(changed.transcript_versions[0].text.contains("New words."));
+        // Closed meanwhile: the stored copy is updated on the history worker.
+        let (mut app, _) = app();
+        app.history.worker = Some(crate::history::Worker::test_directory(folder("rebuild")));
+        let mut stored = started.clone();
+        stored.title = "Saved meanwhile".into();
+        app.history.worker.as_ref().unwrap().save(stored);
+        settle(&app);
+        app.call_tools.import.working = true;
+        app.call_tools.import.rebuilding = Some(started.id.clone());
+        app.call_tools.import.rebuild_from = Some((revision, "model".into()));
+        app.calls_file_event(FileEvent::Finished(Ok(Box::new(rebuilt))));
+        assert!(
+            !app.call_tools.import.failed,
+            "{}",
+            app.call_tools.import.message
+        );
+        settle(&app);
+        let history = app.history.worker.as_ref().unwrap();
+        history.load(started.id.clone());
+        settle(&app);
+        let loaded = history
+            .drain()
+            .into_iter()
+            .find_map(|event| match event {
+                crate::history::Event::Loaded(session) => Some(session),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(loaded.title, "Saved meanwhile");
+        assert!(loaded.text.contains("New words."));
+        assert_eq!(loaded.transcript_versions.len(), 1);
+    }
+
+    #[test]
+    fn restoring_names_a_version_and_a_repeated_request_changes_nothing() {
+        let (mut app, _) = app();
+        app.history.worker = Some(crate::history::Worker::test_directory(folder("restore")));
+        let mut session = Session::new(Kind::Dictation);
+        session.text = "Current.".into();
+        for text in ["First.", "Second."] {
+            let mut version = TranscriptVersion::of(&session, "");
+            version.text = text.into();
+            version.replaced_ms += session.transcript_versions.len() as u64;
+            session.transcript_versions.push(version);
+        }
+        let id = session.id.clone();
+        let first = version_id(&session.transcript_versions[0]);
+        let expected = transcript_revision(&session);
+        app.history.selected = Some(session);
+        app.calls_restore_version(&id, &first, &expected).unwrap();
+        assert_eq!(app.history.selected.as_ref().unwrap().text, "First.");
+        // A second click on the same button: the version and the transcript
+        // it would replace are both gone, so nothing else is restored.
+        assert!(app.calls_restore_version(&id, &first, &expected).is_err());
+        let current = transcript_revision(app.history.selected.as_ref().unwrap());
+        assert!(app.calls_restore_version(&id, &first, &current).is_err());
+        assert_eq!(app.history.selected.as_ref().unwrap().text, "First.");
+        let versions = &app.history.selected.as_ref().unwrap().transcript_versions;
+        let texts: Vec<_> = versions.iter().map(|v| v.text.as_str()).collect();
+        assert_eq!(texts, ["Second.", "Current."]);
+    }
+
+    #[test]
+    fn destructive_actions_need_a_matching_confirmation() {
+        let (mut app, _) = app();
+        let directory = folder("confirm");
+        app.history.worker = Some(crate::history::Worker::test_directory(directory.clone()));
+        app.call_tools.history_dir = Some(directory.clone());
+        let mut session = Session::new(Kind::Call);
+        let id = session.id.clone();
+        let audio = audio_store::path(&directory, &id);
+        let recorder =
+            audio_store::Recorder::start(audio.clone(), vec!["recording".into()], false).unwrap();
+        recorder.push(0, vec![0.1; 16_000]);
+        let info = recorder.finish().unwrap();
+        let bytes = info.bytes;
+        session.audio = Some(info);
+        app.history.selected = Some(session);
+        let delete = |confirm_id: &str, bytes: u64| {
+            action(serde_json::json!({
+                "type": "audio_delete",
+                "id": id,
+                "confirm": { "id": confirm_id, "bytes": bytes },
+            }))
+        };
+        assert!(
+            serde_json::from_value::<crate::app::desktop::Action>(
+                serde_json::json!({"type": "audio_delete", "id": id})
+            )
+            .is_err(),
+            "a confirmation is required"
+        );
+        assert!(app.desktop_action(delete("other", bytes)).is_err());
+        assert!(app.desktop_action(delete(&id, bytes + 1)).is_err());
+        assert!(audio.exists());
+        app.desktop_action(delete(&id, bytes)).unwrap();
+        assert!(!audio.exists());
+        assert!(app.history.selected.as_ref().unwrap().audio.is_none());
+        app.call_tools.people.remember_name("Morgan");
+        app.call_tools.people.remember_name("Casey");
+        let clear = |count: usize| {
+            action(serde_json::json!({"type": "people_clear", "confirm": {"count": count}}))
+        };
+        assert!(app.desktop_action(clear(1)).is_err());
+        assert_eq!(app.call_tools.people.list().len(), 2);
+        app.desktop_action(clear(2)).unwrap();
+        assert!(app.call_tools.people.list().is_empty());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn dictation_cancel_and_capture_cannot_touch_a_running_file_job() {
+        let (mut app, _) = app();
+        app.ready = true;
+        app.call_tools.import.working = true;
+        app.call_tools.import.rebuilding = Some(Session::new(Kind::Call).id);
+        app.busy = true;
+        let job = CancelToken::new();
+        app.call_tools.import.cancel = Some(job.clone());
+        assert!(
+            app.desktop_action(action(serde_json::json!({"type": "dictation_cancel"})))
+                .is_err()
+        );
+        assert!(app.busy && !job.is_cancelled());
+        // Even if the shared flag is cleared, capture checks the job itself.
+        app.cancel_dictation();
+        assert!(app.busy);
+        app.busy = false;
+        assert!(
+            app.desktop_action(action(serde_json::json!({"type": "dictation_start"})))
+                .is_err()
+        );
+        app.toggle(None);
+        assert!(app.recording.is_none());
+        assert!(app.calls_file_job_running());
+    }
+
+    #[test]
+    fn encryption_results_wait_for_recordings_and_count_people_failures() {
+        let (mut app, _) = app();
+        let directory = folder("protect");
+        // A people file that cannot be read or rewritten.
+        std::fs::create_dir_all(directory.join("people.json")).unwrap();
+        app.call_tools.people = people::at(&directory, false);
+        let audio = audio_store::path(&directory, &Session::new(Kind::Call).id);
+        let recorder =
+            audio_store::Recorder::start(audio.clone(), vec!["recording".into()], false).unwrap();
+        recorder.push(0, vec![0.1; 31 * 16_000]);
+        app.call_tools.recorder = Some(Arc::new(recorder));
+        app.settings.encrypt_at_rest = true;
+        app.history.storage.encryption_working = true;
+        app.calls_set_protection(true);
+        app.calls_protection_changed(Ok(MigrationReport {
+            protect: true,
+            changed: 3,
+            failed: 0,
+        }));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.history.protection.is_none() {
+            assert!(app.history.storage.encryption_working);
+            assert!(Instant::now() < deadline, "the recording never converted");
+            std::thread::sleep(Duration::from_millis(20));
+            app.calls_tick();
+        }
+        let report = app.history.protection.clone().unwrap().unwrap();
+        assert_eq!(report.failed, 1, "the people file: {report:?}");
+        assert!(!app.history.storage.encryption_working);
+        let recorder = app.call_tools.recorder.take().unwrap();
+        recorder.finish().unwrap();
+        assert_eq!(recorder.protection(), audio_store::Protection::Settled);
+        let bytes = std::fs::read(&audio).unwrap();
+        assert!(crate::history::protect::is_sealed(&bytes[19 + 4..]));
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

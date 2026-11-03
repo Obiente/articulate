@@ -23,7 +23,7 @@ pub fn read_mono(path: &std::path::Path) -> Result<Vec<f32>> {
     let mut decoded = crate::media::decode_file(
         path,
         crate::media::Layout::Mono,
-        &std::sync::atomic::AtomicBool::new(false),
+        &crate::media::uncancelled(),
         |_| {},
     )?;
     Ok(decoded.channels.pop().unwrap_or_default())
