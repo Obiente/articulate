@@ -1,16 +1,40 @@
 use super::*;
+use crate::app::desktop::view::discord::{Companion, DiscordView, Participant};
+use crate::app::desktop::view::meetings::{MeetingApp, MeetingEvent, MeetingsView};
 use crate::discord::install::{self, Detection, InstallReport, Plan, PluginStatus};
+use crate::discord::launch::{self, Flavor};
 use crate::discord::{Snapshot, Status};
+use crate::meetings;
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 #[derive(Default)]
 pub(super) struct LaunchState {
-    pending: Option<Receiver<Result<(), String>>>,
+    pending: Option<Receiver<Result<LaunchOutcome, String>>>,
     error: Option<String>,
     companion: CompanionState,
     retry: Retry,
     pub(super) automation: AutoCall,
     automatic_status: String,
     automatic_model_attempt: Option<String>,
+    installed_flavors: Option<(Instant, Vec<Flavor>)>,
+    avatars: Option<crate::discord::avatar::Cache>,
+    pub(super) meetings: MeetingGlue,
+    /// Whether the companion pairing file has been checked against the saved
+    /// key since startup, so settings restored by other means are mirrored.
+    pairing_file_checked: bool,
+}
+
+/// What a background relaunch did when it succeeded.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LaunchOutcome {
+    /// Opened with a loopback debugger on a random port.
+    Debugger(launch::Launched),
+    /// Opened normally, closing any previous debugger access.
+    Normal,
 }
 
 #[derive(Default)]
@@ -202,7 +226,7 @@ enum CompanionAction {
 }
 
 impl App {
-    pub(super) fn desktop_discord_status(&self) -> serde_json::Value {
+    pub(super) fn desktop_discord_status(&self) -> DiscordView<'_> {
         let snapshot = self
             .discord
             .as_ref()
@@ -210,7 +234,7 @@ impl App {
         let (status, connection_error) = match snapshot.as_ref().map(|s| &s.status) {
             Some(Status::Ready) => ("ready", None),
             Some(Status::Connecting) => ("connecting", None),
-            Some(Status::Unavailable(error)) => ("unavailable", Some(error.as_str())),
+            Some(Status::Unavailable(error)) => ("unavailable", Some(error.clone())),
             None => ("disconnected", None),
         };
         let companion = &self.discord_launch.companion;
@@ -235,22 +259,106 @@ impl App {
             .as_ref()
             .filter(|_| connected)
             .and_then(|s| s.audio_status.as_deref());
-        serde_json::json!({"connected":connected,"listener_started":self.discord.is_some(),"status":status,
-            "in_voice":in_voice,"audio_ready":audio_ready,
-            "audio_status":audio_status,"audio_message":if audio_ready {None} else {companion_audio_message(audio_status)},
-            "pairing_state":if connected {"paired"} else if self.discord.is_some() {"waiting"} else {"automatic"},
-            "automatic_can_retry":self.settings.discord_auto_transcribe && self.call.is_none() && (self.discord_launch.automation.suppressed.is_some() || self.discord_launch.automation.failed_attempts > 0 || self.discord_launch.error.is_some() || (!self.ready && !self.loading && self.discord_launch.automatic_model_attempt.is_some())),
-            "error":self.discord_launch.error.as_deref().or(connection_error),
-            "relaunching":self.discord_launch.pending.is_some(),"companion_selected":self.settings.discord_companion,
-            "automatic_status":self.discord_launch.automatic_status,
-            "companion":{"checked":companion.checked,"installed":companion.detection.as_ref().is_some_and(|d|d.installed),
-                "runtime_status":runtime_status,
-                "source_found":plan.is_some(),"active":companion.detection.as_ref().is_some_and(|d|d.selected_active),
-                "busy":companion.pending.is_some(),"status":companion.progress,"error":companion.error,
-                "plugin_status":plan.map(|p|match p.status {PluginStatus::Missing=>"missing",PluginStatus::Current=>"current",PluginStatus::UpdateAvailable=>"update_available"}).unwrap_or("unknown"),
-                "can_build":plan.is_some_and(|p|p.can_build),"native_audio":companion.native_enabled,
-                "installer_ready":plan.is_some_and(|p|p.status==PluginStatus::Current && p.source.join("dist/patcher.js").is_file())}
-        })
+        let participants = observation
+            .map(|observation| {
+                observation
+                    .participants
+                    .iter()
+                    .map(|participant| Participant {
+                        id: participant.id.clone(),
+                        name: participant.name.clone(),
+                        speaking: participant.speaking,
+                        is_self: participant.is_self,
+                        avatar: participant
+                            .avatar
+                            .as_ref()
+                            .filter(|_| self.settings.discord_avatars)
+                            .map(|avatar| avatar.uri()),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let protocol: Cow<'_, str> = snapshot
+            .as_ref()
+            .and_then(|s| s.companion_protocol.clone())
+            .map_or(Cow::Borrowed("unknown"), Cow::Owned);
+        let automation = &self.discord_launch.automation;
+        let debugger_open = self.settings.discord_debugger_port != 0;
+        DiscordView {
+            connected,
+            listener_started: self.discord.is_some(),
+            status,
+            in_voice,
+            audio_ready,
+            audio_status: audio_status.map(str::to_owned),
+            audio_message: if audio_ready {
+                None
+            } else {
+                companion_audio_message(audio_status)
+            },
+            participants,
+            pairing_state: if connected {
+                "paired"
+            } else if self.discord.is_some() {
+                "waiting"
+            } else {
+                "automatic"
+            },
+            pairing_key_present: crate::discord::plugin::valid_token(
+                &self.settings.discord_pairing_key,
+            ),
+            companion_protocol_message: companion_protocol_message(&protocol),
+            companion_protocol: protocol,
+            flavor: &self.settings.discord_flavor,
+            installed_flavors: self
+                .installed_flavors()
+                .iter()
+                .map(|flavor| flavor.id())
+                .collect(),
+            debugger_port: self.settings.discord_debugger_port,
+            debugger_open,
+            debugger_notice: debugger_open.then_some(DEBUGGER_NOTICE),
+            automatic_can_retry: self.settings.discord_auto_transcribe
+                && self.call.is_none()
+                && (automation.suppressed.is_some()
+                    || automation.failed_attempts > 0
+                    || self.discord_launch.error.is_some()
+                    || (!self.ready
+                        && !self.loading
+                        && self.discord_launch.automatic_model_attempt.is_some())),
+            error: self
+                .discord_launch
+                .error
+                .as_deref()
+                .map(Cow::Borrowed)
+                .or(connection_error.map(Cow::Owned)),
+            relaunching: self.discord_launch.pending.is_some(),
+            companion_selected: self.settings.discord_companion,
+            automatic_status: &self.discord_launch.automatic_status,
+            companion: Companion {
+                checked: companion.checked,
+                installed: companion.detection.as_ref().is_some_and(|d| d.installed),
+                runtime_status,
+                source_found: plan.is_some(),
+                active: companion
+                    .detection
+                    .as_ref()
+                    .is_some_and(|d| d.selected_active),
+                busy: companion.pending.is_some(),
+                status: &companion.progress,
+                error: companion.error.as_deref(),
+                plugin_status: plan.map_or("unknown", |p| match p.status {
+                    PluginStatus::Missing => "missing",
+                    PluginStatus::Current => "current",
+                    PluginStatus::UpdateAvailable => "update_available",
+                }),
+                can_build: plan.is_some_and(|p| p.can_build),
+                native_audio: companion.native_enabled,
+                installer_ready: plan.is_some_and(|p| {
+                    p.status == PluginStatus::Current && p.source.join("dist/patcher.js").is_file()
+                }),
+            },
+        }
     }
 
     pub(super) fn desktop_discord_retry(&mut self) -> Result<(), String> {
@@ -307,6 +415,142 @@ impl App {
         Ok(())
     }
 
+    /// Closes the debugger that an earlier relaunch opened by restarting the
+    /// same Discord edition normally. Offered after capture ends and when the
+    /// user switches to the companion.
+    pub(super) fn desktop_discord_relaunch_normally(&mut self) -> Result<(), String> {
+        if self.call.is_some() || self.recording.is_some() || self.busy {
+            return Err("Finish recording before restarting Discord.".into());
+        }
+        if self.discord_launch.pending.is_some() {
+            return Err("A Discord restart is already running.".into());
+        }
+        let flavor = Flavor::parse(&self.settings.discord_flavor).unwrap_or(Flavor::Stable);
+        self.discord_launch.error = None;
+        if !self.settings.discord_companion {
+            if let Some(control) = &self.call {
+                control.set_discord(None);
+            }
+            if let Some(connection) = self.discord.take() {
+                connection.disconnect();
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("discord-relaunch".into())
+            .spawn(move || {
+                let result = launch::relaunch_normally(flavor)
+                    .map(|()| LaunchOutcome::Normal)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = tx.send(result);
+            })
+            .map_err(|error| format!("Could not start Discord relaunch: {error}"))?;
+        self.discord_launch.pending = Some(rx);
+        Ok(())
+    }
+
+    /// Generates a fresh pairing key, invalidating every companion that holds
+    /// the old one. The current companion re-reads the key from local settings.
+    pub(super) fn desktop_discord_rotate_key(&mut self) -> Result<(), String> {
+        if self.call.is_some() {
+            return Err("Finish the recording before changing the pairing key.".into());
+        }
+        let key = crate::discord::plugin::new_token().map_err(|e| e.to_string())?;
+        self.replace_pairing(key, self.settings.discord_auto_connect)
+    }
+
+    /// Removes the pairing key and stops listening. Connecting again later
+    /// pairs with a new key; the old companion key no longer works anywhere.
+    pub(super) fn desktop_discord_forget_pairing(&mut self) -> Result<(), String> {
+        if self.call.is_some() {
+            return Err("Finish the recording before forgetting the pairing.".into());
+        }
+        self.replace_pairing(String::new(), false)
+    }
+
+    fn replace_pairing(&mut self, key: String, reconnect: bool) -> Result<(), String> {
+        let previous_key = std::mem::replace(&mut self.settings.discord_pairing_key, key);
+        let previous_reconnect =
+            std::mem::replace(&mut self.settings.discord_auto_connect, reconnect);
+        // The saved file is the source of truth. If it cannot be written, the
+        // old key stays in force everywhere: in memory, in the pairing file
+        // and in the listener that still holds it.
+        if let Err(error) = self.save_preferences() {
+            self.settings.discord_pairing_key = previous_key;
+            self.settings.discord_auto_connect = previous_reconnect;
+            return Err(error.to_string());
+        }
+        if let Some(connection) = self.discord.take() {
+            connection.disconnect();
+        }
+        if let Some(control) = &self.call {
+            control.set_discord(None);
+        }
+        self.discord_launch.retry = Retry::default();
+        self.discord_launch.error = None;
+        let published = self.publish_pairing_file();
+        if reconnect && self.settings.discord_companion {
+            self.connect_discord();
+        }
+        published?;
+        self.discord_launch.error.clone().map_or(Ok(()), Err)
+    }
+
+    /// Mirrors the saved pairing key into the file the companion reads, so a
+    /// companion keeps pairing when `settings.json` is encrypted at rest.
+    fn publish_pairing_file(&mut self) -> Result<(), String> {
+        self.discord_launch.pairing_file_checked = true;
+        crate::discord::pairing::sync(
+            &crate::model::data_dir(),
+            &self.settings.discord_pairing_key,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("The companion cannot read the pairing key: {error:#}"))
+    }
+
+    /// Installed editions as last scanned, for settings validation.
+    pub(super) fn desktop_installed_flavors(&self) -> Vec<Flavor> {
+        self.installed_flavors()
+    }
+
+    pub(super) fn desktop_discord_relaunching(&self) -> bool {
+        self.discord_launch.pending.is_some()
+    }
+
+    /// Drops cached participant pictures once they are turned off. The
+    /// renderer stops receiving avatar identifiers from the same update.
+    pub(super) fn desktop_avatars_disabled(&mut self) {
+        self.discord_launch.avatars = None;
+    }
+
+    fn debugger_port(&self) -> u16 {
+        match self.settings.discord_debugger_port {
+            0 => crate::discord::DEFAULT_DEBUGGER_PORT,
+            port => port,
+        }
+    }
+
+    fn installed_flavors(&self) -> Vec<Flavor> {
+        // Cached by poll; status snapshots must not scan the disk every frame.
+        self.discord_launch
+            .installed_flavors
+            .as_ref()
+            .map(|(_, flavors)| flavors.clone())
+            .unwrap_or_default()
+    }
+
+    fn refresh_installed_flavors(&mut self) {
+        let stale = self
+            .discord_launch
+            .installed_flavors
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(30));
+        if stale && (self.settings.discord_standard_configured || !self.settings.discord_companion)
+        {
+            self.discord_launch.installed_flavors = Some((Instant::now(), launch::installed()));
+        }
+    }
+
     pub(super) fn desktop_companion_action(&mut self, action: &str) -> Result<(), String> {
         if self.discord_launch.companion.pending.is_some() {
             return Err("Companion setup is already running.".into());
@@ -354,6 +598,7 @@ impl App {
                     self.settings.discord_pairing_key = crate::discord::plugin::new_token()?;
                 }
                 self.save_preferences()?;
+                self.publish_pairing_file().map_err(anyhow::Error::msg)?;
                 crate::discord::plugin::start(self.settings.discord_pairing_key.clone())
             })();
             match result {
@@ -368,7 +613,7 @@ impl App {
         } else {
             self.settings.discord_standard_configured = true;
             self.save();
-            crate::discord::Connection::start()
+            crate::discord::Connection::start(self.debugger_port())
         };
         self.discord_launch.retry = Retry::default();
         self.discord = Some(connection);
@@ -380,8 +625,11 @@ impl App {
     pub(super) fn poll_discord_launch(&mut self) {
         self.poll_companion_install();
         self.companion_auto_update();
+        self.refresh_installed_flavors();
         self.poll_discord_connection();
+        self.poll_avatars();
         self.poll_automatic_call();
+        self.poll_meetings();
         let Some(receiver) = &self.discord_launch.pending else {
             return;
         };
@@ -394,17 +642,34 @@ impl App {
         };
         self.discord_launch.pending = None;
         match result {
-            Ok(()) => {
+            Ok(LaunchOutcome::Debugger(launched)) => {
                 self.settings.discord_companion = false;
+                self.settings.discord_flavor = launched.flavor.id().into();
+                self.settings.discord_debugger_port = launched.port;
                 self.save();
                 self.connect_discord();
-                self.call_status = "Discord opened. Connecting to speaker names…".into();
+                self.call_status = format!(
+                    "{} opened with a temporary debugger. Connecting to speaker names…",
+                    launched.flavor.label()
+                );
+            }
+            Ok(LaunchOutcome::Normal) => {
+                self.settings.discord_debugger_port = 0;
+                self.save();
+                self.call_status = "Discord reopened without debugger access.".into();
             }
             Err(error) => self.discord_launch.error = Some(error),
         }
     }
 
     fn poll_discord_connection(&mut self) {
+        // Settings restored from a backup or an older version carry a key the
+        // companion must be able to read even while `settings.json` is sealed.
+        if !self.discord_launch.pairing_file_checked
+            && let Err(error) = self.publish_pairing_file()
+        {
+            self.discord_launch.error = Some(error);
+        }
         if self
             .discord
             .as_ref()
@@ -574,12 +839,13 @@ impl App {
             connection.disconnect();
         }
         let (tx, rx) = mpsc::channel();
-
+        let requested = Flavor::parse(&self.settings.discord_flavor);
         match std::thread::Builder::new()
             .name("discord-relaunch".into())
             .spawn(move || {
-                let result =
-                    crate::discord::launch::relaunch().map_err(|error| format!("{error:#}"));
+                let result = launch::relaunch(requested)
+                    .map(LaunchOutcome::Debugger)
+                    .map_err(|error| format!("{error:#}"));
                 let _ = tx.send(result);
             }) {
             Ok(_) => self.discord_launch.pending = Some(rx),
@@ -768,6 +1034,364 @@ impl App {
     }
 }
 
+impl App {
+    /// Serves a cached participant picture for a `bytes://discord-avatar/...`
+    /// identifier. Returns `None` until the picture has been fetched locally.
+    pub(super) fn desktop_discord_avatar(&mut self, uri: &str) -> Option<Vec<u8>> {
+        if !self.settings.discord_avatars {
+            return None;
+        }
+        self.discord_launch
+            .avatars
+            .get_or_insert_with(Default::default)
+            .bytes_for_uri(uri)
+            .map(|bytes| bytes.to_vec())
+    }
+
+    fn poll_avatars(&mut self) {
+        if !self.settings.discord_avatars {
+            return;
+        }
+        let Some(snapshot) = self
+            .discord
+            .as_ref()
+            .map(|connection| connection.snapshot())
+        else {
+            return;
+        };
+        let Some(observation) = current_observation(&snapshot) else {
+            return;
+        };
+        let avatars: Vec<_> = observation
+            .participants
+            .iter()
+            .filter_map(|participant| participant.avatar.clone())
+            .collect();
+        if avatars.is_empty() {
+            return;
+        }
+        let cache = self
+            .discord_launch
+            .avatars
+            .get_or_insert_with(Default::default);
+        for avatar in &avatars {
+            cache.request(avatar);
+        }
+    }
+
+    /// Mirrors Discord's automatic transcripts for detected Teams, Zoom and
+    /// Meet meetings. Capture always starts through `start_stream_capture`.
+    fn poll_meetings(&mut self) {
+        let settings = self.settings.meetings.clone();
+        let now = Instant::now();
+        let events = self.discord_launch.meetings.advance(now, &settings);
+        for event in events {
+            match event {
+                meetings::Event::Started { app, .. } => match settings.start {
+                    meetings::StartMode::Automatic => {
+                        self.discord_launch.meetings.pending_start = Some(app)
+                    }
+                    meetings::StartMode::Ask => self.discord_launch.meetings.prompt = Some(app),
+                },
+                meetings::Event::Ended { app } => {
+                    let glue = &mut self.discord_launch.meetings;
+                    if glue.prompt == Some(app) {
+                        glue.prompt = None;
+                    }
+                    if glue.pending_start == Some(app) {
+                        glue.pending_start = None;
+                    }
+                    if glue.suppressed == Some(app) {
+                        glue.suppressed = None;
+                    }
+                    if glue.owned == Some(app)
+                        && let Some(control) = &self.call
+                    {
+                        control.stop();
+                        self.call_status =
+                            format!("{} meeting ended. Saving your transcript…", app.label());
+                    }
+                }
+            }
+        }
+        // A capture the user finished stays finished until the meeting ends.
+        if self.call.is_none()
+            && let Some(app) = self.discord_launch.meetings.owned.take()
+        {
+            self.discord_launch.meetings.suppressed = Some(app);
+        }
+        let Some(app) = self.discord_launch.meetings.pending_start else {
+            self.discord_launch.meetings.status = self
+                .discord_launch
+                .meetings
+                .describe(&settings, self.call.is_some());
+            return;
+        };
+        if self.discord_launch.meetings.suppressed == Some(app)
+            || !self
+                .discord_launch
+                .meetings
+                .detector
+                .active()
+                .contains(&app)
+        {
+            self.discord_launch.meetings.pending_start = None;
+            return;
+        }
+        let idle = self.call.is_none()
+            && self.recording.is_none()
+            && !self.busy
+            && !self.preview_inflight
+            && !self.loading
+            && self.downloading.is_none()
+            && !self.integration_inflight
+            && self.integration_pending.is_none()
+            && self.pending_final.is_none()
+            && self.pending_install.is_none();
+        if !idle {
+            self.discord_launch.meetings.status =
+                "Waiting for the current dictation or task to finish.".into();
+            return;
+        }
+        if !self.ready {
+            if PathBuf::from(&self.settings.model_path).is_file() {
+                if self.discord_launch.meetings.model_attempt.as_ref()
+                    != Some(&self.settings.model_path)
+                {
+                    self.discord_launch.meetings.model_attempt =
+                        Some(self.settings.model_path.clone());
+                    self.load();
+                }
+                self.discord_launch.meetings.status =
+                    "Loading the speech model for the meeting transcript…".into();
+            } else {
+                self.discord_launch.meetings.status =
+                    "Choose and download a speech model in Settings to transcribe meetings.".into();
+            }
+            return;
+        }
+        self.discord_launch.meetings.pending_start = None;
+        let preference = (!self.settings.transcription_language.is_empty())
+            .then(|| self.settings.transcription_language.clone());
+        // Mixed microphone and output capture without Discord participant audio.
+        if self.start_stream_capture(false, false, false, preference, None) {
+            self.discord_launch.meetings.owned = Some(app);
+            self.call_status = format!(
+                "{} meeting detected. Starting your transcript… {}",
+                app.label(),
+                meetings::CONSENT_REMINDER
+            );
+        } else {
+            self.discord_launch.meetings.suppressed = Some(app);
+            self.discord_launch.meetings.status = self.call_status.clone();
+        }
+    }
+
+    /// Answers the "start a transcript?" prompt for a detected meeting.
+    pub(super) fn desktop_meeting_respond(&mut self, accept: bool) -> Result<(), String> {
+        let glue = &mut self.discord_launch.meetings;
+        let app = glue
+            .prompt
+            .take()
+            .ok_or("No meeting is waiting for an answer.")?;
+        if accept {
+            glue.pending_start = Some(app);
+        } else {
+            glue.suppressed = Some(app);
+        }
+        Ok(())
+    }
+
+    pub(super) fn desktop_meetings_status(&self) -> MeetingsView<'_> {
+        let glue = &self.discord_launch.meetings;
+        MeetingsView {
+            enabled: self.settings.meetings.any(),
+            settings: &self.settings.meetings,
+            consent_reminder: meetings::CONSENT_REMINDER,
+            active: glue
+                .detector
+                .active()
+                .into_iter()
+                .map(MeetingApp::from)
+                .collect(),
+            prompt: glue.prompt.map(MeetingApp::from),
+            owned: glue.owned.map(MeetingApp::from),
+            status: &glue.status,
+            probe_error: glue.probe_error.as_deref(),
+            events: glue
+                .events
+                .iter()
+                .map(|(event, at)| MeetingEvent {
+                    app: event.app().id(),
+                    label: event.app().label(),
+                    kind: event.kind(),
+                    at_unix_ms: at
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The running probe thread: its result channel and its stop flag.
+type ProbeHandle = (
+    Receiver<Result<Vec<meetings::Evidence>, String>>,
+    Arc<AtomicBool>,
+);
+
+/// How long the last successful probe keeps counting as evidence once probes
+/// fail or stall. Shorter than the detector's start debounce, so a meeting is
+/// never confirmed from a single observation that was not refreshed, and
+/// bounded, so a meeting whose evidence cannot be refreshed ends after the
+/// usual end debounce instead of being transcribed indefinitely.
+const EVIDENCE_GRACE: Duration = Duration::from_millis(2500);
+
+/// Application-side state for meeting detection: the background probe, the
+/// debounced detector and which capture, if any, this feature owns.
+#[derive(Default)]
+pub(super) struct MeetingGlue {
+    detector: meetings::Detector,
+    probe: Option<ProbeHandle>,
+    probe_error: Option<String>,
+    /// The last successful probe and when it arrived.
+    latest: Option<(Vec<meetings::Evidence>, Instant)>,
+    pending_start: Option<meetings::App>,
+    prompt: Option<meetings::App>,
+    owned: Option<meetings::App>,
+    suppressed: Option<meetings::App>,
+    model_attempt: Option<String>,
+    status: String,
+    events: VecDeque<(meetings::Event, std::time::SystemTime)>,
+}
+
+impl MeetingGlue {
+    /// Starts or stops the probe thread to match the settings, drains its
+    /// results and runs the detector. Returns confirmed events.
+    fn advance(&mut self, now: Instant, settings: &meetings::Settings) -> Vec<meetings::Event> {
+        if settings.any() {
+            if self
+                .probe
+                .as_ref()
+                .is_none_or(|(_, stop)| stop.load(Ordering::Acquire))
+            {
+                self.start_probe();
+            }
+        } else if let Some((_, stop)) = self.probe.take() {
+            stop.store(true, Ordering::Release);
+            self.latest = None;
+            self.pending_start = None;
+            self.prompt = None;
+        }
+        if let Some((receiver, stop)) = &self.probe {
+            loop {
+                match receiver.try_recv() {
+                    Ok(Ok(evidence)) => {
+                        self.probe_error = None;
+                        self.latest = Some((evidence, now));
+                    }
+                    Ok(Err(error)) => self.probe_error = Some(error),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        stop.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+        }
+        // Evidence that could not be refreshed within the grace counts as
+        // absent: it cannot confirm a start, and it cannot hold a meeting open.
+        let evidence = self
+            .latest
+            .as_ref()
+            .filter(|(_, at)| now.saturating_duration_since(*at) <= EVIDENCE_GRACE)
+            .map(|(evidence, _)| evidence.clone())
+            .unwrap_or_default();
+        let events = self.detector.tick(now, &evidence, settings);
+        for event in &events {
+            self.events
+                .push_back((event.clone(), std::time::SystemTime::now()));
+            while self.events.len() > 16 {
+                self.events.pop_front();
+            }
+        }
+        events
+    }
+
+    fn start_probe(&mut self) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let worker_stop = stop.clone();
+        let spawned = std::thread::Builder::new()
+            .name("meeting-probe".into())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    let result = meetings::probe().map_err(|error| format!("{error:#}"));
+                    if tx.send(result).is_err() {
+                        break;
+                    }
+                    for _ in 0..10 {
+                        if worker_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            });
+        match spawned {
+            Ok(_) => self.probe = Some((rx, stop)),
+            Err(error) => {
+                self.probe_error = Some(format!("Could not start meeting detection: {error}"))
+            }
+        }
+    }
+
+    fn describe(&self, settings: &meetings::Settings, capturing: bool) -> String {
+        if !settings.any() {
+            String::new()
+        } else if let Some(app) = self.owned.filter(|_| capturing) {
+            format!("Transcribing the {} meeting.", app.label())
+        } else if capturing {
+            "This capture is controlled manually.".into()
+        } else if let Some(app) = self.prompt {
+            format!(
+                "{} meeting detected. Choose whether to start a transcript.",
+                app.label()
+            )
+        } else if let Some(app) = self.suppressed {
+            format!("Transcription is paused for this {} meeting.", app.label())
+        } else if let Some(error) = &self.probe_error {
+            format!("Meeting detection is unavailable: {error}")
+        } else {
+            "Watching for a meeting.".into()
+        }
+    }
+}
+
+impl Drop for MeetingGlue {
+    fn drop(&mut self) {
+        if let Some((_, stop)) = &self.probe {
+            stop.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Shown while a relaunched Discord still exposes its debugger.
+pub(super) const DEBUGGER_NOTICE: &str = "Discord is running with its local debugger open. Any program on this computer can read or control that Discord window until you restart Discord without it.";
+
+fn companion_protocol_message(protocol: &str) -> Option<&'static str> {
+    match protocol {
+        "outdated" => Some(
+            "The Discord companion is older than this Articulate version. Update the companion from Settings, then restart Discord.",
+        ),
+        "newer" => Some(
+            "The Discord companion is newer than this Articulate version. Update Articulate to connect.",
+        ),
+        _ => None,
+    }
+}
+
 fn companion_audio_message(status: Option<&str>) -> Option<&'static str> {
     match status? {
         "preload-unavailable" | "addon-unavailable" => Some(
@@ -877,6 +1501,7 @@ mod tests {
         let mut snapshot = Snapshot {
             audio_status: None,
             companion_revision: None,
+            companion_protocol: None,
             status: Status::Ready,
             observation: Some(crate::discord::Observation {
                 at: Instant::now(),
@@ -898,21 +1523,120 @@ mod tests {
     }
 
     #[test]
+    fn meeting_prompts_are_answered_once_and_reported_in_the_typed_view() {
+        let (mut app, _) = super::super::tests::app();
+        app.settings.meetings.teams = true;
+        let view = app.desktop_meetings_status();
+        assert!(view.enabled && view.prompt.is_none() && view.owned.is_none());
+        assert!(app.desktop_meeting_respond(true).is_err());
+        app.discord_launch.meetings.prompt = Some(meetings::App::Teams);
+        app.discord_launch.meetings.events.push_back((
+            meetings::Event::Started {
+                app: meetings::App::Teams,
+                best_effort: false,
+            },
+            std::time::SystemTime::now(),
+        ));
+        let view = app.desktop_meetings_status();
+        let prompt = view.prompt.as_ref().unwrap();
+        assert_eq!(
+            (prompt.id, prompt.label, prompt.best_effort),
+            ("teams", "Microsoft Teams", false)
+        );
+        assert_eq!(view.events.len(), 1);
+        assert_eq!(view.events[0].kind, "started");
+        assert!(view.events[0].at_unix_ms > 0);
+        // Declining leaves the meeting alone until it ends.
+        app.desktop_meeting_respond(false).unwrap();
+        assert!(app.discord_launch.meetings.prompt.is_none());
+        assert_eq!(
+            app.discord_launch.meetings.suppressed,
+            Some(meetings::App::Teams)
+        );
+        assert!(app.discord_launch.meetings.pending_start.is_none());
+        assert!(app.desktop_meeting_respond(false).is_err());
+        // Accepting queues the start through the shared capture path.
+        app.discord_launch.meetings.prompt = Some(meetings::App::Meet);
+        app.desktop_meeting_respond(true).unwrap();
+        assert_eq!(
+            app.discord_launch.meetings.pending_start,
+            Some(meetings::App::Meet)
+        );
+        assert!(app.desktop_meetings_status().prompt.is_none());
+        let serialized = serde_json::to_value(app.desktop_meetings_status()).unwrap();
+        assert_eq!(serialized["settings"]["teams"], true);
+        assert_eq!(serialized["settings"]["start"], "ask");
+    }
+
+    #[test]
+    fn typed_discord_view_reports_editions_debugger_and_pictures() {
+        let (mut app, _) = super::super::tests::app();
+        app.settings.discord_flavor = "ptb".into();
+        app.settings.discord_debugger_port = 51234;
+        app.discord_launch.installed_flavors =
+            Some((Instant::now(), vec![Flavor::Stable, Flavor::Ptb]));
+        let view = app.desktop_discord_status();
+        assert_eq!(view.flavor, "ptb");
+        assert_eq!(view.installed_flavors, vec!["stable", "ptb"]);
+        assert!(view.debugger_open);
+        assert_eq!(view.debugger_port, 51234);
+        assert_eq!(view.debugger_notice, Some(DEBUGGER_NOTICE));
+        assert_eq!(view.companion_protocol, "unknown");
+        assert!(view.companion_protocol_message.is_none());
+        assert!(view.participants.is_empty());
+        assert_eq!(view.status, "disconnected");
+        assert!(view.error.is_none());
+        app.settings.discord_debugger_port = 0;
+        let view = app.desktop_discord_status();
+        assert!(!view.debugger_open && view.debugger_notice.is_none());
+        // The protocol message guides the user without exposing internals.
+        assert!(
+            companion_protocol_message("outdated")
+                .unwrap()
+                .contains("Update the companion")
+        );
+        assert!(
+            companion_protocol_message("newer")
+                .unwrap()
+                .contains("Update Articulate")
+        );
+        assert!(companion_protocol_message("current").is_none());
+        // Pictures are served only through identifiers and only while enabled.
+        app.settings.discord_avatars = false;
+        assert!(
+            app.desktop_discord_avatar(
+                "bytes://discord-avatar/123456/0123456789abcdef0123456789abcdef.png"
+            )
+            .is_none()
+        );
+        app.desktop_avatars_disabled();
+        assert!(app.discord_launch.avatars.is_none());
+        app.settings.discord_avatars = true;
+        assert!(
+            app.desktop_discord_avatar("https://cdn.discordapp.com/avatars/1/2.png")
+                .is_none()
+        );
+        assert!(
+            app.desktop_discord_avatar(
+                "bytes://discord-avatar/123456/0123456789abcdef0123456789abcdef.png"
+            )
+            .is_none(),
+            "not cached yet; the lookup is queued"
+        );
+        assert!(app.discord_launch.avatars.is_some());
+    }
+
+    #[test]
     fn automatic_status_explains_missing_connection_and_exposes_paused_retry() {
         let (mut app, _) = super::super::tests::app();
         app.settings.discord_auto_transcribe = true;
         app.poll_automatic_call();
         let state = app.desktop_discord_status();
-        assert_eq!(state["connected"], false);
-        assert_eq!(state["listener_started"], false);
-        assert_eq!(state["pairing_state"], "automatic");
-        assert_eq!(state["automatic_can_retry"], false);
-        assert!(
-            state["automatic_status"]
-                .as_str()
-                .unwrap()
-                .starts_with("Connect Discord")
-        );
+        assert!(!state.connected);
+        assert!(!state.listener_started);
+        assert_eq!(state.pairing_state, "automatic");
+        assert!(!state.automatic_can_retry);
+        assert!(state.automatic_status.starts_with("Connect Discord"));
         app.discord_launch.error = Some("Synthetic listener failure".into());
         app.poll_automatic_call();
         assert!(
@@ -920,12 +1644,12 @@ mod tests {
                 .automatic_status
                 .contains("Synthetic listener failure")
         );
-        assert_eq!(app.desktop_discord_status()["automatic_can_retry"], true);
+        assert!(app.desktop_discord_status().automatic_can_retry);
         app.discord_launch.error = None;
         app.discord_launch.automation.suppressed = Some("123".into());
-        assert_eq!(app.desktop_discord_status()["automatic_can_retry"], true);
+        assert!(app.desktop_discord_status().automatic_can_retry);
         app.discord_launch.automation.retry();
-        assert_eq!(app.desktop_discord_status()["automatic_can_retry"], false);
+        assert!(!app.desktop_discord_status().automatic_can_retry);
         app.call = Some(call_capture::Control::new());
         assert!(app.desktop_discord_retry().is_err());
     }
@@ -1723,5 +2447,122 @@ mod tests {
             ),
             Some(AutoAction::Start)
         );
+    }
+
+    #[test]
+    fn meeting_evidence_expires_when_probes_fail_and_never_starts_stale() {
+        let settings = meetings::Settings {
+            teams: true,
+            ..Default::default()
+        };
+        let present = vec![meetings::Evidence {
+            app: meetings::App::Teams,
+            running: true,
+            capturing: true,
+        }];
+        let mut glue = MeetingGlue::default();
+        let (tx, rx) = mpsc::channel();
+        glue.probe = Some((rx, Arc::new(AtomicBool::new(false))));
+        let at = Instant::now();
+        let second = |n: u64| at + Duration::from_secs(n);
+        // One good probe, then failures: the single observation ages past the
+        // grace before the start debounce could complete, so nothing starts.
+        tx.send(Ok(present.clone())).unwrap();
+        assert!(glue.advance(at, &settings).is_empty());
+        tx.send(Err("probe failed".into())).unwrap();
+        for n in 1..=6 {
+            assert!(glue.advance(second(n), &settings).is_empty(), "{n}");
+        }
+        assert_eq!(glue.probe_error.as_deref(), Some("probe failed"));
+        assert!(glue.detector.active().is_empty());
+        assert!(
+            glue.latest.is_some(),
+            "the stale probe is kept, not trusted"
+        );
+        // Fresh evidence every second confirms a meeting after the debounce.
+        for n in 10..=13 {
+            tx.send(Ok(present.clone())).unwrap();
+            let events = glue.advance(second(n), &settings);
+            if n == 13 {
+                assert!(matches!(events[0], meetings::Event::Started { .. }));
+            } else {
+                assert!(events.is_empty(), "{n}");
+            }
+        }
+        assert!(glue.probe_error.is_none());
+        assert_eq!(glue.detector.active(), vec![meetings::App::Teams]);
+        // A transient failure within the grace keeps the meeting; a stalled
+        // probe is bounded by the grace plus the end debounce.
+        tx.send(Err("probe failed".into())).unwrap();
+        assert!(glue.advance(second(15), &settings).is_empty());
+        assert_eq!(glue.detector.active(), vec![meetings::App::Teams]);
+        assert!(glue.advance(second(16), &settings).is_empty());
+        assert!(glue.advance(second(20), &settings).is_empty());
+        assert_eq!(
+            glue.advance(second(21), &settings),
+            vec![meetings::Event::Ended {
+                app: meetings::App::Teams
+            }]
+        );
+        assert!(glue.detector.active().is_empty());
+        // The grace is shorter than the start debounce by construction.
+        assert!(EVIDENCE_GRACE < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn pairing_changes_roll_back_when_saving_fails_and_mirror_the_pairing_file() {
+        let (mut app, _) = super::super::tests::app();
+        let directory = crate::model::data_dir();
+        let _ = std::fs::remove_file(directory.join(crate::discord::pairing::FILE_NAME));
+        app.settings.discord_companion = true;
+        app.settings.discord_auto_connect = false;
+        app.settings.discord_pairing_key = crate::discord::plugin::new_token().unwrap();
+        let original = app.settings.discord_pairing_key.clone();
+        // Startup mirrors a key restored by other means into the pairing file.
+        app.poll_discord_connection();
+        assert_eq!(
+            crate::discord::pairing::read(&directory)
+                .unwrap()
+                .as_deref(),
+            Some(original.as_str())
+        );
+        // A failed save leaves the key, the auto-connect choice, the pairing
+        // file and the running listener exactly as they were.
+        app.discord = Some(crate::discord::Connection::start(1));
+        app.settings.discord_auto_connect = true;
+        app.settings.save_blocked = Some("disk is read-only".into());
+        let error = app.desktop_discord_rotate_key().unwrap_err();
+        assert!(error.contains("read-only"), "{error}");
+        assert_eq!(app.settings.discord_pairing_key, original);
+        assert!(app.settings.discord_auto_connect);
+        assert!(app.discord.is_some(), "the listener keeps running");
+        assert_eq!(
+            crate::discord::pairing::read(&directory)
+                .unwrap()
+                .as_deref(),
+            Some(original.as_str())
+        );
+        let error = app.desktop_discord_forget_pairing().unwrap_err();
+        assert!(error.contains("read-only"), "{error}");
+        assert_eq!(app.settings.discord_pairing_key, original);
+        assert!(app.settings.discord_auto_connect);
+        assert!(app.discord.is_some());
+        // Once saving works again, the rotation replaces both copies of the key
+        // and forgetting removes the pairing file with it.
+        app.settings.save_blocked = None;
+        app.settings.discord_auto_connect = false;
+        app.desktop_discord_rotate_key().unwrap();
+        let rotated = app.settings.discord_pairing_key.clone();
+        assert_ne!(rotated, original);
+        assert!(app.discord.is_none(), "the old listener was stopped");
+        assert_eq!(
+            crate::discord::pairing::read(&directory)
+                .unwrap()
+                .as_deref(),
+            Some(rotated.as_str())
+        );
+        app.desktop_discord_forget_pairing().unwrap();
+        assert!(app.settings.discord_pairing_key.is_empty());
+        assert_eq!(crate::discord::pairing::read(&directory).unwrap(), None);
     }
 }

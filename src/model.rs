@@ -1,11 +1,9 @@
-use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
-use std::{
-    fs::{self, File},
-    io::{Read, Write},
-    path::PathBuf,
-    time::Duration,
-};
+use anyhow::{Context, Result};
+#[path = "download.rs"]
+#[allow(dead_code)]
+pub mod download;
+use std::sync::{Arc, atomic::AtomicBool};
+use std::{fs, path::PathBuf};
 
 pub const NAME: &str = "Qwen3-ASR-1.7B-Q8_0.gguf";
 pub const SIZE: u64 = 2_185_030_624;
@@ -29,10 +27,18 @@ pub fn data_dir() -> PathBuf {
         }
         return std::env::temp_dir().join(format!("articulate-tests-{}", std::process::id()));
     }
-    std::env::var_os("LOCALAPPDATA")
+    let directory = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("TranscribeLocal")
+        .join("TranscribeLocal");
+    static CLEANUP: std::sync::Once = std::sync::Once::new();
+    CLEANUP.call_once(|| {
+        let _ = download::prune_stale(
+            &directory.join("models"),
+            std::time::Duration::from_secs(7 * 86400),
+        );
+    });
+    directory
 }
 pub fn default_path() -> PathBuf {
     data_dir().join("models").join(NAME)
@@ -60,11 +66,20 @@ pub fn download(mut progress: impl FnMut(f32)) -> Result<PathBuf> {
     reason = "Preserve speaker-model download for React audio setup"
 )]
 pub fn download_speakers(mut progress: impl FnMut(f32)) -> Result<PathBuf> {
-    download_file(
+    download_speakers_cancellable(&Arc::new(AtomicBool::new(false)), &mut progress)
+}
+
+#[allow(dead_code)]
+pub fn download_speakers_cancellable(
+    cancel: &Arc<AtomicBool>,
+    mut progress: impl FnMut(f32),
+) -> Result<PathBuf> {
+    download_file_cancellable(
         crate::speakers::NAME,
         236606560,
         "62faec7b99ad23e323087597604b50728abe85089b6364970b019a845547bf99",
         "https://huggingface.co/handy-computer/diar_streaming_sortformer_4spk-v2.1-gguf/resolve/ae4afbb5c3d33b71cf2dbf600022b655ee706dd0/diar_streaming_sortformer_4spk-v2.1-F16.gguf",
+        cancel,
         &mut progress,
     )
 }
@@ -76,44 +91,221 @@ pub(crate) fn download_file(
     url: &str,
     progress: &mut impl FnMut(f32),
 ) -> Result<PathBuf> {
+    download_file_cancellable(
+        name,
+        size,
+        expected_hash,
+        url,
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    )
+}
+
+#[allow(dead_code)]
+pub fn download_file_cancellable(
+    name: &str,
+    size: u64,
+    expected_hash: &str,
+    url: &str,
+    cancel: &Arc<AtomicBool>,
+    progress: &mut impl FnMut(f32),
+) -> Result<PathBuf> {
+    anyhow::ensure!(
+        std::path::Path::new(name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            == Some(name)
+            && !name.contains(['/', '\\', ':']),
+        "Invalid model filename"
+    );
+    let _lease = match name {
+        NAME => Some(acquire(ModelId::Speech)),
+        VERIFIER_NAME => Some(acquire(ModelId::Verifier)),
+        crate::speakers::NAME => Some(acquire(ModelId::Speaker)),
+        "sensevoice-small-q8.gguf" => Some(acquire(ModelId::SoundCues)),
+        _ => None,
+    };
     let path = data_dir().join("models").join(name);
     fs::create_dir_all(path.parent().context("Missing model directory")?)?;
-    let part = path.with_extension("gguf.part");
-    let result = (|| {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(1800)))
-            .build();
-        let agent: ureq::Agent = config.into();
-        let mut response = agent.get(url).call().context("Model download failed")?;
-        let mut reader = response.body_mut().as_reader();
-        let mut file = File::create(&part)?;
-        let mut buffer = vec![0u8; 256 * 1024];
-        let mut hash = Sha256::new();
-        let mut received = 0u64;
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
+    download::fetch(
+        download::Artifact {
+            url,
+            destination: &path,
+            size,
+            sha: expected_hash,
+            stage: "Downloading model",
+        },
+        cancel,
+        &mut |_, fraction| {
+            if let Some(value) = fraction {
+                progress(value)
             }
-            received += count as u64;
-            if received > size {
-                bail!("Downloaded model has an unexpected size");
-            }
-            hash.update(&buffer[..count]);
-            file.write_all(&buffer[..count])?;
-            progress(received as f32 / size as f32);
+        },
+    )?;
+    Ok(path)
+}
+
+#[allow(dead_code)]
+pub fn download_cancellable(
+    cancel: &Arc<AtomicBool>,
+    mut progress: impl FnMut(f32),
+) -> Result<PathBuf> {
+    download_file_cancellable(NAME, SIZE, SHA256, URL, cancel, &mut progress)
+}
+#[allow(dead_code)]
+pub fn download_verifier_cancellable(
+    cancel: &Arc<AtomicBool>,
+    mut progress: impl FnMut(f32),
+) -> Result<PathBuf> {
+    download_file_cancellable(
+        VERIFIER_NAME,
+        VERIFIER_SIZE,
+        VERIFIER_SHA256,
+        VERIFIER_URL,
+        cancel,
+        &mut progress,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelId {
+    Speech,
+    Verifier,
+    Speaker,
+    SoundCues,
+    Polish,
+    Notes,
+}
+#[derive(serde::Serialize)]
+pub struct ModelInfo {
+    pub id: ModelId,
+    pub installed: bool,
+    pub disk_size: u64,
+    pub path: PathBuf,
+    pub in_use: bool,
+}
+static MODEL_USERS: std::sync::Mutex<Vec<ModelId>> = std::sync::Mutex::new(Vec::new());
+/// Retain this lease for the complete lifetime of an inference engine or download.
+pub struct ModelLease(ModelId);
+impl Drop for ModelLease {
+    fn drop(&mut self) {
+        let mut users = MODEL_USERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = users.iter().position(|id| *id == self.0) {
+            users.remove(index);
         }
-        if received != size || format!("{:x}", hash.finalize()) != expected_hash {
-            bail!("Model integrity check failed. Please retry the download.");
-        }
-        file.sync_all()?;
-        drop(file);
-        // Replace only after verification, without first deleting a valid model.
-        fs::rename(&part, &path)?;
-        Ok(path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(part);
     }
-    result
+}
+#[allow(dead_code)]
+pub fn acquire(id: ModelId) -> ModelLease {
+    MODEL_USERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(id);
+    ModelLease(id)
+}
+fn managed_path(id: ModelId) -> PathBuf {
+    match id {
+        ModelId::Speech => data_dir().join("models").join(NAME),
+        ModelId::Verifier => verifier_path(),
+        ModelId::Speaker => data_dir().join("models").join(crate::speakers::NAME),
+        ModelId::SoundCues => data_dir().join("models").join("sensevoice-small-q8.gguf"),
+        ModelId::Polish => crate::polish::model_path(crate::polish::ModelProfile::Polish),
+        ModelId::Notes => crate::polish::model_path(crate::polish::ModelProfile::Summary),
+    }
+}
+#[allow(dead_code)]
+pub fn list_models() -> Vec<ModelInfo> {
+    let users = MODEL_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    [
+        ModelId::Speech,
+        ModelId::Verifier,
+        ModelId::Speaker,
+        ModelId::SoundCues,
+        ModelId::Polish,
+        ModelId::Notes,
+    ]
+    .into_iter()
+    .map(|id| {
+        let path = managed_path(id);
+        let disk_size = path.metadata().map_or(0, |m| m.len());
+        let installed = match id {
+            ModelId::Speech => disk_size == SIZE,
+            ModelId::Verifier => disk_size == VERIFIER_SIZE,
+            ModelId::Speaker => disk_size == 236_606_560,
+            ModelId::SoundCues => crate::sensevoice::installed(),
+            ModelId::Polish => {
+                crate::polish::profile_installed(crate::polish::ModelProfile::Polish)
+            }
+            ModelId::Notes => {
+                crate::polish::profile_installed(crate::polish::ModelProfile::Summary)
+            }
+        };
+        ModelInfo {
+            id,
+            installed,
+            disk_size,
+            path,
+            in_use: users.contains(&id),
+        }
+    })
+    .collect()
+}
+#[allow(dead_code)]
+pub fn delete_model(id: ModelId) -> Result<()> {
+    let users = MODEL_USERS.lock().unwrap_or_else(|e| e.into_inner());
+    anyhow::ensure!(!users.contains(&id), "This model is in use");
+    let path = managed_path(id);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let _ = fs::remove_file(path.with_extension("verified.json"));
+    crate::polish::invalidate_install_state();
+    Ok(())
+}
+
+pub fn acquire_path(path: &std::path::Path) -> Option<ModelLease> {
+    let canonical = path.canonicalize().ok();
+    let id = [
+        ModelId::Speech,
+        ModelId::Verifier,
+        ModelId::Speaker,
+        ModelId::SoundCues,
+        ModelId::Polish,
+        ModelId::Notes,
+    ]
+    .into_iter()
+    .find(|id| {
+        let managed = managed_path(*id);
+        path == managed
+            || canonical
+                .as_ref()
+                .is_some_and(|path| managed.canonicalize().ok().as_ref() == Some(path))
+    });
+    id.map(acquire)
+}
+
+#[cfg(test)]
+mod management_tests {
+    use super::*;
+    #[test]
+    fn custom_paths_do_not_lease_managed_models() {
+        assert!(acquire_path(&std::env::temp_dir().join("custom-fixture.gguf")).is_none());
+        assert!(acquire_path(&managed_path(ModelId::Speech)).is_some());
+    }
+    #[test]
+    fn active_lease_prevents_deletion() {
+        let lease = acquire(ModelId::Speech);
+        assert!(
+            list_models()
+                .iter()
+                .find(|m| m.id == ModelId::Speech)
+                .unwrap()
+                .in_use
+        );
+        assert!(delete_model(ModelId::Speech).is_err());
+        drop(lease);
+    }
 }

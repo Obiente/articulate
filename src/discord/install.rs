@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{Arc, OnceLock, atomic::AtomicBool},
     thread,
     time::{Duration, Instant},
 };
@@ -17,15 +17,19 @@ const SOURCE_REVISION: &str = "59a54286542651fff5ea53f0ce6cadf2a6aa7521";
 const SOURCE_URL: &str =
     "https://codeload.github.com/Vendicated/Vencord/zip/59a54286542651fff5ea53f0ce6cadf2a6aa7521";
 const SOURCE_SHA256: &str = "8b58c3eef5c93ecd94b8950a5ef47001e4da3c22e90175b02eb736141b3ece57";
+const SOURCE_SIZE: u64 = 1_258_924;
 const INSTALLER_URL: &str =
     "https://github.com/Vencord/Installer/releases/download/v1.4.2/VencordInstaller.exe";
 const INSTALLER_SHA256: &str = "1cb4115a99a8b7a0b0371dddb2ac7dde38b9acc23f53a69540319b4b7ca6c2da";
+const INSTALLER_SIZE: u64 = 11_566_080;
 #[cfg(windows)]
 const NODE_FOLDER: &str = "node-v22.23.2-win-x64";
 #[cfg(windows)]
 const NODE_URL: &str = "https://nodejs.org/dist/v22.23.2/node-v22.23.2-win-x64.zip";
 #[cfg(windows)]
 const NODE_SHA256: &str = "1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97";
+#[cfg(windows)]
+const NODE_SIZE: u64 = 35_683_585;
 const MANIFEST: &str = ".articulate-companion.json";
 const NATIVE_FILES: [(&str, &[u8]); 5] = [
     (
@@ -610,9 +614,15 @@ fn ensure_node(progress: &impl Fn(&str)) -> Result<PathBuf> {
             );
             return Ok(node);
         }
-        progress("Downloading the verified local Node.js build tools…");
         let archive = runtimes.join(format!("{NODE_FOLDER}.zip"));
-        download(NODE_URL, NODE_SHA256, &archive, 128 * 1024 * 1024)?;
+        download(
+            NODE_URL,
+            NODE_SHA256,
+            NODE_SIZE,
+            &archive,
+            "Downloading the verified local Node.js build tools",
+            progress,
+        )?;
         let stage = runtimes.join(format!("extract-{}", super::plugin::new_token()?));
         fs::create_dir(&stage)?;
         extract_archive(&archive, &stage)?;
@@ -670,6 +680,10 @@ fn build(source: &Path, native: bool, progress: &impl Fn(&str)) -> Result<()> {
             "pnpm",
             "install",
             "--frozen-lockfile",
+            // Transitive packages must not run lifecycle scripts on this machine.
+            // The pinned build only needs esbuild, whose Windows binary arrives
+            // as an optional dependency rather than through its postinstall step.
+            "--ignore-scripts",
         ]);
         run(command, source, &log, Duration::from_secs(1800))?;
     }
@@ -888,34 +902,46 @@ impl Drop for ToolJob {
     }
 }
 
-fn download(url: &str, expected: &str, destination: &Path, limit: u64) -> Result<()> {
+/// Fetches one pinned artifact through the shared resumable downloader
+/// (HTTPS only, exact size, SHA-256, bounded retries) and reports its
+/// progress as a percentage. A complete cached file is verified again and
+/// reused; a changed one is refused rather than overwritten.
+fn download(
+    url: &str,
+    expected: &str,
+    size: u64,
+    destination: &Path,
+    stage: &str,
+    progress: &impl Fn(&str),
+) -> Result<()> {
+    let cancel = Arc::new(AtomicBool::new(false));
     if destination.exists() {
-        ordinary(destination)?;
-        ensure!(
-            hash(&bounded_read(destination, limit)?) == expected,
-            "A cached download has changed. Remove it before retrying."
-        );
-        return Ok(());
+        return crate::model::download::verified(destination, size, expected, &cancel)
+            .context("A cached download has changed. Remove it before retrying.");
     }
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(180)))
-        .build();
-    let mut response = config
-        .new_agent()
-        .get(url)
-        .call()
-        .context("The verified download could not be fetched")?;
-    let mut bytes = Vec::new();
-    response
-        .body_mut()
-        .as_reader()
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= limit && hash(&bytes) == expected,
-        "Downloaded file failed size or SHA-256 verification"
-    );
-    write_new(destination, &bytes)
+    progress(&format!("{stage}…"));
+    let mut last_percent = None;
+    crate::model::download::fetch(
+        crate::model::download::Artifact {
+            url,
+            destination,
+            size,
+            sha: expected,
+            stage,
+        },
+        &cancel,
+        &mut |step, fraction| {
+            let percent = fraction.map(|fraction| (fraction * 100.0).clamp(0.0, 100.0) as u8);
+            if percent != last_percent || step != stage {
+                last_percent = percent;
+                match percent {
+                    Some(percent) => progress(&format!("{step}… {percent}%")),
+                    None => progress(&format!("{step}…")),
+                }
+            }
+        },
+    )
+    .with_context(|| format!("{stage} failed"))
 }
 
 /// Creates a private, pinned source checkout. Does not touch Discord or installed Vencord.
@@ -929,8 +955,14 @@ pub fn prepare_managed(progress: impl Fn(&str)) -> Result<Plan> {
     fs::create_dir_all(&cache)?;
     ordinary(&cache)?;
     let archive = cache.join(format!("Vencord-{SOURCE_REVISION}.zip"));
-    progress("Downloading the verified Vencord source…");
-    download(SOURCE_URL, SOURCE_SHA256, &archive, 32 * 1024 * 1024)?;
+    download(
+        SOURCE_URL,
+        SOURCE_SHA256,
+        SOURCE_SIZE,
+        &archive,
+        "Downloading the verified Vencord source",
+        &progress,
+    )?;
     let stage = cache.join(format!("extract-{}", super::plugin::new_token()?));
     fs::create_dir(&stage)?;
     extract_archive(&archive, &stage)?;
@@ -997,12 +1029,13 @@ pub fn open_installer(source: &Path, progress: impl Fn(&str)) -> Result<()> {
     fs::create_dir_all(&cache)?;
     ordinary(&cache)?;
     let installer = cache.join("VencordInstaller-1.4.2.exe");
-    progress("Downloading the verified Vencord installer…");
     download(
         INSTALLER_URL,
         INSTALLER_SHA256,
+        INSTALLER_SIZE,
         &installer,
-        32 * 1024 * 1024,
+        "Downloading the verified Vencord installer",
+        &progress,
     )?;
     Command::new(&installer)
         .env("VENCORD_USER_DATA_DIR", external_path(&source))
@@ -1079,6 +1112,73 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn cached_downloads_are_verified_by_size_and_digest_before_reuse() {
+        let fixture = Fixture::new();
+        let bytes: Vec<u8> = (0..200_000_u32).map(|i| (i % 251) as u8).collect();
+        let expected = hash(&bytes);
+        let destination = fixture.0.join("archive.zip");
+        fs::write(&destination, &bytes).unwrap();
+        let messages = std::cell::RefCell::new(Vec::new());
+        let progress = |message: &str| messages.borrow_mut().push(message.to_owned());
+        download(
+            "https://example.invalid/archive.zip",
+            &expected,
+            bytes.len() as u64,
+            &destination,
+            "Downloading",
+            &progress,
+        )
+        .unwrap();
+        assert!(
+            messages.borrow().is_empty(),
+            "a verified cache needs no network"
+        );
+        assert!(
+            download(
+                "https://example.invalid/archive.zip",
+                &"0".repeat(64),
+                bytes.len() as u64,
+                &destination,
+                "Downloading",
+                &progress,
+            )
+            .is_err(),
+            "a changed cached file is refused"
+        );
+        assert!(
+            download(
+                "https://example.invalid/archive.zip",
+                &expected,
+                bytes.len() as u64 + 1,
+                &destination,
+                "Downloading",
+                &progress,
+            )
+            .is_err(),
+            "the pinned size must match"
+        );
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            bytes,
+            "verification never rewrites"
+        );
+        // Nothing may be fetched over plain HTTP or from an unpinned manifest.
+        let missing = fixture.0.join("missing.zip");
+        assert!(
+            download(
+                "http://example.invalid/archive.zip",
+                &expected,
+                bytes.len() as u64,
+                &missing,
+                "Downloading",
+                &progress,
+            )
+            .is_err()
+        );
+        assert!(!missing.exists());
+    }
+
     #[test]
     fn companion_revision_covers_templates_native_payload_and_preload() {
         let plugin: &[(&str, &[u8])] = &[("index.ts", b"plugin")];

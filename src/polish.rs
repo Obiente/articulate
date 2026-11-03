@@ -3,8 +3,8 @@ mod guard;
 mod install;
 pub(crate) mod runtime;
 pub(crate) mod speech;
+mod stamp;
 mod transfer;
-mod transport;
 
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -31,10 +31,11 @@ pub const MAX_BYTES: usize = 1600;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Style {
-    #[default]
-    Clear,
     Professional,
     Casual,
+    #[default]
+    #[serde(other)]
+    Clear,
 }
 
 #[derive(Clone)]
@@ -117,6 +118,17 @@ pub struct Job {
     events: Receiver<Event>,
 }
 impl Job {
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, mpsc::Sender<Event>) {
+        let (tx, events) = mpsc::channel();
+        (
+            Self {
+                cancel: Arc::new(AtomicBool::new(false)),
+                events,
+            },
+            tx,
+        )
+    }
     pub fn try_recv(&self) -> std::result::Result<Event, TryRecvError> {
         self.events.try_recv()
     }
@@ -243,6 +255,15 @@ fn progress(events: &mpsc::Sender<Event>, stage: &str, fraction: Option<f32>) {
         stage: stage.into(),
         fraction,
     });
+}
+
+#[allow(dead_code)]
+pub fn model_path(profile: ModelProfile) -> std::path::PathBuf {
+    install::model_for(profile)
+}
+#[allow(dead_code)]
+pub fn invalidate_install_state() {
+    install::invalidate_install_state();
 }
 
 #[cfg(test)]

@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{
-        atomic::Ordering,
+        Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::{Duration, Instant},
@@ -19,6 +20,7 @@ use transcribe_cpp::CancelToken;
 
 mod assort_ui;
 mod brain_ui;
+pub(crate) mod call_tools;
 mod capture_feedback;
 
 pub(crate) mod desktop;
@@ -34,6 +36,9 @@ mod transcript_editor;
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
+    close_to_tray: bool,
+    start_with_windows: bool,
+    automatic_update_checks: bool,
     cpu: bool,
     insert: bool,
     entries: Vec<Entry>,
@@ -54,16 +59,34 @@ struct Settings {
     audio_feedback: bool,
     audio_context: bool,
     styles: Vec<crate::writing_style::StyleRule>,
+    spoken_editing_commands: bool,
+    input_profiles: Vec<crate::writing_style::InputProfile>,
     discord_companion: bool,
     discord_pairing_key: String,
     #[serde(default = "enabled")]
     discord_auto_connect: bool,
     discord_auto_transcribe: bool,
     discord_standard_configured: bool,
+    /// Installed Discord edition to relaunch: "stable", "ptb", "canary" or "" for automatic.
+    discord_flavor: String,
+    /// Loopback debugger port of the last Articulate relaunch, or 0 when none is open.
+    discord_debugger_port: u16,
+    #[serde(default = "enabled")]
+    discord_avatars: bool,
     vencord_source: String,
     vencord_auto_update: bool,
+    meetings: crate::meetings::Settings,
     assort: assort_ui::Configuration,
     polish_style: crate::polish::Style,
+    /// Encrypt history and this file with Windows DPAPI for the current user.
+    encrypt_at_rest: bool,
+    /// Optional automatic deletion of old sessions.
+    retention: crate::history::retention::Policy,
+    /// Keep call audio beside the transcript by default (off unless chosen).
+    keep_call_audio: bool,
+    /// Set when the saved file could not be read, so it is never overwritten.
+    #[serde(skip)]
+    save_blocked: Option<String>,
 }
 fn enabled() -> bool {
     true
@@ -77,6 +100,9 @@ fn default_quick_note_hotkey() -> platform::Hotkey {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            close_to_tray: false,
+            start_with_windows: false,
+            automatic_update_checks: true,
             cpu: false,
             insert: false,
             entries: Vec::new(),
@@ -94,15 +120,25 @@ impl Default for Settings {
             audio_feedback: true,
             audio_context: false,
             styles: Vec::new(),
+            spoken_editing_commands: false,
+            input_profiles: Vec::new(),
             discord_companion: false,
             discord_pairing_key: String::new(),
             discord_auto_connect: true,
             discord_auto_transcribe: false,
             discord_standard_configured: false,
+            discord_flavor: String::new(),
+            discord_debugger_port: 0,
+            discord_avatars: true,
             vencord_source: String::new(),
             vencord_auto_update: false,
+            meetings: Default::default(),
             assort: Default::default(),
             polish_style: Default::default(),
+            encrypt_at_rest: false,
+            retention: Default::default(),
+            keep_call_audio: false,
+            save_blocked: None,
         }
     }
 }
@@ -111,8 +147,11 @@ enum Command {
     Load(PathBuf, bool, Option<String>),
     Transcribe(Vec<f32>, u64, bool, CancelToken),
     Call(calls::Request, CancelToken),
+    /// Import a file or rebuild a transcript from retained audio.
+    File(call_tools::FileJob, CancelToken),
 }
 enum Event {
+    MicrophoneChecked(Result<audio::AudioCheck, String>),
     Loaded(String, Vec<String>),
     Text(Result<String, String>, f32, u64, bool),
     Error(String),
@@ -120,6 +159,7 @@ enum Event {
     Downloaded(PathBuf),
     Call(calls::Update),
     CallFinished(Result<(), String>),
+    File(call_tools::FileEvent),
     #[allow(
         dead_code,
         reason = "Speaker model download event retained for model management"
@@ -138,6 +178,7 @@ pub struct App {
     polish: polish_ui::State,
     pending_install: Option<crate::update::InstallRequest>,
     history: history_ui::State,
+    call_tools: call_tools::State,
     insights: insights_ui::State,
     saved_search: search_ui::State,
     brain: brain_ui::State,
@@ -176,6 +217,7 @@ pub struct App {
     busy: bool,
     ready: bool,
     downloading: Option<f32>,
+    model_cancels: std::collections::HashMap<model::ModelId, Arc<AtomicBool>>,
     status: String,
     backend: String,
     speech_languages: Vec<String>,
@@ -188,6 +230,11 @@ pub struct App {
     utterance: u64,
     preview_inflight: bool,
     preview_audio_seconds: f32,
+    capture_interruption: Option<String>,
+    dictation_editor: macros::DictationEditor,
+    recording_spoken_editing: bool,
+    last_dictation_text: String,
+    microphone_check: desktop::actions::capture::MicrophoneCheck,
     pending_final: Option<Vec<f32>>,
     cleanup_count: usize,
     microphones: Vec<String>,
@@ -226,16 +273,31 @@ pub struct App {
     last_seconds: u64,
 }
 
+/// Parse stored preferences in either plaintext or encrypted form.
+fn parse_settings(bytes: Vec<u8>) -> anyhow::Result<Settings> {
+    Ok(serde_json::from_slice(&crate::history::protect::open(
+        bytes,
+    )?)?)
+}
+
 fn save_settings(directory: &std::path::Path, settings: &Settings) -> anyhow::Result<()> {
+    use crate::history::protect;
     use std::io::Write;
     static SAVES: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(reason) = &settings.save_blocked {
+        anyhow::bail!("{reason}");
+    }
     // Serialize replacement within this process. Separate processes never share
     // a temporary file, so a failed save cannot remove another writer's data.
     let _guard = SAVES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::fs::create_dir_all(directory)?;
+    let bytes = protect::seal_if(
+        settings.encrypt_at_rest,
+        serde_json::to_vec_pretty(settings)?,
+    )?;
     let temp = directory.join(format!(
         "settings-{}-{}.tmp",
         std::process::id(),
@@ -245,11 +307,25 @@ fn save_settings(directory: &std::path::Path, settings: &Settings) -> anyhow::Re
         .write(true)
         .create_new(true)
         .open(&temp)?;
+    let main = directory.join("settings.json");
     let result = (|| -> anyhow::Result<()> {
-        file.write_all(&serde_json::to_vec_pretty(settings)?)?;
+        file.write_all(&bytes)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temp, directory.join("settings.json"))?;
+        // Keep the previous good file. A damaged one never replaces a good backup,
+        // and the backup follows the current encryption choice.
+        let backup = directory.join("settings.json.bak");
+        if let Ok(previous) = std::fs::read(&main)
+            && let Ok(plain) = protect::open(previous)
+            && serde_json::from_slice::<Settings>(&plain).is_ok()
+        {
+            protect::write_atomic(&backup, &protect::seal_if(settings.encrypt_at_rest, plain)?)?;
+        } else {
+            // The backup is kept, but always in the current form. A failure
+            // here is reported by `migrate_settings_copies`.
+            let _ = protect::migrate_file(&backup, settings.encrypt_at_rest, MAX_SETTINGS_BYTES);
+        }
+        std::fs::rename(&temp, &main)?;
         Ok(())
     })();
     if result.is_err() {
@@ -258,17 +334,300 @@ fn save_settings(directory: &std::path::Path, settings: &Settings) -> anyhow::Re
     result
 }
 
+/// Largest preferences file read or migrated.
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Where loaded preferences came from. Only `Main` confirms the saved
+/// encryption choice: a backup can predate it, and defaults know nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsSource {
+    Main,
+    Backup,
+    Defaults,
+}
+
+/// The last good preferences, if `settings.json.bak` holds a valid copy.
+fn read_settings_backup(directory: &std::path::Path) -> Option<Settings> {
+    std::fs::read(directory.join("settings.json.bak"))
+        .ok()
+        .and_then(|bytes| parse_settings(bytes).ok())
+}
+
+/// Load preferences without ever letting a later save destroy unreadable data.
+///
+/// A file that cannot be parsed or decrypted is renamed to
+/// `settings.corrupt-<timestamp>.json` before anything can save, then the last
+/// good `settings.json.bak` is used if there is one. The backup is also used
+/// when `settings.json` is missing. A file that cannot be read at all (for
+/// example, it is locked) blocks saving until restart instead.
+fn load_settings(directory: &std::path::Path) -> (Settings, Option<String>, SettingsSource) {
+    let main = directory.join("settings.json");
+    let mut attempt = 0;
+    let bytes = loop {
+        match std::fs::read(&main) {
+            Ok(bytes) => break bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return match read_settings_backup(directory) {
+                    Some(settings) => (
+                        settings,
+                        Some(
+                            "Saved settings were missing, so your previous settings were restored."
+                                .into(),
+                        ),
+                        SettingsSource::Backup,
+                    ),
+                    None => (Settings::default(), None, SettingsSource::Defaults),
+                };
+            }
+            // Antivirus, backup and indexing tools hold files briefly.
+            Err(_) if attempt < 4 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(50 * attempt));
+            }
+            Err(e) => {
+                let reason = format!(
+                    "Saved settings could not be read ({e}). Default settings are in use, and changes will not be saved until Articulate restarts so your saved file is not replaced."
+                );
+                return (
+                    Settings {
+                        save_blocked: Some(reason.clone()),
+                        ..Default::default()
+                    },
+                    Some(reason),
+                    SettingsSource::Defaults,
+                );
+            }
+        }
+    };
+    let error = match parse_settings(bytes) {
+        Ok(settings) => return (settings, None, SettingsSource::Main),
+        Err(error) if error.is::<crate::history::protect::Undecryptable>() => {
+            "they are encrypted for a different Windows account"
+        }
+        Err(_) => "they are damaged",
+    };
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut moved = None;
+    for suffix in 0..100 {
+        let name = if suffix == 0 {
+            format!("settings.corrupt-{stamp}.json")
+        } else {
+            format!("settings.corrupt-{stamp}-{suffix}.json")
+        };
+        let target = directory.join(&name);
+        if target.exists() {
+            continue;
+        }
+        if std::fs::rename(&main, &target).is_ok() {
+            moved = Some(name);
+        }
+        break;
+    }
+    let Some(moved) = moved else {
+        let reason = format!(
+            "Saved settings could not be used because {error}. Default settings are in use, and changes will not be saved until Articulate restarts so your saved file is not replaced."
+        );
+        return (
+            Settings {
+                save_blocked: Some(reason.clone()),
+                ..Default::default()
+            },
+            Some(reason),
+            SettingsSource::Defaults,
+        );
+    };
+    match read_settings_backup(directory) {
+        Some(settings) => (
+            settings,
+            Some(format!(
+                "Saved settings could not be used because {error}. They were kept as {moved}, and your previous settings were restored."
+            )),
+            SettingsSource::Backup,
+        ),
+        None => (
+            Settings::default(),
+            Some(format!(
+                "Saved settings could not be used because {error}. They were kept as {moved}, and default settings are in use."
+            )),
+            SettingsSource::Defaults,
+        ),
+    }
+}
+
+/// Preferences ready for startup.
+struct StartupSettings {
+    settings: Settings,
+    warning: Option<String>,
+    /// The saved encryption choice was read from `settings.json`, so an
+    /// interrupted encryption change may be completed in either direction.
+    /// Otherwise stored files are left in their current form.
+    protection_confirmed: bool,
+}
+
+/// Load preferences and settle how stored data is protected.
+///
+/// Recovered or default preferences never turn encryption off: if any stored
+/// file is encrypted, encryption stays on. Preferences recovered from the
+/// backup are installed again as `settings.json`.
+fn load_startup_settings(data: &std::path::Path) -> StartupSettings {
+    let (mut settings, mut warning, source) = load_settings(data);
+    if source == SettingsSource::Main {
+        return StartupSettings {
+            settings,
+            warning,
+            protection_confirmed: true,
+        };
+    }
+    if !settings.encrypt_at_rest && protected_data_present(data) {
+        settings.encrypt_at_rest = true;
+        let note = "Encryption at rest stays on because your saved data is encrypted.";
+        warning = Some(match warning {
+            Some(warning) => format!("{warning} {note}"),
+            None => note.into(),
+        });
+    }
+    if source == SettingsSource::Backup
+        && settings.save_blocked.is_none()
+        && let Err(error) = save_settings(data, &settings)
+    {
+        let note = format!("The restored settings could not be saved yet ({error}).");
+        warning = Some(match warning {
+            Some(warning) => format!("{warning} {note}"),
+            None => note,
+        });
+    }
+    StartupSettings {
+        settings,
+        warning,
+        protection_confirmed: false,
+    }
+}
+
+/// Whether any preference, history or people file is stored encrypted,
+/// including copies that cannot be decrypted by this account.
+fn protected_data_present(data: &std::path::Path) -> bool {
+    use crate::history::protect;
+    let named = ["settings.json", "settings.json.bak", "people.json"]
+        .into_iter()
+        .map(|name| data.join(name));
+    let side = settings_copies(data).into_iter().map(|(path, _)| path);
+    if named.chain(side).any(|path| protect::is_sealed_file(&path)) {
+        return true;
+    }
+    crate::history::contains_protected(&data.join("history"))
+}
+
+/// Recovery copies of preferences: isolated files, which can be restored, and
+/// temporaries abandoned by an interrupted save (`true`), which are never read.
+fn settings_copies(data: &std::path::Path) -> Vec<(PathBuf, bool)> {
+    let Ok(entries) = std::fs::read_dir(data) else {
+        return Vec::new();
+    };
+    let own = format!("settings-{}-", std::process::id());
+    let own_partial = format!(".settings.json.bak.{}-", std::process::id());
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_owned();
+            if name.starts_with("settings.corrupt-") && name.ends_with(".json") {
+                Some((entry.path(), false))
+            } else if (name.starts_with("settings-")
+                && name.ends_with(".tmp")
+                && !name.starts_with(&own))
+                || (name.starts_with(".settings.json.bak.")
+                    && name.ends_with(".partial")
+                    && !name.starts_with(&own_partial))
+            {
+                Some((entry.path(), true))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Bring every copy of the preferences to the requested form: the backup and
+/// isolated copies are rewritten, and abandoned temporaries are removed so no
+/// plaintext copy is left behind. `settings.json` itself is written by
+/// `save_settings`. Each failure is counted.
+fn migrate_settings_copies(
+    data: &std::path::Path,
+    protect: bool,
+) -> crate::history::MigrationReport {
+    use crate::history::protect as seal;
+    let mut report = crate::history::MigrationReport {
+        protect,
+        ..Default::default()
+    };
+    let backup = data.join("settings.json.bak");
+    let copies = std::iter::once((backup, false)).chain(settings_copies(data));
+    for (path, abandoned) in copies {
+        let result = if abandoned {
+            std::fs::remove_file(&path).map(|()| true).or_else(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(false)
+                } else {
+                    Err(error.into())
+                }
+            })
+        } else {
+            seal::migrate_file(&path, protect, MAX_SETTINGS_BYTES)
+        };
+        match result {
+            Ok(true) => report.changed += 1,
+            Ok(false) => {}
+            Err(error) => {
+                log::warn!("Could not update {}: {error:#}", path.display());
+                report.failed += 1;
+            }
+        }
+    }
+    report
+}
+
+/// Merge preferences and vocabulary from a restored backup. Machine-specific
+/// and secret settings (pairing key, model and tool paths) are always kept.
+fn merge_restored_settings(
+    current: &Settings,
+    restored: Option<serde_json::Value>,
+    library: Option<&str>,
+) -> anyhow::Result<Settings> {
+    let mut merged = serde_json::to_value(current)?;
+    if let (Some(target), Some(serde_json::Value::Object(source))) = (
+        merged.as_object_mut(),
+        restored.map(crate::history::backup::portable_settings),
+    ) {
+        for (key, value) in source {
+            target.insert(key, value);
+        }
+    }
+    let mut settings: Settings = serde_json::from_value(merged)?;
+    settings.save_blocked = current.save_blocked.clone();
+    if let Some(library) = library {
+        crate::library::parse(library)?.merge(&mut settings.entries, &mut settings.macros);
+        dictionary::deduplicate(&mut settings.entries);
+    }
+    Ok(settings)
+}
+
 impl App {
     fn new() -> Self {
-        let settings_path = model::data_dir().join("settings.json");
-        let (mut settings, warning) = match std::fs::read(&settings_path) {
-            Ok(bytes) => match serde_json::from_slice::<Settings>(&bytes) {
-                Ok(s) => (s, None),
-                Err(_) => (Settings::default(), Some("Saved settings could not be read. Your previous file has not been changed.".to_owned())),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
-            Err(e) => (Settings::default(), Some(format!("Could not read saved settings: {e}"))),
-        };
+        let data = model::data_dir();
+        let StartupSettings {
+            mut settings,
+            warning,
+            protection_confirmed,
+        } = load_startup_settings(&data);
+        if protection_confirmed {
+            // Complete an interrupted change of the preference copies.
+            let report = migrate_settings_copies(&data, settings.encrypt_at_rest);
+            if report.failed > 0 {
+                log::warn!("{} settings copies could not be updated", report.failed);
+            }
+        }
         dictionary::deduplicate(&mut settings.entries);
         if settings.model_path.is_empty() {
             settings.model_path = model::default_path().to_string_lossy().into_owned();
@@ -311,6 +670,19 @@ impl App {
                             Err(e) => Event::Error(format!("Could not load the model: {e:#}")),
                         }
                     }
+                    Command::File(job, token) => {
+                        let result = match engine.as_mut() {
+                            Some(engine) => {
+                                engine.set_cancel_token(&token);
+                                call_tools::run_file_job(engine, job, &token, &mut |event| {
+                                    let _ = worker_tx.send(Event::File(event));
+                                })
+                                .map_err(|e| format!("{e:#}"))
+                            }
+                            None => Err("Load a speech model first".into()),
+                        };
+                        Event::File(call_tools::FileEvent::Finished(result))
+                    }
                     Command::Transcribe(pcm, id, final_pass, token) => {
                         let start = Instant::now();
                         let result = match engine.as_mut() {
@@ -339,11 +711,13 @@ impl App {
             platform::hotkey(settings.quick_note_hotkey.clone(), quick_note_events);
 
         let (integration_tx, integration_rx) = integration::start(|| {});
+        let call_tools = call_tools::State::start(settings.encrypt_at_rest);
         let mut app = Self {
             polish: Default::default(),
 
             pending_install: None,
-            history: history_ui::State::start(),
+            history: history_ui::State::start(settings.encrypt_at_rest, protection_confirmed),
+            call_tools,
             insights: Default::default(),
             saved_search: Default::default(),
             brain: Default::default(),
@@ -382,6 +756,7 @@ impl App {
             busy: false,
             ready: false,
             downloading: None,
+            model_cancels: Default::default(),
             status: "Choose a model to get started".into(),
             backend: String::new(),
             speech_languages: Vec::new(),
@@ -394,6 +769,11 @@ impl App {
             utterance: 0,
             preview_inflight: false,
             preview_audio_seconds: 0.0,
+            capture_interruption: None,
+            dictation_editor: Default::default(),
+            recording_spoken_editing: false,
+            last_dictation_text: String::new(),
+            microphone_check: Default::default(),
             pending_final: None,
             cleanup_count: 0,
             microphones: audio::input_devices(),
@@ -477,7 +857,15 @@ impl App {
             self.last_seconds = recording.seconds() as u64;
             self.dictation_metrics.audio_duration_ms =
                 Some((f64::from(recording.seconds()) * 1000.0) as u64);
-            let result = recording.stop();
+            let result = recording.stop().map(|captured| {
+                self.capture_interruption = captured.interruption.map(str::to_owned);
+                if self.capture_interruption.is_some() {
+                    self.target = None;
+                    self.insertion_cancel.cancel();
+                    self.integration_pending = None;
+                }
+                captured.pcm
+            });
             if self.settings.audio_feedback {
                 crate::audio_cues::play(crate::audio_cues::Cue::Stopped);
             }
@@ -509,6 +897,7 @@ impl App {
             }
         } else {
             if self.busy
+                || self.calls_file_job_running()
                 || self.loading
                 || !self.ready
                 || self.downloading.is_some()
@@ -521,7 +910,22 @@ impl App {
                     self.history_save_dictation();
                     self.history.dictation = None;
                     self.history.dictation_deleted = false;
-                    self.status = format!("Listening on {}", recording.device);
+                    self.status = audio::device_notice(
+                        self.settings.microphone.as_deref(),
+                        &recording.device,
+                    )
+                    .unwrap_or_else(|| format!("Listening on {}", recording.device));
+                    self.capture_interruption = None;
+                    if !self.recording_spoken_editing {
+                        self.dictation_editor = Default::default();
+                        self.dictation_editor
+                            .apply(&self.text, &macros::EditingSettings::default());
+                    }
+                    self.dictation_editor.begin_recording(
+                        self.text == self.last_dictation_text
+                            && self.dictation_app.is_none()
+                            && target.is_none(),
+                    );
                     self.recording = Some(recording);
                     if self.settings.audio_feedback {
                         crate::audio_cues::play(crate::audio_cues::Cue::Started);
@@ -529,6 +933,7 @@ impl App {
                     self.last_seconds = 0;
                     self.target = target;
                     self.dictation_app = target.and_then(platform::app_name);
+                    self.recording_spoken_editing = self.spoken_editing();
                     self.dictation_metrics = crate::insights::DictationMetrics {
                         app: self.dictation_app.clone(),
                         ..Default::default()
@@ -540,12 +945,24 @@ impl App {
                     self.insertion_cancel = CancelToken::new();
                     self.integration_inflight = false;
                     self.integration_pending = None;
-                    self.live_mode = self.settings.insert
-                        && self.settings.live_insert
+                    self.live_mode = self.insert_enabled()
+                        && self
+                            .input_profile()
+                            .and_then(|p| p.live_insert)
+                            .unwrap_or(self.settings.live_insert)
                         && target.is_some()
                         && !self.hold_recording;
                     let _ = self.integration_tx.send(integration::Action::Cancel);
-                    if self.settings.insert
+                    let line_break = self
+                        .input_profile()
+                        .and_then(|p| p.line_break)
+                        .unwrap_or_else(|| {
+                            crate::writing_style::default_line_break(self.dictation_app.as_deref())
+                        });
+                    let _ = self
+                        .integration_tx
+                        .send(integration::Action::LineBreak(line_break));
+                    if self.insert_enabled()
                         && let Some(target) = target
                     {
                         let _ = self.integration_tx.send(integration::Action::Arm(
@@ -571,7 +988,7 @@ impl App {
 
     fn shortcut(&mut self, target: Target, at: Instant) {
         if self.recording.is_some() {
-            if self.settings.hotkey_mode == platform::HotkeyMode::Toggle
+            if self.input_hotkey_mode() == platform::HotkeyMode::Toggle
                 || (self.hold_recording && self.shortcut_gesture.press_again(at))
             {
                 self.toggle(None);
@@ -597,7 +1014,19 @@ impl App {
             self.overlay_until = Some(Instant::now() + Duration::from_secs(4));
             return;
         }
-        if self.settings.hotkey_mode == platform::HotkeyMode::Hold {
+        let app = platform::app_name(target);
+        let mode = self
+            .settings
+            .input_profiles
+            .iter()
+            .rev()
+            .find(|p| {
+                app.as_deref()
+                    .is_some_and(|app| app.eq_ignore_ascii_case(&p.app))
+            })
+            .and_then(|p| p.hotkey_mode)
+            .unwrap_or(self.settings.hotkey_mode);
+        if mode == platform::HotkeyMode::Hold {
             // A release may finish only the recording this press started. A
             // manual capture must remain under its explicit Finish control.
             self.hold_recording = true;
@@ -625,7 +1054,7 @@ impl App {
 
     fn shortcut_instruction(&self) -> String {
         let key = self.settings.hotkey.label();
-        match self.settings.hotkey_mode {
+        match self.input_hotkey_mode() {
             platform::HotkeyMode::Hold
                 if self.hold_recording && self.shortcut_gesture.hands_free =>
             {
@@ -649,6 +1078,7 @@ impl App {
     }
 
     fn cancel_dictation(&mut self) {
+        self.capture_interruption = None;
         self.cancel.cancel();
         self.insertion_cancel.cancel();
         self.pending_final = None;
@@ -658,7 +1088,7 @@ impl App {
         self.hold_recording = false;
         self.shortcut_gesture = Default::default();
         self.live_mode = false;
-        self.busy = false;
+        self.busy = self.calls_file_job_running();
         self.preview_inflight = false;
         self.chunk_inflight = false;
         self.integration_inflight = false;
@@ -675,10 +1105,12 @@ impl App {
         reason = "Audio import controller retained for the Tauri file import flow"
     )]
     fn transcribe(&mut self, pcm: Vec<f32>) {
+        self.capture_interruption = None;
         self.history_save_dictation();
         self.history.dictation = None;
         self.history.dictation_deleted = false;
         self.dictation_app = None;
+        self.dictation_editor = Default::default();
         self.dictation_metrics = Default::default();
         // The previous view is already saved. A failed import must not later
         // create another session containing the previous dictation's words.
@@ -716,17 +1148,61 @@ impl App {
         }
     }
 
+    fn input_profile(&self) -> Option<&crate::writing_style::InputProfile> {
+        self.settings.input_profiles.iter().rev().find(|p| {
+            self.dictation_app
+                .as_deref()
+                .is_some_and(|app| app.eq_ignore_ascii_case(&p.app))
+        })
+    }
+    fn input_hotkey_mode(&self) -> platform::HotkeyMode {
+        self.input_profile()
+            .and_then(|p| p.hotkey_mode)
+            .unwrap_or(self.settings.hotkey_mode)
+    }
+    fn spoken_editing(&self) -> bool {
+        self.input_profile()
+            .and_then(|p| p.spoken_editing_commands)
+            .unwrap_or(self.settings.spoken_editing_commands)
+    }
+    fn insert_enabled(&self) -> bool {
+        self.input_profile()
+            .and_then(|p| p.insert)
+            .unwrap_or(self.settings.insert)
+    }
+    fn dictation_style(&self) -> crate::writing_style::WritingStyle {
+        self.input_profile()
+            .and_then(|p| p.style)
+            .unwrap_or_else(|| {
+                crate::writing_style::effective(
+                    &self.settings.styles,
+                    self.dictation_app.as_deref(),
+                    self.settings.clean_speech,
+                )
+            })
+    }
+    fn finalized_text(&mut self, segment: String) {
+        if self.recording_spoken_editing {
+            let edited = self.dictation_editor.apply(
+                &segment,
+                &macros::EditingSettings {
+                    spoken_editing_commands: true,
+                },
+            );
+            self.committed_raw.clear();
+            self.update_text(edited);
+        } else {
+            self.update_text(segment);
+        }
+    }
+
     fn update_text(&mut self, raw: String) {
         self.raw = [self.committed_raw.as_str(), raw.as_str()]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        let style = crate::writing_style::effective(
-            &self.settings.styles,
-            self.dictation_app.as_deref(),
-            self.settings.clean_speech,
-        );
+        let style = self.dictation_style();
         let protected: Vec<_> = self
             .settings
             .entries
@@ -753,6 +1229,22 @@ impl App {
     }
 
     fn preview(&mut self) {
+        #[cfg(windows)]
+        if let Some((microphones, outputs)) = crate::platform::devices::refresh() {
+            self.microphones = microphones;
+            self.outputs = outputs;
+        }
+        if let Some(recording) = self.recording.as_mut() {
+            recording.drain();
+        }
+        if self
+            .recording
+            .as_ref()
+            .is_some_and(|r| r.full.load(Ordering::Relaxed) || r.failed.load(Ordering::Relaxed))
+        {
+            self.toggle(None);
+            return;
+        }
         if self.preview_inflight || self.busy {
             return;
         }
@@ -774,7 +1266,10 @@ impl App {
                 }
             }
             let seconds = recording.window_seconds();
-            if seconds >= 1.2 && seconds - self.preview_audio_seconds >= 0.8 {
+            if seconds >= 1.2
+                && seconds - self.preview_audio_seconds
+                    >= self.elapsed.unwrap_or(0.8).clamp(0.8, 8.0) * 1.25
+            {
                 self.preview_audio_seconds = seconds;
                 match recording.snapshot() {
                     Ok(pcm) => self.submit(pcm, false),
@@ -796,6 +1291,12 @@ impl App {
     }
 
     fn publish_live_preview(&mut self) {
+        if self.recording_spoken_editing
+            && self.raw.is_empty()
+            && self.dictation_editor.notice.is_none()
+        {
+            return;
+        }
         if self.live_mode
             && let Some(target) = self.target
         {
@@ -849,11 +1350,13 @@ impl App {
                     calls::Update::AudioContext(row) => {
                         if self.call_context.len() < 4096 {
                             crate::sensevoice::apply(&mut self.call_rows, &row);
+                            crate::sensevoice::apply_existing(&mut self.call_committed, &row);
                             self.call_context.push(row);
                             self.history_call_changed();
                         }
                     }
                     calls::Update::AudioContextStatus(message) => self.context_status = message,
+                    calls::Update::Interruption(gap) => self.calls_interruption(gap),
                     calls::Update::AudioGap(lost) => {
                         if self.call.is_some()
                             && let Some(session) = &mut self.history.call
@@ -869,27 +1372,20 @@ impl App {
                             self.history_call_changed();
                         }
                     }
-                    calls::Update::Rows(rows) => {
-                        if self.is_note_capture() {
-                            // Keep source identities and timestamps immutable so
-                            // live note updates can reuse earlier model sections.
-                            self.call_committed.extend(rows);
-                        } else {
-                            calls::append_rows(&mut self.call_committed, rows);
-                        }
+                    calls::Update::Rows(mut rows) => {
                         for annotation in &self.call_context {
-                            crate::sensevoice::apply(&mut self.call_committed, annotation);
+                            crate::sensevoice::apply_existing(&mut rows, annotation);
                         }
+                        self.calls_commit_rows(rows);
                         self.call_rows.clone_from(&self.call_committed);
                         self.refresh_call_notes();
                         self.history_call_changed();
                     }
-                    calls::Update::Preview(rows) => {
-                        self.call_rows.clone_from(&self.call_committed);
-                        calls::append_rows(&mut self.call_rows, rows);
+                    calls::Update::Preview(mut rows) => {
                         for annotation in &self.call_context {
-                            crate::sensevoice::apply(&mut self.call_rows, annotation);
+                            crate::sensevoice::apply_existing(&mut rows, annotation);
                         }
+                        self.calls_preview_rows(rows);
                         self.refresh_call_notes();
                         self.history_call_changed();
                     }
@@ -906,6 +1402,7 @@ impl App {
                                 .is_some_and(|control| control.stop_ns.load(Ordering::SeqCst) != 0),
                         );
                     }
+                    self.calls_capture_finished();
                     self.history_save_call();
                     if spoken_note && let Some(session) = &self.history.call {
                         self.notetaker_queue_filing(session.clone());
@@ -919,6 +1416,7 @@ impl App {
                         Err(error) => error,
                     };
                 }
+                Event::File(event) => self.calls_file_event(event),
                 Event::ContextProgress(p) => self.context_progress = Some(p),
                 Event::ContextInstalled(result) => {
                     self.context_progress = None;
@@ -953,6 +1451,13 @@ impl App {
                     self.verifier_downloading = None;
                     self.verifier_download_status = error;
                 }
+                Event::MicrophoneChecked(result) => {
+                    self.microphone_check.running = false;
+                    match result {
+                        Ok(check) => self.microphone_check.result = Some(check),
+                        Err(error) => self.microphone_check.error = Some(error),
+                    }
+                }
                 Event::Loaded(backend, languages) => {
                     self.speech_languages = languages;
                     self.loading = false;
@@ -970,7 +1475,7 @@ impl App {
                     if was_chunk && id == self.utterance {
                         match &result {
                             Ok(text) => {
-                                self.update_text(text.clone());
+                                self.finalized_text(text.clone());
                                 self.committed_raw = self.raw.clone();
                                 self.publish_live_preview();
                             }
@@ -1015,23 +1520,53 @@ impl App {
                             continue;
                         }
                     };
-                    self.update_text(text);
+                    if final_pass
+                        && self.recording_spoken_editing
+                        && self.insert_enabled()
+                        && self.committed_raw.is_empty()
+                        && let Some(undo) = macros::previous_command(&text)
+                        && let Some(target) = self.target.take()
+                    {
+                        self.busy = true;
+                        self.integration_inflight = true;
+                        if self
+                            .integration_tx
+                            .send(integration::Action::EditPrevious {
+                                id: self.utterance,
+                                target,
+                                undo,
+                                cancel: self.insertion_cancel.clone(),
+                            })
+                            .is_err()
+                        {
+                            self.busy = false;
+                            self.integration_inflight = false;
+                            self.status = "Previous insertion editing is unavailable.".into();
+                        }
+                        continue;
+                    }
+                    if final_pass {
+                        self.finalized_text(text);
+                    } else if !self.recording_spoken_editing {
+                        self.update_text(text);
+                    }
                     self.elapsed = Some(elapsed);
                     if !final_pass {
                         self.publish_live_preview();
                         continue;
                     }
+                    if let Some(message) = &self.capture_interruption {
+                        self.status = message.clone();
+                        self.history_save_dictation();
+                        continue;
+                    }
                     // Resolve from speech, before dictionary rules, and never rewrite literal templates.
-                    let spoken = if crate::writing_style::effective(
-                        &self.settings.styles,
-                        self.dictation_app.as_deref(),
-                        self.settings.clean_speech,
-                    ) != crate::writing_style::WritingStyle::Verbatim
-                    {
-                        cleanup::apply(&self.raw).0
-                    } else {
-                        self.raw.clone()
-                    };
+                    let spoken =
+                        if self.dictation_style() != crate::writing_style::WritingStyle::Verbatim {
+                            cleanup::apply(&self.raw).0
+                        } else {
+                            self.raw.clone()
+                        };
                     match macros::expand(
                         &spoken,
                         &self.settings.macros,
@@ -1055,18 +1590,21 @@ impl App {
                             continue;
                         }
                     }
+                    self.last_dictation_text.clone_from(&self.text);
                     self.dictation_metrics.recognized_words =
                         Some(self.raw.split_whitespace().count() as u64);
                     self.dictation_metrics.dictionary_replacements =
                         Some(self.words_changed as u64);
                     self.dictation_metrics.cleanup_edits = Some(self.cleanup_count as u64);
-                    self.status = if self.text.is_empty() {
+                    self.status = if let Some(notice) = &self.dictation_editor.notice {
+                        notice.clone()
+                    } else if self.text.is_empty() {
                         "No speech was recognized".into()
                     } else {
                         "Your transcript is ready".into()
                     };
                     self.history_save_dictation();
-                    if self.settings.insert
+                    if self.insert_enabled()
                         && (!self.text.is_empty() || self.live_mode)
                         && let Some(target) = self.target.take()
                     {
@@ -1185,6 +1723,14 @@ impl App {
                         self.queue_integration(action);
                     }
                 }
+                integration::Event::Edited(id, result) if id == self.utterance => {
+                    self.integration_inflight = false;
+                    self.busy = false;
+                    self.status =
+                        result.map_or_else(|e| e, |_| "Previous insertion updated.".into());
+                    self.overlay_message.clone_from(&self.status);
+                    self.overlay_until = Some(Instant::now() + Duration::from_secs(5));
+                }
                 integration::Event::Inserted(id, result) if id == self.utterance => {
                     self.integration_inflight = false;
                     self.integration_pending = None;
@@ -1244,9 +1790,11 @@ impl App {
             self.shortcut_gesture = Default::default();
         }
         self.history_poll();
+        self.calls_tick();
         self.updater.poll();
         self.poll_saved_search();
         self.polish_poll();
+        self.desktop_assort_poll();
         self.brain_poll();
         self.notetaker_poll_filing();
         self.preview();
@@ -1278,12 +1826,15 @@ impl App {
 
     fn download(&mut self) {
         self.downloading = Some(0.0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.model_cancels
+            .insert(model::ModelId::Speech, cancel.clone());
         self.status = "Downloading the speech model...".into();
         let tx = self.event_tx.clone();
 
         std::thread::spawn(move || {
             let mut last = Instant::now();
-            let result = model::download(|p| {
+            let result = model::download_cancellable(&cancel, |p| {
                 if last.elapsed() > Duration::from_millis(100) {
                     let _ = tx.send(Event::Progress(p));
 
@@ -1355,6 +1906,10 @@ impl App {
         language_preference: Option<String>,
         audio_context: Option<bool>,
     ) -> bool {
+        if self.calls_file_job_running() {
+            self.call_status = "Wait for the import or re-transcription to finish.".into();
+            return false;
+        }
         let native_audio = match calls::select_native_source(
             !microphone_only && separate_discord_audio,
             self.discord
@@ -1393,7 +1948,30 @@ impl App {
         self.call_native_received = false;
         self.context_status.clear();
         self.call_context.clear();
+        self.call_tools.live_rules.clear();
+        let kind = if microphone_only {
+            crate::history::Kind::Note
+        } else {
+            crate::history::Kind::Call
+        };
+        let mut session = crate::history::Session::new(kind);
+        if microphone_only {
+            session.title = "Spoken note".into();
+            session.auto_file_pending = true;
+        }
+        let keep_audio = self
+            .call_tools
+            .keep_audio
+            .take()
+            .unwrap_or(self.settings.keep_call_audio);
+        let recorder = if keep_audio && !microphone_only {
+            let remote = if native_audio { "participants" } else { "call" };
+            self.calls_start_recorder(&mut session, vec!["microphone".into(), remote.into()])
+        } else {
+            None
+        };
         let request = calls::Request {
+            recorder,
             audio_context: audio_context.unwrap_or(self.settings.audio_context),
             language_preference,
             microphone: self.settings.microphone.clone(),
@@ -1415,16 +1993,6 @@ impl App {
             Ok(()) => {
                 self.call = Some(control);
                 self.call_cues_enabled = call_cues_enabled;
-                let kind = if microphone_only {
-                    crate::history::Kind::Note
-                } else {
-                    crate::history::Kind::Call
-                };
-                let mut session = crate::history::Session::new(kind);
-                if microphone_only {
-                    session.title = "Spoken note".into();
-                    session.auto_file_pending = true;
-                }
                 self.history.call = Some(session);
                 self.capture_feedback.prepare(
                     if microphone_only {
@@ -1444,6 +2012,12 @@ impl App {
                 true
             }
             Err(_) => {
+                if let Some(recorder) = self.call_tools.recorder.take() {
+                    let _ = recorder.finish();
+                    if let Some(path) = self.call_tools.audio_path(&session.id) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
                 self.call_status = "The speech worker stopped. Restart the app.".into();
                 self.capture_failed_feedback(
                     microphone_only,
@@ -1507,6 +2081,69 @@ impl Drop for App {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn command_only_recording_routes_to_verified_previous_field_edit() {
+        let (mut app, _) = app();
+        let (tx, rx) = mpsc::channel();
+        app.integration_tx = tx;
+        app.target = Some(platform::test_target());
+        app.settings.insert = true;
+        app.recording_spoken_editing = true;
+        app.event_tx
+            .send(Event::Text(
+                Ok("Scratch that.".into()),
+                0.1,
+                app.utterance,
+                true,
+            ))
+            .unwrap();
+        app.receive();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            integration::Action::EditPrevious { undo: false, .. }
+        ));
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn newer_settings_preserve_existing_preferences() {
+        let settings: super::Settings = serde_json::from_value(serde_json::json!({
+            "discord_pairing_key": "synthetic-pairing-value",
+            "hotkey": {"key": "F8", "future": true},
+            "hotkey_mode": "future",
+            "polish_style": "future",
+            "meetings": {"start": "future", "extra": 42},
+            "input_profiles": [{"app": "editor.exe", "future": true, "style": "future",
+                "line_break": "future", "hotkey_mode": "future"}],
+            "styles": [{"app": "editor.exe", "style": "future", "extra": 1}]
+        }))
+        .unwrap();
+        assert_eq!(settings.discord_pairing_key, "synthetic-pairing-value");
+        assert_eq!(settings.hotkey.key, "F8");
+        assert_eq!(settings.hotkey_mode, crate::platform::HotkeyMode::default());
+        assert_eq!(
+            settings.input_profiles[0].style,
+            Some(crate::writing_style::WritingStyle::default())
+        );
+    }
+
+    #[test]
+    fn changing_editing_preference_does_not_drop_committed_text() {
+        let (mut app, _) = app();
+        app.recording_spoken_editing = false;
+        app.committed_raw = "First sentence.".into();
+        app.settings.spoken_editing_commands = true;
+        app.finalized_text("Second sentence.".into());
+        assert_eq!(app.raw, "First sentence. Second sentence.");
+        app.recording_spoken_editing = true;
+        app.dictation_editor = Default::default();
+        app.finalized_text("First sentence.".into());
+        app.committed_raw = app.raw.clone();
+        app.settings.spoken_editing_commands = false;
+        app.finalized_text("Second sentence.".into());
+        assert_eq!(app.raw, "First sentence. Second sentence.");
+    }
     use super::*;
 
     #[test]
@@ -1541,9 +2178,319 @@ mod tests {
             serde_json::from_slice(&std::fs::read(directory.join("settings.json")).unwrap())
                 .unwrap();
         assert!(settings.transcription_language.starts_with("synthetic-"));
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        let backup: Settings =
+            serde_json::from_slice(&std::fs::read(directory.join("settings.json.bak")).unwrap())
+                .unwrap();
+        assert!(backup.transcription_language.starts_with("synthetic-"));
+        // Only the file and its previous good copy remain; no shared temporaries.
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn settings_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "articulate-settings-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn unreadable_settings_are_moved_aside_and_never_overwritten() {
+        let directory = settings_directory("corrupt");
+        let damaged = b"{\"insert\": tru".to_vec();
+        std::fs::write(directory.join("settings.json"), &damaged).unwrap();
+        let (settings, warning, _) = load_settings(&directory);
+        let warning = warning.unwrap();
+        assert!(warning.contains("settings.corrupt-"));
+        assert!(warning.contains("default settings are in use"));
+        assert!(!directory.join("settings.json").exists());
+        let moved: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with("settings.corrupt-") && name.ends_with(".json")
+            })
+            .collect();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(std::fs::read(moved[0].path()).unwrap(), damaged);
+        // A later automatic save cannot destroy the damaged original.
+        save_settings(&directory, &settings).unwrap();
+        assert_eq!(std::fs::read(moved[0].path()).unwrap(), damaged);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn damaged_settings_fall_back_to_the_previous_good_copy() {
+        let directory = settings_directory("backup");
+        let first = Settings {
+            transcription_language: "synthetic-first".into(),
+            ..Default::default()
+        };
+        save_settings(&directory, &first).unwrap();
+        let second = Settings {
+            transcription_language: "synthetic-second".into(),
+            ..Default::default()
+        };
+        save_settings(&directory, &second).unwrap();
+        std::fs::write(directory.join("settings.json"), b"\0garbage").unwrap();
+        let (settings, warning, _) = load_settings(&directory);
+        assert_eq!(settings.transcription_language, "synthetic-first");
+        assert!(warning.unwrap().contains("previous settings were restored"));
+        // A damaged file is never copied over the good backup.
+        std::fs::write(directory.join("settings.json"), b"garbage").unwrap();
+        save_settings(&directory, &settings).unwrap();
+        let backup: Settings =
+            serde_json::from_slice(&std::fs::read(directory.join("settings.json.bak")).unwrap())
+                .unwrap();
+        assert_eq!(backup.transcription_language, "synthetic-first");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn blocked_settings_refuse_to_save() {
+        let directory = settings_directory("blocked");
+        let settings = Settings {
+            save_blocked: Some("Synthetic read failure".into()),
+            ..Default::default()
+        };
+        assert!(save_settings(&directory, &settings).is_err());
+        assert!(!directory.join("settings.json").exists());
+        let (loaded, warning, _) = load_settings(&directory);
+        assert!(warning.is_none() && loaded.save_blocked.is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encrypted_settings_roundtrip_and_keep_secrets_off_disk() {
+        let directory = settings_directory("encrypted");
+        let settings = Settings {
+            encrypt_at_rest: true,
+            discord_pairing_key: "synthetic-pairing-secret".into(),
+            ..Default::default()
+        };
+        save_settings(&directory, &settings).unwrap();
+        save_settings(&directory, &settings).unwrap();
+        for name in ["settings.json", "settings.json.bak"] {
+            let raw = std::fs::read(directory.join(name)).unwrap();
+            assert!(crate::history::protect::is_sealed(&raw));
+            assert!(!String::from_utf8_lossy(&raw).contains("synthetic-pairing-secret"));
+        }
+        let (loaded, warning, _) = load_settings(&directory);
+        assert!(warning.is_none());
+        assert!(loaded.encrypt_at_rest);
+        assert_eq!(loaded.discord_pairing_key, "synthetic-pairing-secret");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_settings_are_restored_from_the_backup_and_reinstalled() {
+        let directory = settings_directory("missing");
+        let first = Settings {
+            transcription_language: "synthetic-first".into(),
+            ..Default::default()
+        };
+        save_settings(&directory, &first).unwrap();
+        save_settings(&directory, &first).unwrap();
         std::fs::remove_file(directory.join("settings.json")).unwrap();
-        std::fs::remove_dir(directory).unwrap();
+        let loaded = load_startup_settings(&directory);
+        assert_eq!(loaded.settings.transcription_language, "synthetic-first");
+        assert!(!loaded.protection_confirmed);
+        assert!(
+            loaded
+                .warning
+                .unwrap()
+                .contains("previous settings were restored")
+        );
+        // The recovered copy is the main file again, so it survives a restart.
+        let (again, warning, source) = load_settings(&directory);
+        assert_eq!(source, SettingsSource::Main);
+        assert!(warning.is_none());
+        assert_eq!(again.transcription_language, "synthetic-first");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn startup_without_encrypted_data_keeps_the_loaded_choice() {
+        let directory = settings_directory("plain-start");
+        let loaded = load_startup_settings(&directory);
+        assert!(!loaded.settings.encrypt_at_rest);
+        assert!(!loaded.protection_confirmed);
+        assert!(loaded.warning.is_none());
+        save_settings(&directory, &Settings::default()).unwrap();
+        let loaded = load_startup_settings(&directory);
+        assert!(loaded.protection_confirmed && !loaded.settings.encrypt_at_rest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovered_or_default_settings_never_turn_encryption_off() {
+        use crate::history::protect;
+        let directory = settings_directory("keep-protection");
+        let history = directory.join("history");
+        std::fs::create_dir_all(&history).unwrap();
+        let id = crate::history::Session::new(crate::history::Kind::Note).id;
+        std::fs::write(
+            history.join(format!("{id}.json")),
+            protect::seal(b"{\"synthetic\":true}").unwrap(),
+        )
+        .unwrap();
+        // No preferences at all.
+        let loaded = load_startup_settings(&directory);
+        assert!(loaded.settings.encrypt_at_rest && !loaded.protection_confirmed);
+        // Damaged preferences with an older plaintext backup that predates encryption.
+        save_settings(&directory, &Settings::default()).unwrap();
+        save_settings(&directory, &Settings::default()).unwrap();
+        std::fs::write(directory.join("settings.json"), b"{damaged").unwrap();
+        let loaded = load_startup_settings(&directory);
+        assert!(loaded.settings.encrypt_at_rest && !loaded.protection_confirmed);
+        assert!(loaded.warning.unwrap().contains("stays on"));
+        // The reinstalled preferences keep encryption on at the next start.
+        let (again, _, source) = load_settings(&directory);
+        assert_eq!(source, SettingsSource::Main);
+        assert!(again.encrypt_at_rest);
+        assert!(protect::is_sealed(
+            &std::fs::read(directory.join("settings.json")).unwrap()
+        ));
+        // Preferences that cannot be decrypted are encrypted data too.
+        std::fs::remove_dir_all(&history).unwrap();
+        for entry in std::fs::read_dir(&directory).unwrap().flatten() {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+        let mut sealed = protect::seal(b"{}").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff;
+        std::fs::write(directory.join("settings.json"), sealed).unwrap();
+        let loaded = load_startup_settings(&directory);
+        assert!(loaded.settings.encrypt_at_rest && !loaded.protection_confirmed);
+        // A successfully read choice is confirmed, so an interrupted change completes.
+        for entry in std::fs::read_dir(&directory).unwrap().flatten() {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+        save_settings(&directory, &Settings::default()).unwrap();
+        std::fs::create_dir_all(&history).unwrap();
+        std::fs::write(
+            history.join(format!("{id}.json")),
+            protect::seal(b"{}").unwrap(),
+        )
+        .unwrap();
+        let loaded = load_startup_settings(&directory);
+        assert!(loaded.protection_confirmed && !loaded.settings.encrypt_at_rest);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encryption_changes_update_every_settings_copy() {
+        use crate::history::protect;
+        let directory = settings_directory("copies");
+        save_settings(&directory, &Settings::default()).unwrap();
+        save_settings(&directory, &Settings::default()).unwrap();
+        // The main file is unreadable, so a save cannot rebuild the backup from it.
+        std::fs::write(directory.join("settings.json"), b"{damaged").unwrap();
+        std::fs::write(
+            directory.join("settings.corrupt-1.json"),
+            b"{\"isolated\":1}",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join("settings-999999-0.tmp"),
+            b"{\"abandoned\":1}",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(".settings.json.bak.999999-0.partial"),
+            b"{\"abandoned\":2}",
+        )
+        .unwrap();
+        let protected = Settings {
+            encrypt_at_rest: true,
+            ..Default::default()
+        };
+        save_settings(&directory, &protected).unwrap();
+        let report = migrate_settings_copies(&directory, true);
+        assert_eq!(report.failed, 0);
+        let names: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        for name in [
+            "settings.json",
+            "settings.json.bak",
+            "settings.corrupt-1.json",
+        ] {
+            assert!(
+                protect::is_sealed(&std::fs::read(directory.join(name)).unwrap()),
+                "{name}"
+            );
+        }
+        let report = migrate_settings_copies(&directory, false);
+        assert_eq!((report.changed, report.failed), (2, 0));
+        assert_eq!(
+            std::fs::read(directory.join("settings.corrupt-1.json")).unwrap(),
+            b"{\"isolated\":1}"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restored_settings_keep_this_devices_discord_state() {
+        let current = Settings {
+            discord_debugger_port: 9229,
+            discord_flavor: "ptb".into(),
+            microphone: Some("Local microphone".into()),
+            ..Default::default()
+        };
+        let merged = merge_restored_settings(
+            &current,
+            Some(serde_json::json!({
+                "discord_debugger_port": 1234,
+                "discord_flavor": "canary",
+                "microphone": "Archived microphone",
+                "transcription_language": "fr",
+            })),
+            None,
+        )
+        .unwrap();
+        assert_eq!(merged.discord_debugger_port, 9229);
+        assert_eq!(merged.discord_flavor, "ptb");
+        assert_eq!(merged.microphone.as_deref(), Some("Local microphone"));
+        assert_eq!(merged.transcription_language, "fr");
+    }
+
+    #[test]
+    fn restored_settings_keep_local_secrets_and_merge_vocabulary() {
+        let current = Settings {
+            discord_pairing_key: "local-secret".into(),
+            model_path: "C:/local/model.gguf".into(),
+            ..Default::default()
+        };
+        let entry = dictionary::validate("Jon", "John").unwrap();
+        let library = crate::library::export(&[entry], &[]).unwrap();
+        let merged = merge_restored_settings(
+            &current,
+            Some(serde_json::json!({
+                "discord_pairing_key": "archived",
+                "model_path": "C:/elsewhere.gguf",
+                "transcription_language": "fr",
+            })),
+            Some(&library),
+        )
+        .unwrap();
+        assert_eq!(merged.discord_pairing_key, "local-secret");
+        assert_eq!(merged.model_path, "C:/local/model.gguf");
+        assert_eq!(merged.transcription_language, "fr");
+        assert_eq!(merged.entries.len(), 1);
     }
 
     fn call_row(speaker: i32, start_ms: u64, text: &str) -> calls::Row {
@@ -1876,6 +2823,7 @@ mod tests {
 
                 pending_install: None,
                 history: history_ui::State::default(),
+                call_tools: Default::default(),
                 insights: Default::default(),
                 saved_search: Default::default(),
                 brain: Default::default(),
@@ -1914,6 +2862,7 @@ mod tests {
                 busy: false,
                 ready: true,
                 downloading: None,
+                model_cancels: Default::default(),
                 status: String::new(),
                 backend: "CPU".into(),
                 speech_languages: vec!["en".into(), "nl".into()],
@@ -1926,6 +2875,11 @@ mod tests {
                 utterance: 1,
                 preview_inflight: true,
                 preview_audio_seconds: 0.0,
+                capture_interruption: None,
+                dictation_editor: Default::default(),
+                recording_spoken_editing: false,
+                last_dictation_text: String::new(),
+                microphone_check: Default::default(),
                 pending_final: None,
                 cleanup_count: 0,
                 microphones: Vec::new(),
@@ -2177,6 +3131,25 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_final_preserves_text_and_reports_incomplete() {
+        let (mut app, _) = app();
+        app.capture_interruption = Some("Incomplete transcript: microphone interrupted".into());
+        app.target = None;
+        app.busy = true;
+        app.event_tx
+            .send(Event::Text(
+                Ok("Valid captured prefix.".into()),
+                0.2,
+                1,
+                true,
+            ))
+            .unwrap();
+        app.receive();
+        assert_eq!(app.text, "Valid captured prefix.");
+        assert!(app.status.starts_with("Incomplete transcript"));
+        assert!(!app.busy);
+    }
+    #[test]
     fn stale_preview_cannot_replace_new_utterance() {
         let (mut app, _rx) = app();
         app.utterance = 2;
@@ -2192,6 +3165,7 @@ mod tests {
     #[test]
     fn explicit_cancel_does_not_restart_pending_final_or_publish_late_chunks() {
         let (mut app, commands) = app();
+        app.capture_interruption = Some("Interrupted capture".into());
         let (tx, actions) = mpsc::channel();
         app.integration_tx = tx;
         app.busy = true;
@@ -2200,6 +3174,7 @@ mod tests {
         app.text = "Visible preview".into();
         let cancelled_id = app.utterance;
         app.cancel_dictation();
+        assert!(app.capture_interruption.is_none());
         assert!(app.cancel.is_cancelled() && app.insertion_cancel.is_cancelled());
         assert!(matches!(
             actions.try_recv().unwrap(),

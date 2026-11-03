@@ -14,6 +14,7 @@ pub mod install;
     reason = "Preserve guarded Discord relaunch for React connection setup"
 )]
 pub mod launch;
+pub mod pairing;
 pub mod pcm;
 pub mod plugin;
 
@@ -34,7 +35,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket, client::client_with_config, protocol::WebSocketConfig};
 
-const ADDRESS: &str = "127.0.0.1:9222";
+/// Port used by a manual `--remote-debugging-port` launch. Articulate's own
+/// relaunch chooses a random port instead; see `launch`.
+pub const DEFAULT_DEBUGGER_PORT: u16 = 9222;
 const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
 const HISTORY_LIMIT: usize = 8192;
 const GROUP: &str = "articulate-voice-observer";
@@ -74,6 +77,9 @@ pub struct Snapshot {
     pub status: Status,
     pub observation: Option<Observation>,
     pub companion_revision: Option<String>,
+    /// "current", "outdated" or "newer" once a companion has spoken; None for
+    /// the debugger route or before any companion handshake.
+    pub companion_protocol: Option<String>,
     pub audio_status: Option<String>,
 }
 
@@ -99,13 +105,15 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn start() -> Arc<Self> {
+    /// Observes the renderer debugger on the given loopback port.
+    pub fn start(port: u16) -> Arc<Self> {
         let shared = Arc::new(Shared {
             pcm: pcm::Hub::default(),
             state: Mutex::new(State {
                 snapshot: Snapshot {
                     audio_status: None,
                     companion_revision: None,
+                    companion_protocol: None,
                     status: Status::Connecting,
                     observation: None,
                 },
@@ -120,7 +128,7 @@ impl Connection {
         let worker_shared = shared.clone();
         let worker = thread::Builder::new()
             .name("discord-voice".into())
-            .spawn(move || run(worker_shared));
+            .spawn(move || run(worker_shared, port));
         let worker = match worker {
             Ok(worker) => Some(worker),
             Err(_) => {
@@ -238,6 +246,7 @@ impl Shared {
         state.snapshot = Snapshot {
             audio_status: None,
             companion_revision: None,
+            companion_protocol: None,
             status: Status::Unavailable(message.into()),
             observation: None,
         };
@@ -257,8 +266,28 @@ impl Shared {
         );
     }
 
+    /// Records that a peer spoke an unsupported protocol version so Settings
+    /// can suggest an update. The notice is only ever advisory: it never
+    /// replaces a live, authenticated companion observation, touches the
+    /// activity history or stops a capture, so a local process that cannot
+    /// prove the pairing key cannot interrupt a paired companion. It applies
+    /// while nothing is paired and is overwritten by the next handshake.
+    fn protocol_mismatch(&self, kind: &'static str) {
+        let message = if kind == "newer" {
+            "The Discord companion is newer than this Articulate version. Update Articulate."
+        } else {
+            "The Discord companion needs updating. Update it from Settings and restart Discord."
+        };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(state.snapshot.status, Status::Ready) || state.snapshot.observation.is_some() {
+            return;
+        }
+        state.snapshot.status = Status::Unavailable(message.into());
+        state.snapshot.companion_protocol = Some(kind.into());
+    }
+
     fn publish(&self, observation: Observation) {
-        self.publish_companion(observation, None, None);
+        self.publish_companion(observation, None, None, None);
     }
 
     fn publish_companion(
@@ -266,6 +295,7 @@ impl Shared {
         mut observation: Observation,
         revision: Option<String>,
         audio_status: Option<String>,
+        protocol: Option<&'static str>,
     ) {
         if self.stopped() {
             return;
@@ -295,6 +325,7 @@ impl Shared {
             Snapshot {
                 audio_status,
                 companion_revision: revision,
+                companion_protocol: protocol.map(str::to_owned),
                 status: Status::Ready,
                 observation: Some(observation.clone()),
             }
@@ -302,6 +333,7 @@ impl Shared {
             Snapshot {
                 audio_status: None,
                 companion_revision: None,
+                companion_protocol: None,
                 status: Status::Unavailable("Discord activity is temporarily unavailable.".into()),
                 observation: None,
             }
@@ -322,10 +354,12 @@ fn push_history(history: &mut VecDeque<Observation>, observation: Observation) {
     }
 }
 
-fn run(shared: Arc<Shared>) {
+fn run(shared: Arc<Shared>, port: u16) {
     let mut backoff = Duration::from_secs(1);
+    let closed_message =
+        format!("Discord is unavailable. Open its local debugger on port {port} to connect.");
     while !shared.stopped() {
-        let result = observe(&shared);
+        let result = observe(&shared, port);
         if shared.stopped() {
             break;
         }
@@ -343,7 +377,7 @@ fn run(shared: Arc<Shared>) {
             })
         });
         shared.unavailable(if debugger_closed {
-            "Discord is unavailable. Open its local debugger on port 9222 to connect."
+            closed_message.as_str()
         } else {
             "Discord's voice interface is unavailable. Retrying automatically."
         });
@@ -398,8 +432,8 @@ impl Calibration {
     }
 }
 
-fn observe(shared: &Shared) -> Result<()> {
-    let mut cdp = Cdp::connect()?;
+fn observe(shared: &Shared, port: u16) -> Result<()> {
+    let mut cdp = Cdp::connect(port)?;
     let result = (|| -> Result<()> {
         let bridge = cdp.discover(shared)?;
         cdp.bridge = Some(bridge.clone());
@@ -496,9 +530,9 @@ struct Cdp {
 }
 
 impl Cdp {
-    fn connect() -> Result<Self> {
-        let endpoint = discover_endpoint()?;
-        let stream = loopback_stream()?;
+    fn connect(port: u16) -> Result<Self> {
+        let endpoint = discover_endpoint(port)?;
+        let stream = loopback_stream(port)?;
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_PAYLOAD))
             .max_frame_size(Some(MAX_PAYLOAD));
@@ -522,7 +556,22 @@ impl Cdp {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             ensure!(Instant::now() < deadline, "Debugger response timed out");
-            match self.socket.read()? {
+            // The socket read timeout is shorter than this deadline so that a
+            // stop request is noticed promptly. A timed-out read is not a failure
+            // until the deadline itself passes.
+            let message = match self.socket.read() {
+                Ok(message) => message,
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match message {
                 Message::Text(text) => {
                     let response: Value = serde_json::from_str(&text)?;
                     if response["id"].as_u64() != Some(id) {
@@ -637,20 +686,23 @@ fn internal_id(properties: &Value, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn loopback_stream() -> Result<TcpStream> {
-    let stream =
-        TcpStream::connect_timeout(&ADDRESS.parse::<SocketAddr>()?, Duration::from_secs(1))?;
+fn loopback_stream(port: u16) -> Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_secs(1),
+    )?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     stream.set_nodelay(true)?;
     Ok(stream)
 }
 
-fn discover_endpoint() -> Result<String> {
+fn discover_endpoint(port: u16) -> Result<String> {
     // Direct TCP avoids system proxies, redirects, DNS, or accidental remote endpoints.
-    let mut stream = loopback_stream()?;
+    let mut stream = loopback_stream(port)?;
     stream.write_all(
-        b"GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:9222\r\nConnection: close\r\n\r\n",
+        format!("GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
     )?;
     let mut bytes = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -696,7 +748,7 @@ fn discover_endpoint() -> Result<String> {
         !headers.to_ascii_lowercase().contains("transfer-encoding:"),
         "Unsupported debugger response framing"
     );
-    select_endpoint(&serde_json::from_slice(&bytes[split + 4..])?)
+    select_endpoint(&serde_json::from_slice(&bytes[split + 4..])?, port)
 }
 
 fn http_response_length(bytes: &[u8]) -> Result<Option<usize>> {
@@ -727,9 +779,11 @@ fn http_response_length(bytes: &[u8]) -> Result<Option<usize>> {
     Ok(Some(total))
 }
 
-fn select_endpoint(value: &Value) -> Result<String> {
+/// Picks the single stable, PTB or Canary renderer page on the loopback debugger.
+fn select_endpoint(value: &Value, port: u16) -> Result<String> {
     let targets = value.as_array().context("Invalid debugger targets")?;
     ensure!(targets.len() <= 64, "Too many debugger targets");
+    let address = format!("127.0.0.1:{port}");
     let mut matches = Vec::new();
     for target in targets {
         if target["type"] != "page" {
@@ -743,7 +797,7 @@ fn select_endpoint(value: &Value) -> Result<String> {
         };
         if uri.scheme_str() != Some("https")
             || !uri.authority().is_some_and(|authority| {
-                matches!(authority.as_str(), "discord.com" | "discord.com:443")
+                launch::Flavor::for_renderer_host(authority.as_str()).is_some()
             })
         {
             continue;
@@ -756,7 +810,7 @@ fn select_endpoint(value: &Value) -> Result<String> {
             ws.scheme_str() == Some("ws")
                 && ws
                     .authority()
-                    .is_some_and(|authority| authority.as_str() == ADDRESS)
+                    .is_some_and(|authority| authority.as_str() == address)
                 && ws.path().starts_with("/devtools/page/")
                 && ws.query().is_none(),
             "Debugger must be loopback only"
@@ -781,6 +835,7 @@ mod tests {
                         snapshot: Snapshot {
                             audio_status: None,
                             companion_revision: None,
+                            companion_protocol: None,
                             status: Status::Connecting,
                             observation: None,
                         },
@@ -846,8 +901,24 @@ mod tests {
     #[test]
     fn endpoint_rejects_remote_and_ambiguous_targets() {
         let target = json!({"type":"page", "url":"https://discord.com/channels/@me", "webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/example"});
-        assert!(select_endpoint(&json!([target.clone()])).is_ok());
-        assert!(select_endpoint(&json!([target.clone(), target.clone()])).is_err());
+        assert!(select_endpoint(&json!([target.clone()]), 9222).is_ok());
+        assert!(select_endpoint(&json!([target.clone(), target.clone()]), 9222).is_err());
+        // The port is whatever this launch chose; a target list from another port is refused.
+        assert!(select_endpoint(&json!([target.clone()]), 51234).is_err());
+        for (host, ok) in [
+            ("canary.discord.com", true),
+            ("ptb.discord.com:443", true),
+            ("discord.com.example.test", false),
+            ("example.test", false),
+        ] {
+            let mut edition = target.clone();
+            edition["url"] = format!("https://{host}/channels/@me").into();
+            assert_eq!(
+                select_endpoint(&json!([edition]), 9222).is_ok(),
+                ok,
+                "{host}"
+            );
+        }
         for endpoint in [
             "ws://localhost:9222/devtools/page/example",
             "ws://127.0.0.1:9999/devtools/page/example",
@@ -856,7 +927,7 @@ mod tests {
         ] {
             let mut changed = target.clone();
             changed["webSocketDebuggerUrl"] = endpoint.into();
-            assert!(select_endpoint(&json!([changed])).is_err());
+            assert!(select_endpoint(&json!([changed]), 9222).is_err());
         }
     }
 
@@ -974,6 +1045,45 @@ mod tests {
     }
 
     #[test]
+    fn cdp_waits_through_read_timeouts_until_the_reply_deadline() {
+        use std::net::TcpListener;
+        use tungstenite::protocol::Role;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        // Shorter than the reply below and than the two-second call deadline.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = WebSocket::from_raw_socket(stream, Role::Server, None);
+            let request = socket.read().unwrap().into_text().unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            thread::sleep(Duration::from_millis(700));
+            socket
+                .send(Message::Text(
+                    json!({"id":request["id"],"result":{"value":true}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            // Keep the connection open until the client has read the reply.
+            let _ = socket.read();
+        });
+        let mut cdp = Cdp {
+            socket: WebSocket::from_raw_socket(stream, Role::Client, None),
+            next_id: 0,
+            bridge: None,
+        };
+        let result = cdp
+            .call("Runtime.evaluate", json!({"expression":"void 0"}))
+            .unwrap();
+        assert_eq!(result["value"], true);
+        drop(cdp);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn disconnect_clears_current_identity_and_marks_history_invalid() {
         let now = Instant::now();
         let shared = Shared {
@@ -982,6 +1092,7 @@ mod tests {
                 snapshot: Snapshot {
                     audio_status: None,
                     companion_revision: None,
+                    companion_protocol: None,
                     status: Status::Connecting,
                     observation: None,
                 },

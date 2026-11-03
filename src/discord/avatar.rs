@@ -51,10 +51,24 @@ impl Avatar {
     fn filename(&self) -> String {
         format!("{:x}.png", Sha256::digest(self.uri().as_bytes()))
     }
+
+    /// Parses the identifier form produced by `uri`, refusing anything else.
+    pub fn from_uri(uri: &str) -> Option<Self> {
+        let rest = uri.strip_prefix("bytes://discord-avatar/")?;
+        let (user_id, file) = rest.split_once('/')?;
+        let hash = file.strip_suffix(".png")?;
+        let avatar = Self {
+            user_id: user_id.into(),
+            hash: hash.into(),
+        };
+        avatar.valid().then_some(avatar)
+    }
 }
 
 type Images = Arc<Mutex<HashMap<Avatar, Option<Arc<[u8]>>>>>;
 
+/// Bounded participant picture cache: at most `MAX_MEMORY` entries in memory
+/// and `MAX_DISK` PNG files on disk, each named by a digest of its identifier.
 pub struct Cache {
     pending: mpsc::SyncSender<Avatar>,
     images: Images,
@@ -62,10 +76,16 @@ pub struct Cache {
 
 impl Default for Cache {
     fn default() -> Self {
+        Self::new(crate::model::data_dir().join("discord-avatars"))
+    }
+}
+
+impl Cache {
+    /// Caches under `directory`, which is created on first save.
+    pub fn new(directory: PathBuf) -> Self {
         let (pending, receiver) = mpsc::sync_channel::<Avatar>(MAX_MEMORY);
         let images: Images = Arc::default();
         let worker_images = images.clone();
-        let directory = crate::model::data_dir().join("discord-avatars");
         let _ = std::thread::Builder::new()
             .name("discord-avatars".into())
             .spawn(move || {
@@ -79,9 +99,7 @@ impl Default for Cache {
             });
         Self { pending, images }
     }
-}
 
-impl Cache {
     /// Called only for participants displayed in a connected or saved session.
     pub fn request(&self, avatar: &Avatar) {
         if !avatar.valid() {
@@ -100,6 +118,17 @@ impl Cache {
 
     pub fn bytes(&self, avatar: &Avatar) -> Option<Arc<[u8]>> {
         self.images.lock().ok()?.get(avatar)?.clone()
+    }
+
+    /// Resolves a `bytes://discord-avatar/...` identifier to cached PNG bytes.
+    /// Unknown identifiers are queued and return `None` until loaded.
+    pub fn bytes_for_uri(&self, uri: &str) -> Option<Arc<[u8]>> {
+        let avatar = Avatar::from_uri(uri)?;
+        let bytes = self.bytes(&avatar);
+        if bytes.is_none() {
+            self.request(&avatar);
+        }
+        bytes
     }
 }
 
@@ -140,6 +169,7 @@ fn load(directory: &Path, avatar: &Avatar) -> Result<Vec<u8>> {
         return Ok(bytes);
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
+        .https_only(true)
         .max_redirects(0)
         .timeout_global(Some(Duration::from_secs(10)))
         .timeout_connect(Some(Duration::from_secs(4)))
@@ -247,6 +277,49 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn cache_serves_local_files_by_identifier_without_a_network() {
+        let directory = std::env::temp_dir().join(format!(
+            "articulate-avatar-cache-{}",
+            crate::discord::plugin::new_token().unwrap()
+        ));
+        let avatar = Avatar {
+            user_id: "123456".into(),
+            hash: "0123456789abcdef0123456789abcdef".into(),
+        };
+        assert_eq!(Avatar::from_uri(&avatar.uri()), Some(avatar.clone()));
+        for uri in [
+            "bytes://discord-avatar/123456/0123456789abcdef0123456789abcdef.svg",
+            "bytes://discord-avatar/../x/0123456789abcdef0123456789abcdef.png",
+            "https://cdn.discordapp.com/avatars/123456/0123456789abcdef0123456789abcdef.png",
+            "bytes://discord-avatar/123456/0123456789abcdef0123456789abcdef.png?x=1",
+        ] {
+            assert!(Avatar::from_uri(uri).is_none(), "{uri}");
+        }
+        // The cached file name is a digest, never participant-controlled text.
+        assert!(avatar.filename().len() == 68 && avatar.filename().ends_with(".png"));
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        save(&directory, &directory.join(avatar.filename()), &png).unwrap();
+        let cache = Cache::new(directory.clone());
+        assert!(
+            cache.bytes_for_uri(&avatar.uri()).is_none(),
+            "Loads happen off-thread"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while cache.bytes(&avatar).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            cache.bytes_for_uri(&avatar.uri()).as_deref(),
+            Some(png.as_slice())
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

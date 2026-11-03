@@ -4,6 +4,8 @@ import { findStoreLazy } from "@webpack";
 // Replaced when Articulate prepares the source, then fixed in the running build.
 const compiledRevision = "__ARTICULATE_COMPANION_REVISION__";
 const revisionFields = /^[a-f0-9]{64}$/.test(compiledRevision) ? { companion_revision: compiledRevision } : {};
+// Must match the receiver's protocol version; the native bridge adds the sequence.
+const PROTOCOL_VERSION = 2;
 
 const Native = VencordNative.pluginHelpers.Articulate as PluginNative<typeof import("./native")>;
 const nativeAudio = () => (globalThis as unknown as { ArticulateNativeAudio?: {
@@ -11,13 +13,15 @@ const nativeAudio = () => (globalThis as unknown as { ArticulateNativeAudio?: {
 } }).ArticulateNativeAudio;
 const audioStates = new Set(["disabled", "addon-unavailable", "waiting", "waiting-for-voice-engine",
     "unsupported-native-build", "native-hook-unavailable", "waiting-for-articulate", "ready",
-    "capturing", "control-unavailable", "audio-transport-unavailable", "preload-unavailable"]);
+    "capturing", "control-unavailable", "audio-transport-unavailable", "preload-unavailable", "update-required"]);
 function audioStatus(): string {
     try {
         const state = nativeAudio()?.status().state;
         return state && audioStates.has(state) ? state : "preload-unavailable";
     } catch { return "preload-unavailable"; }
 }
+// Throttling uses a monotonic clock so a wall-clock change never stalls sampling.
+const monotonic = () => typeof performance !== "undefined" ? performance.now() : Date.now();
 
 interface VoiceState { userId: string; }
 const selected = findStoreLazy("SelectedChannelStore") as { getVoiceChannelId(): string | null; };
@@ -29,9 +33,9 @@ const channels = findStoreLazy("ChannelStore") as { getChannel(id: string): { gu
 let timer: ReturnType<typeof setInterval> | undefined;
 let active = false;
 let pending = false;
-let last = 0;
+let last = -Infinity;
 let pairingKey = "";
-let nextPairingCheck = 0;
+let nextPairingCheck = -Infinity;
 let lastHealth = "";
 function health(state: string) {
     if (state === lastHealth) return;
@@ -39,14 +43,25 @@ function health(state: string) {
     if (state !== "connected") console.warn(`[Articulate companion] ${state}`);
 }
 
+async function failureHealth(): Promise<string> {
+    try {
+        switch (await Native.getTransportState()) {
+            case "outdated": return "Articulate needs a newer companion; update it from Articulate's settings and restart Discord";
+            case "newer": return "Articulate is older than this companion; update Articulate";
+            case "rejected": return "The local listener did not prove the pairing key";
+            default: return "Local connection unavailable";
+        }
+    } catch { return "Local connection unavailable"; }
+}
+
 async function sample() {
     if (!active) { nativeAudio()?.disable(); return; }
-    if (pending || Date.now() - last < 50) return;
-    last = Date.now();
+    if (pending || monotonic() - last < 50) return;
+    last = monotonic();
     pending = true;
     try {
-        if (Date.now() >= nextPairingCheck) {
-            nextPairingCheck = Date.now() + 3000;
+        if (monotonic() >= nextPairingCheck) {
+            nextPairingCheck = monotonic() + 3000;
             pairingKey = await Native.getPairingKey();
         }
         if (!active || !/^[a-f0-9]{64}$/i.test(pairingKey)) {
@@ -65,21 +80,22 @@ async function sample() {
             const participants = states.map(state => {
                 const user = users.getUser(state.userId);
                 const member = channel?.guild_id ? members.getMember(channel.guild_id, state.userId) : null;
-                const name = user?.username || member?.nick || user?.globalName;
+                // Prefer what people see in the channel: nickname, then display name.
+                const name = member?.nick || user?.globalName || user?.username;
                 if (!name) throw new Error("Display name unavailable");
                 const avatar = user?.avatar && /^(?:a_)?[a-f0-9]{32}$/.test(user.avatar) && /^[0-9]{1,20}$/.test(state.userId)
                     ? { user_id: state.userId, hash: user.avatar } : undefined;
                 return { id: state.userId, name: [...name].slice(0, 128).join(""), speaking: !!speaking.isSpeaking(state.userId), is_self: state.userId === localId, ...(avatar ? { avatar } : {}) };
             });
-            snapshot = { version: 1, observed_ms: Date.now(), channel_id: channelId, participants, valid: true };
+            snapshot = { version: PROTOCOL_VERSION, observed_ms: Date.now(), channel_id: channelId, participants, valid: true };
         } catch {
             health("Discord voice stores unavailable");
-            snapshot = { version: 1, observed_ms: Date.now(), channel_id: null, participants: [], valid: false };
+            snapshot = { version: PROTOCOL_VERSION, observed_ms: Date.now(), channel_id: null, participants: [], valid: false };
         }
         if (await Native.publish(pairingKey, JSON.stringify({ ...snapshot, ...revisionFields, audio_status: audioStatus() }))) {
             if (snapshot.valid) health("connected");
         } else {
-            health("Local connection unavailable");
+            health(await failureHealth());
         }
     }
     catch {
@@ -97,7 +113,7 @@ export default definePlugin({
     authors: [],
     start() {
         active = true;
-        nextPairingCheck = 0;
+        nextPairingCheck = -Infinity;
         // Store listener APIs change between Discord builds. Sampling already
         // runs frequently, so a missing listener must never disable pairing.
         timer = setInterval(sample, 150);

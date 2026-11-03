@@ -8,10 +8,42 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     time::Instant,
 };
+
+use crate::calls::interruptions::{Cause, Interruption, Source};
+
+/// Why a track stopped delivering audio, recorded before the capture thread sees it.
+const FAULT_DEVICE: u8 = 1;
+const FAULT_OVERFLOW: u8 = 2;
+
+/// The first fault since the track last recovered. Written by the audio and
+/// error callbacks with atomics only; read by the capture thread.
+#[derive(Default)]
+struct Fault {
+    /// Milliseconds since the capture origin, plus one; zero when clear.
+    at: AtomicU64,
+    kind: AtomicU8,
+}
+
+impl Fault {
+    fn note(&self, kind: u8, ms: u64) {
+        if self
+            .at
+            .compare_exchange(0, ms + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.kind.store(kind, Ordering::Relaxed);
+        }
+    }
+
+    fn take(&self) -> Option<(u64, u8)> {
+        let at = self.at.swap(0, Ordering::Relaxed);
+        (at != 0).then(|| (at - 1, self.kind.load(Ordering::Relaxed)))
+    }
+}
 
 const BLOCK: usize = 512;
 struct Packet {
@@ -23,6 +55,7 @@ struct Packet {
 pub struct Control {
     origin: OnceLock<Instant>,
     discord: Mutex<Option<Arc<crate::discord::Connection>>>,
+    pub active_devices: Mutex<(Option<String>, Option<String>)>,
     pub stop_ns: AtomicU64,
     pub abort: AtomicBool,
 }
@@ -31,6 +64,7 @@ impl Control {
         Arc::new(Self {
             origin: OnceLock::new(),
             discord: Mutex::new(None),
+            active_devices: Mutex::new((None, None)),
             stop_ns: AtomicU64::new(0),
             abort: AtomicBool::new(false),
         })
@@ -81,8 +115,20 @@ pub struct Track {
     pending: VecDeque<Packet>,
     rate: u32,
     cursor: u64,
+    converter: crate::audio::StreamingResampler,
+    control: Arc<Control>,
     failed: Arc<AtomicBool>,
+    fault: Arc<Fault>,
     pub level: Arc<AtomicU32>,
+    selected: Option<String>,
+    output: bool,
+    pub gaps: u64,
+    recovering: bool,
+    /// The interruption in progress while the device is being reopened.
+    open_gap: Option<Interruption>,
+    /// Interruptions not yet collected with `take_interruptions`.
+    reported: Vec<Interruption>,
+    pub device: String,
 }
 
 impl Track {
@@ -97,13 +143,23 @@ impl Track {
             };
             devices
                 .find(|d| d.name().is_ok_and(|n| n == name))
-                .context("Selected audio device is unavailable")?
+                .or_else(|| {
+                    if output {
+                        host.default_output_device()
+                    } else {
+                        host.default_input_device()
+                    }
+                })
+                .context("No audio device is available")?
         } else if output {
             host.default_output_device()
                 .context("No speaker or headphone output found")?
         } else {
             host.default_input_device().context("No microphone found")?
         };
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| "Default audio device".into());
         let config = if output {
             device.default_output_config()?
         } else {
@@ -112,13 +168,15 @@ impl Track {
         let rate = config.sample_rate().0;
         let (producer, consumer) = HeapRb::<Packet>::new(8192).split();
         let failed = Arc::new(AtomicBool::new(false));
+        let fault = Arc::new(Fault::default());
         let level = Arc::new(AtomicU32::new(0));
         let state = Writer {
             producer,
             channels: config.channels() as usize,
             rate,
-            control,
+            control: control.clone(),
             failed: failed.clone(),
+            fault: fault.clone(),
             level: level.clone(),
             next: None,
         };
@@ -132,22 +190,98 @@ impl Track {
             _ => anyhow::bail!("Unsupported call audio format"),
         };
         stream.play()?;
+        let mut reported = Vec::new();
+        if let Some(notice) = crate::audio::device_notice(selected, &device_name) {
+            let ms = control.elapsed().as_millis() as u64;
+            let mut gap = Interruption::new(
+                ms,
+                ms,
+                if output {
+                    Source::SystemAudio
+                } else {
+                    Source::Microphone
+                },
+                Cause::DeviceLost,
+            );
+            gap.device_notice = Some(notice);
+            reported.push(gap);
+        }
+        {
+            let mut active = control
+                .active_devices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if output {
+                active.1 = Some(device_name.clone());
+            } else {
+                active.0 = Some(device_name.clone());
+            }
+        }
         Ok(Self {
             _stream: stream,
             consumer,
             pending: VecDeque::new(),
             rate,
             cursor: 0,
+            converter: crate::audio::StreamingResampler::new(rate)?,
+            control,
             failed,
+            fault,
             level,
+            selected: selected.map(str::to_owned),
+            output,
+            gaps: 0,
+            recovering: false,
+            open_gap: None,
+            reported,
+            device: device_name,
         })
     }
 
+    fn source(&self) -> Source {
+        if self.output {
+            Source::SystemAudio
+        } else {
+            Source::Microphone
+        }
+    }
+
+    /// Interruptions since the last call, including one still in progress
+    /// (marked ongoing, ending at `now` seconds).
+    pub fn take_interruptions(&mut self, now: f64) -> Vec<Interruption> {
+        let mut found = std::mem::take(&mut self.reported);
+        if let Some(open) = &self.open_gap {
+            let mut current = open.clone();
+            current.end_ms = current.end_ms.max((now * 1000.0) as u64);
+            found.push(current);
+        }
+        found
+    }
+
+    /// Record the start of an interruption noticed at `seconds`.
+    fn begin_gap(&mut self, seconds: f64) {
+        // The callback records when the fault happened; without it, the audio
+        // is missing from the previous refresh onward.
+        let now_ms = (seconds * 1000.0) as u64;
+        let cursor_ms = self.cursor * 1000 / u64::from(self.rate.max(1));
+        let (start_ms, cause) = match self.fault.take() {
+            Some((at, FAULT_OVERFLOW)) => (at, Cause::Overflow),
+            Some((at, _)) => (at, Cause::DeviceLost),
+            None => (cursor_ms, Cause::DeviceLost),
+        };
+        let mut gap = Interruption::new(start_ms.min(now_ms), now_ms, self.source(), cause);
+        gap.ongoing = true;
+        self.reported.push(gap.clone());
+        self.open_gap = Some(gap);
+    }
+
     pub fn take_until(&mut self, seconds: f64) -> Result<Vec<f32>> {
-        anyhow::ensure!(
-            !self.failed.load(Ordering::Relaxed),
-            "Call audio capture failed or its buffer overflowed. Check your devices."
-        );
+        let interrupted = self.failed.swap(false, Ordering::Relaxed);
+        if interrupted && !self.recovering {
+            self.gaps += 1;
+            self.recovering = true;
+            self.begin_gap(seconds);
+        }
         while let Some(packet) = self.consumer.try_pop() {
             self.pending.push_back(packet);
         }
@@ -174,7 +308,38 @@ impl Track {
             self.pending.pop_front();
         }
         self.cursor = end;
-        crate::audio::resample(&pcm, self.rate)
+        let mut output = Vec::new();
+        self.converter.append(&pcm, &mut output)?;
+        if self.control.stop_ns.load(Ordering::SeqCst) != 0 && seconds >= self.control.end_seconds()
+        {
+            self.converter.finish(&mut output)?;
+        }
+        if interrupted && self.control.stop_ns.load(Ordering::SeqCst) == 0 {
+            self.converter.finish(&mut output)?;
+            match Self::open(self.selected.as_deref(), self.output, self.control.clone()) {
+                Ok(mut replacement) => {
+                    replacement.cursor = (seconds * f64::from(replacement.rate)).round() as u64;
+                    replacement.gaps = self.gaps;
+                    replacement.reported = std::mem::take(&mut self.reported);
+                    if let Some(mut gap) = self.open_gap.take() {
+                        gap.end_ms = gap.end_ms.max((seconds * 1000.0) as u64);
+                        gap.ongoing = false;
+                        gap.device_notice = Some(format!(
+                            "Audio device reconnected. Now using {}.",
+                            replacement.device
+                        ));
+                        replacement.reported.push(gap);
+                    }
+                    *self = replacement;
+                }
+                Err(_) => {
+                    // Preserve the other track and retry at the next refresh.
+                    self.failed.store(true, Ordering::Relaxed);
+                    self.converter = crate::audio::StreamingResampler::new(self.rate)?;
+                }
+            }
+        }
+        Ok(output)
     }
 }
 
@@ -184,6 +349,7 @@ struct Writer {
     rate: u32,
     control: Arc<Control>,
     failed: Arc<AtomicBool>,
+    fault: Arc<Fault>,
     level: Arc<AtomicU32>,
     next: Option<u64>,
 }
@@ -198,6 +364,8 @@ where
     f32: cpal::FromSample<T>,
 {
     let failed = writer.failed.clone();
+    let fault = writer.fault.clone();
+    let control = writer.control.clone();
     Ok(device.build_input_stream(
         config,
         move |data: &[T], info: &cpal::InputCallbackInfo| {
@@ -241,6 +409,9 @@ where
                 }
                 offset += packet.len as u64;
                 if writer.producer.try_push(packet).is_err() {
+                    writer
+                        .fault
+                        .note(FAULT_OVERFLOW, (wall * 1000.0).max(0.0) as u64);
                     writer.failed.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -248,7 +419,10 @@ where
             writer.next = Some(at + offset);
             writer.level.store(peak.to_bits(), Ordering::Relaxed);
         },
-        move |_| failed.store(true, Ordering::Relaxed),
+        move |_| {
+            fault.note(FAULT_DEVICE, control.elapsed().as_millis() as u64);
+            failed.store(true, Ordering::Relaxed);
+        },
         None,
     )?)
 }

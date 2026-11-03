@@ -1,0 +1,1192 @@
+//! Renderer contract and controller action tests.
+
+use super::{Action, actions};
+use crate::app::{Command, Settings, tests::app};
+use crate::{call_capture, calls, dictionary, history, integration, macros, model};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+fn action(value: Value) -> Action {
+    serde_json::from_value(value).expect("a valid renderer action")
+}
+
+fn keys(value: &Value) -> BTreeSet<String> {
+    value
+        .as_object()
+        .unwrap_or_else(|| panic!("expected an object, found {value}"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+fn set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+fn row(start_ms: u64, text: &str) -> calls::Row {
+    calls::Row {
+        cues: Vec::new(),
+        start_ms,
+        end_ms: start_ms + 1000,
+        microphone: true,
+        speakers: Vec::new(),
+        discord: None,
+        text: text.into(),
+    }
+}
+
+/// A renderer-visible state with every optional part present.
+fn populated_app() -> crate::app::App {
+    let (mut app, _) = app();
+    let mut selected = history::Session::new(history::Kind::Call);
+    selected.text = "Saved transcript.".into();
+    selected.rows.push(row(0, "Saved row."));
+    app.history.items.push(history::Summary::from(&selected));
+    app.history.selected = Some(selected);
+    let mut dictation = history::Session::new(history::Kind::Dictation);
+    dictation.text = "A dictation.".into();
+    app.history.dictation = Some(dictation);
+    app.history.call = Some(history::Session::new(history::Kind::Call));
+    app.call = Some(call_capture::Control::new());
+    app.call_rows.push(row(0, "Live row."));
+    app
+}
+
+#[test]
+fn call_snapshot_reports_active_endpoints_without_changing_preferences() {
+    let (mut app, _) = app();
+    app.settings.microphone = Some("Preferred mic".into());
+    let control = call_capture::Control::new();
+    *control.active_devices.lock().unwrap() =
+        (Some("Fallback mic".into()), Some("Fallback output".into()));
+    app.call = Some(control);
+    let state = app.desktop_snapshot();
+    assert_eq!(state["active_microphone"], "Fallback mic");
+    assert_eq!(state["active_output"], "Fallback output");
+    assert_eq!(app.settings.microphone.as_deref(), Some("Preferred mic"));
+}
+
+#[test]
+fn snapshot_sections_have_a_locked_shape() {
+    let app = populated_app();
+    let sections: BTreeMap<_, _> = app.desktop_sections().into_iter().collect();
+    let expected: BTreeMap<&str, BTreeSet<String>> = [
+        (
+            "shell",
+            set(&[
+                "ready",
+                "loading",
+                "busy",
+                "status",
+                "saving",
+                "history_loading",
+                "history_error",
+                "filing_status",
+                "filing_working",
+                "source_move_working",
+                "summary_working",
+            ]),
+        ),
+        (
+            "capture",
+            set(&[
+                "recording",
+                "call_recording",
+                "note_recording",
+                "seconds",
+                "call_status",
+                "note_status",
+                "call_cues_enabled",
+                "call_cues_status",
+                "capture_feedback",
+            ]),
+        ),
+        (
+            "dictation",
+            set(&[
+                "text",
+                "original",
+                "dictation_session",
+                "dictation_interruption",
+            ]),
+        ),
+        ("live", set(&["call_session", "note_session"])),
+        (
+            "capture_bodies",
+            set(&["dictation_body", "call_body", "note_body"]),
+        ),
+        ("live_rows", set(&["call_rows", "note_rows"])),
+        ("document", set(&["selected"])),
+        (
+            "notes",
+            set(&["notes", "selected_notes", "call_notes", "note_notes"]),
+        ),
+        ("settings", set(&["settings", "microphones", "outputs"])),
+        (
+            "models",
+            set(&["model_status", "downloading", "managed_models", "cleanup"]),
+        ),
+        ("discord", set(&["discord"])),
+        ("meetings", set(&["meetings"])),
+        ("updater", set(&["updater"])),
+        ("overlay", set(&["overlay"])),
+        (
+            "call_tools",
+            set(&[
+                "audio_import",
+                "playback",
+                "active_microphone",
+                "active_output",
+            ]),
+        ),
+        ("people", set(&["people", "people_error"])),
+        ("history", set(&["history"])),
+        ("document_body", set(&["selected_body"])),
+        ("vocabulary", set(&["dictionary", "macros", "assort"])),
+        ("insights", set(&["insights"])),
+        ("search", set(&["search"])),
+        ("storage", set(&["storage", "library_notice"])),
+        ("recovery", set(&["recovery"])),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        sections.keys().copied().collect::<BTreeSet<_>>(),
+        expected.keys().copied().collect::<BTreeSet<_>>()
+    );
+    for (name, keys_expected) in &expected {
+        assert_eq!(&keys(&sections[name]), keys_expected, "section {name}");
+    }
+    let state = app.desktop_snapshot();
+    let session_meta = set(&[
+        "id",
+        "title",
+        "kind",
+        "audio_packets_lost",
+        "created_ms",
+        "updated_ms",
+        "topic_id",
+        "is_collection",
+        "can_receive_sources",
+        "sources",
+        "pinned",
+        "follow_ups",
+        "subtitles_unavailable",
+        "interruptions",
+        "speaker_undo",
+        "audio",
+        "transcript_versions",
+        "transcript_revision",
+    ]);
+    assert_eq!(keys(&state["selected"]), session_meta);
+    assert_eq!(keys(&state["call_session"]), session_meta);
+    assert_eq!(
+        keys(&state["selected_body"]),
+        set(&["id", "text", "original", "rows", "personal_notes"])
+    );
+    assert_eq!(keys(&state["dictation_session"]), session_meta);
+    assert_eq!(
+        keys(&state["dictation_body"]),
+        keys(&state["selected_body"])
+    );
+    assert_eq!(keys(&state["call_body"]), keys(&state["selected_body"]));
+    let row_keys = set(&[
+        "start_ms",
+        "end_ms",
+        "speaker",
+        "speaker_labels",
+        "speaker_keys",
+        "text",
+        "cues",
+        "provisional",
+    ]);
+    assert_eq!(keys(&state["call_rows"][0]), row_keys);
+    assert_eq!(keys(&state["selected_body"]["rows"][0]), row_keys);
+    assert_eq!(
+        keys(&state["history"][0]),
+        set(&[
+            "id",
+            "title",
+            "kind",
+            "created_ms",
+            "updated_ms",
+            "preview",
+            "duration_ms",
+            "topic_id",
+            "is_collection",
+            "can_receive_sources",
+            "pinned",
+        ])
+    );
+    assert_eq!(
+        keys(&state["settings"]),
+        set(&[
+            "spoken_editing_commands",
+            "styles",
+            "input_profiles",
+            "recent_dictation_app",
+            "shortcut_error",
+            "microphone_check",
+            "clean_speech",
+            "insert",
+            "live_insert",
+            "cpu",
+            "transcription_language",
+            "audio_context",
+            "learn_corrections",
+            "audio_feedback",
+            "microphone",
+            "output",
+            "hotkey",
+            "quick_note_hotkey",
+            "quick_note_hotkey_pending",
+            "quick_note_shortcut_error",
+            "hotkey_mode",
+            "discord_auto_connect",
+            "discord_auto_transcribe",
+            "discord_companion",
+            "vencord_auto_update",
+            "close_to_tray",
+            "start_with_windows",
+            "automatic_update_checks",
+            "discord_flavor",
+            "discord_avatars",
+            "meetings_teams",
+            "meetings_zoom",
+            "meetings_meet",
+            "meetings_start",
+            "keep_call_audio",
+        ])
+    );
+    assert_eq!(
+        keys(&state["discord"]),
+        set(&[
+            "connected",
+            "listener_started",
+            "status",
+            "in_voice",
+            "audio_ready",
+            "audio_status",
+            "audio_message",
+            "participants",
+            "pairing_state",
+            "pairing_key_present",
+            "companion_protocol",
+            "companion_protocol_message",
+            "flavor",
+            "installed_flavors",
+            "debugger_port",
+            "debugger_open",
+            "debugger_notice",
+            "automatic_can_retry",
+            "error",
+            "relaunching",
+            "companion_selected",
+            "automatic_status",
+            "companion",
+        ])
+    );
+    assert_eq!(
+        keys(&state["discord"]["companion"]),
+        set(&[
+            "checked",
+            "installed",
+            "runtime_status",
+            "source_found",
+            "active",
+            "busy",
+            "status",
+            "error",
+            "plugin_status",
+            "can_build",
+            "native_audio",
+            "installer_ready",
+        ])
+    );
+    assert_eq!(
+        keys(&state["meetings"]),
+        set(&[
+            "enabled",
+            "settings",
+            "consent_reminder",
+            "active",
+            "prompt",
+            "owned",
+            "status",
+            "probe_error",
+            "events",
+        ])
+    );
+    assert_eq!(
+        keys(&state["meetings"]["settings"]),
+        set(&["teams", "zoom", "meet", "start"])
+    );
+    assert_eq!(state["meetings"]["settings"]["start"], "ask");
+    assert_eq!(state["discord"]["companion_protocol"], "unknown");
+    assert!(state["discord"].get("meetings").is_none());
+    assert_eq!(
+        keys(&state["model_status"]),
+        set(&[
+            "speech_installed",
+            "backend",
+            "model_name",
+            "speech_languages",
+            "model_custom",
+            "speakers_installed",
+            "speakers_working",
+            "speakers_progress",
+            "speakers_status",
+            "context_installed",
+            "context_progress",
+            "context_status",
+            "context_supported",
+            "verifier_installed",
+            "verifier_working",
+            "verifier_progress",
+            "verifier_status",
+            "cleanup_installed",
+            "cleanup_working",
+            "cleanup_status",
+            "cleanup_progress",
+        ])
+    );
+    assert_eq!(
+        keys(&state["overlay"]),
+        set(&["visible", "recording", "finishing", "message"])
+    );
+    assert_eq!(state["updater"], json!({"state": "idle"}));
+}
+
+#[test]
+fn every_state_key_belongs_to_exactly_one_section() {
+    let app = populated_app();
+    let mut owners = BTreeMap::new();
+    for (section, value) in app.desktop_sections() {
+        for key in keys(&value) {
+            if let Some(previous) = owners.insert(key.clone(), section) {
+                panic!("{key} is in both {previous} and {section}");
+            }
+        }
+    }
+    assert!(!owners.contains_key("controller"), "the bridge owns health");
+}
+
+#[test]
+fn live_rows_are_sent_once_and_not_inside_session_views() {
+    let state = populated_app().desktop_snapshot();
+    assert_eq!(state["call_rows"][0]["text"], "Live row.");
+    for session in ["call_session", "selected"] {
+        assert!(state[session].get("rows").is_none(), "{session}");
+        assert!(state[session].get("text").is_none(), "{session}");
+    }
+    assert_eq!(state["selected_body"]["rows"][0]["text"], "Saved row.");
+}
+
+#[test]
+fn renderer_action_types_match_the_frontend_catalog() {
+    let source = include_str!("../../../ui/src/actions.js");
+    let catalog = source
+        .split_once("export const actionCatalog = Object.freeze({")
+        .and_then(|(_, rest)| rest.split_once("});"))
+        .map(|(body, _)| body)
+        .expect("the action catalog");
+    let frontend: BTreeSet<String> = catalog
+        .lines()
+        .filter_map(|line| {
+            let (name, rest) = line.trim().split_once(':')?;
+            (rest.trim_start().starts_with('{')
+                && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .then(|| name.to_owned())
+        })
+        .collect();
+    let mut native = BTreeSet::new();
+    for (feature, types) in actions::action_types() {
+        assert!(!types.is_empty(), "{feature} lists its types");
+        for name in types {
+            assert!(native.insert(name.clone()), "{name} is declared twice");
+        }
+    }
+    assert_eq!(frontend, native);
+}
+
+#[test]
+fn lifecycle_actions_require_ready_state_before_external_changes() {
+    let (mut app, _) = app();
+    assert!(
+        app.desktop_action(action(json!({"type": "update_download"})))
+            .is_err()
+    );
+    assert!(
+        app.desktop_action(action(json!({"type": "update_install"})))
+            .is_err()
+    );
+    assert!(app.pending_install.is_none());
+    app.call = Some(call_capture::Control::new());
+    assert!(
+        app.desktop_action(action(json!({"type": "discord_relaunch"})))
+            .is_err()
+    );
+    assert!(
+        app.desktop_action(action(json!({"type": "companion_install"})))
+            .is_err()
+    );
+    assert!(!app.settings.discord_companion);
+    assert!(action(json!({"type": "update_install"})).installs_update());
+    assert!(!action(json!({"type": "update_check"})).installs_update());
+}
+
+#[test]
+fn closing_and_updating_wait_for_downloads() {
+    let (mut app, _) = app();
+    app.preview_inflight = false;
+    app.speakers_downloading = Some(0.4);
+    let error = app.desktop_shutdown().unwrap_err();
+    assert!(error.contains("speaker identification"), "{error}");
+    app.speakers_downloading = None;
+    app.downloading = Some(0.1);
+    app.context_progress = Some(0.2);
+    let error = app.desktop_shutdown().unwrap_err();
+    assert!(error.contains("speech model and audio context"), "{error}");
+    app.downloading = None;
+    app.context_progress = None;
+    assert!(app.desktop_active_downloads().is_empty());
+}
+
+#[test]
+fn invalid_model_selection_does_not_change_settings_or_expose_private_path() {
+    let (mut app, _) = app();
+    let patch = action(json!({"type":"settings_patch", "cpu":true,"model_path":"relative.gguf"}));
+    assert!(app.desktop_action(patch).is_err());
+    assert!(!app.settings.cpu);
+    app.settings.model_path = std::env::temp_dir()
+        .join("synthetic-private-model-folder")
+        .join("speech.gguf")
+        .to_string_lossy()
+        .into_owned();
+    let snapshot = app.desktop_snapshot();
+    assert_eq!(snapshot["model_status"]["model_name"], "speech.gguf");
+    assert!(
+        !snapshot
+            .to_string()
+            .contains("synthetic-private-model-folder")
+    );
+}
+
+#[test]
+fn a_settings_patch_is_validated_completely_before_anything_changes() {
+    let (mut app, _) = app();
+    // The audio context model is not installed in tests, so this patch fails
+    // after several valid fields; none of them may change.
+    let patch = action(json!({
+        "type": "settings_patch",
+        "clean_speech": false,
+        "insert": true,
+        "hotkey_mode": "Toggle",
+        "microphone": "Synthetic microphone",
+        "audio_context": true,
+    }));
+    assert!(app.desktop_action(patch).is_err());
+    assert!(app.settings.clean_speech);
+    assert!(!app.settings.insert);
+    assert_eq!(app.settings.hotkey_mode, crate::platform::HotkeyMode::Hold);
+    assert!(app.settings.microphone.is_none());
+    // Conflicting shortcuts are rejected before either is registered.
+    let shortcut = json!({"ctrl": true, "alt": true, "shift": false, "win": false, "key": "K"});
+    let patch = action(json!({
+        "type": "settings_patch",
+        "clean_speech": false,
+        "hotkey": shortcut,
+        "quick_note_hotkey": shortcut,
+    }));
+    assert!(app.desktop_action(patch).is_err());
+    assert!(app.settings.clean_speech);
+    assert!(!app.hotkey_pending && !app.quick_note_hotkey_pending);
+    let patch = action(json!({"type": "settings_patch", "microphone": ""}));
+    app.settings.microphone = Some("Previous".into());
+    app.desktop_action(patch).unwrap();
+    assert!(
+        app.settings.microphone.is_none(),
+        "empty selects the default"
+    );
+}
+
+#[test]
+fn discord_edition_avatars_and_meeting_settings_are_validated_and_saved() {
+    let (mut app, _) = app();
+    let patch = |value: Value| {
+        let mut object = json!({"type": "settings_patch"});
+        object
+            .as_object_mut()
+            .unwrap()
+            .extend(value.as_object().unwrap().clone());
+        action(object)
+    };
+    // Unknown editions and modes are rejected before anything changes.
+    assert!(
+        app.desktop_action(patch(
+            json!({"discord_flavor": "beta", "meetings_zoom": true})
+        ))
+        .is_err()
+    );
+    assert!(!app.settings.meetings.zoom);
+    assert!(
+        serde_json::from_value::<Action>(
+            json!({"type": "settings_patch", "meetings_start": "always"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<Action>(
+            json!({"type": "settings_patch", "discord_debugger_port": 9222})
+        )
+        .is_err(),
+        "the debugger port is chosen by the relaunch, never by the renderer"
+    );
+    // Editions are accepted when no installation list is known yet.
+    app.desktop_action(patch(json!({"discord_flavor": " Canary "})))
+        .unwrap();
+    assert_eq!(app.settings.discord_flavor, "canary");
+    // The edition is frozen while the debugger is open.
+    app.settings.discord_debugger_port = 51234;
+    let error = app
+        .desktop_action(patch(json!({"discord_flavor": "stable"})))
+        .unwrap_err();
+    assert!(error.contains("debugger"), "{error}");
+    assert_eq!(app.settings.discord_flavor, "canary");
+    app.settings.discord_debugger_port = 0;
+    app.desktop_action(patch(json!({"discord_flavor": ""})))
+        .unwrap();
+    assert_eq!(app.settings.discord_flavor, "");
+    // Meeting preferences and the start mode round-trip through the view.
+    app.desktop_action(patch(json!({
+        "meetings_teams": true,
+        "meetings_meet": true,
+        "meetings_start": "automatic",
+        "discord_avatars": false,
+    })))
+    .unwrap();
+    assert!(app.settings.meetings.teams && app.settings.meetings.meet);
+    assert!(!app.settings.meetings.zoom);
+    assert_eq!(
+        app.settings.meetings.start,
+        crate::meetings::StartMode::Automatic
+    );
+    assert!(!app.settings.discord_avatars);
+    let state = app.desktop_snapshot();
+    assert_eq!(state["settings"]["meetings_teams"], true);
+    assert_eq!(state["settings"]["meetings_start"], "automatic");
+    assert_eq!(state["settings"]["discord_avatars"], false);
+    assert_eq!(state["meetings"]["enabled"], true);
+    assert_eq!(state["meetings"]["settings"]["meet"], true);
+    assert_eq!(state["meetings"]["prompt"], Value::Null);
+    assert!(
+        state["meetings"]["consent_reminder"]
+            .as_str()
+            .unwrap()
+            .contains("consent")
+    );
+    let restored: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
+    assert!(restored.meetings.teams && !restored.discord_avatars);
+}
+
+#[test]
+fn pairing_and_meeting_actions_are_routed_and_guarded() {
+    let (mut app, _) = app();
+    assert!(
+        app.desktop_action(action(json!({"type": "meeting_respond", "accept": true})))
+            .is_err(),
+        "no meeting is waiting"
+    );
+    assert!(
+        serde_json::from_value::<Action>(json!({"type": "meeting_respond"})).is_err(),
+        "an answer is required"
+    );
+    app.settings.discord_pairing_key = crate::discord::plugin::new_token().unwrap();
+    app.settings.discord_companion = true;
+    app.settings.discord_auto_connect = false;
+    let previous = app.settings.discord_pairing_key.clone();
+    app.desktop_action(action(json!({"type": "discord_rotate_key"})))
+        .unwrap();
+    assert_ne!(app.settings.discord_pairing_key, previous);
+    assert!(crate::discord::plugin::valid_token(
+        &app.settings.discord_pairing_key
+    ));
+    assert_eq!(
+        app.desktop_snapshot()["discord"]["pairing_key_present"],
+        true
+    );
+    app.desktop_action(action(json!({"type": "discord_forget_pairing"})))
+        .unwrap();
+    assert!(app.settings.discord_pairing_key.is_empty());
+    assert!(!app.settings.discord_auto_connect);
+    assert!(app.discord.is_none());
+    assert_eq!(
+        app.desktop_snapshot()["discord"]["pairing_key_present"],
+        false
+    );
+    // A recording keeps the key and the Discord process alone.
+    app.call = Some(call_capture::Control::new());
+    for kind in [
+        "discord_rotate_key",
+        "discord_forget_pairing",
+        "discord_relaunch_normally",
+    ] {
+        assert!(
+            app.desktop_action(action(json!({"type": kind}))).is_err(),
+            "{kind}"
+        );
+    }
+    assert!(app.settings.discord_pairing_key.is_empty());
+}
+
+#[test]
+fn moves_and_deletions_lock_only_the_documents_they_affect() {
+    let (mut app, _) = app();
+    let mut topic = history::Session::new(history::Kind::Note);
+    topic.personal_notes = "My existing words.".into();
+    let patch = |id: &str, notes: &str| {
+        action(json!({"type": "session_patch", "id": id, "personal_notes": notes}))
+    };
+    app.history.selected = Some(topic.clone());
+    app.notetaker.moving = true;
+    let error = app
+        .desktop_action(patch(&topic.id, "A concurrent edit."))
+        .unwrap_err();
+    assert!(error.contains("moving between topics"), "{error}");
+    assert_eq!(
+        app.history.selected.as_ref().unwrap().personal_notes,
+        "My existing words."
+    );
+    assert_eq!(app.desktop_snapshot()["source_move_working"], true);
+    app.notetaker.moving = false;
+    // Deleting an unrelated recording neither blocks nor locks this note.
+    app.history
+        .pending_deletions
+        .insert("an-unrelated-recording".into());
+    assert_eq!(app.desktop_snapshot()["source_move_working"], false);
+    assert!(app.desktop_edit_blocked(&topic).is_none());
+    // Deleting a source of this topic does.
+    let source = history::Session::new(history::Kind::Dictation);
+    let mut summary = history::Summary::from(&source);
+    summary.topic_id = Some(topic.id.clone());
+    app.history.items.push(summary);
+    app.history.pending_deletions.insert(source.id.clone());
+    let error = app
+        .desktop_action(patch(&topic.id, "An edit while deleting a source."))
+        .unwrap_err();
+    assert!(
+        error.contains("recording in this topic is being deleted"),
+        "{error}"
+    );
+    assert_eq!(
+        app.history.selected.as_ref().unwrap().personal_notes,
+        "My existing words."
+    );
+    assert_eq!(app.desktop_snapshot()["source_move_working"], true);
+    app.history.pending_deletions.insert(topic.id.clone());
+    assert_eq!(
+        app.desktop_edit_blocked(&topic),
+        Some("This document is being deleted.")
+    );
+}
+
+#[test]
+fn spoken_note_snapshot_stays_separate_from_calls_and_dictation() {
+    let (mut app, _) = app();
+    app.history.call = Some(history::Session::new(history::Kind::Note));
+    app.call = Some(call_capture::Control::new());
+    app.call_rows.push(row(0, "An evolving thought."));
+    let state = app.desktop_snapshot();
+    assert_eq!(state["note_recording"], true);
+    assert_eq!(state["call_recording"], false);
+    assert_eq!(state["recording"], false);
+    assert_eq!(state["note_rows"][0]["text"], "An evolving thought.");
+    assert!(state["call_rows"].as_array().unwrap().is_empty());
+    assert!(state["call_session"].is_null());
+    assert_eq!(state["note_session"]["kind"], "note");
+}
+
+#[test]
+fn transcription_language_is_validated_saved_and_sent_to_the_speech_worker() {
+    let (mut app, commands) = app();
+    let model_path = model::data_dir().join("language-test.gguf");
+    std::fs::create_dir_all(model::data_dir()).unwrap();
+    std::fs::write(
+        &model_path,
+        b"synthetic model path; no inference worker in this test",
+    )
+    .unwrap();
+    app.settings.model_path = model_path.to_string_lossy().into_owned();
+    let change = |language: &str| {
+        action(json!({"type":"settings_patch", "transcription_language":language}))
+    };
+    app.desktop_action(change("en")).unwrap();
+    assert_eq!(app.settings.transcription_language, "en");
+    assert!(
+        matches!(commands.try_recv().unwrap(), Command::Load(_, _, Some(language)) if language == "en")
+    );
+    let restored: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
+    assert_eq!(restored.transcription_language, "en");
+    app.loading = false;
+    assert!(app.desktop_action(change("invalid")).is_err());
+    assert_eq!(app.settings.transcription_language, "en");
+    app.desktop_action(change("")).unwrap();
+    assert!(matches!(
+        commands.try_recv().unwrap(),
+        Command::Load(_, _, None)
+    ));
+    assert!(
+        serde_json::from_str::<Settings>("{}")
+            .unwrap()
+            .transcription_language
+            .is_empty()
+    );
+}
+
+#[test]
+fn disabling_learning_stops_field_observation_and_discards_pending_local_edit() {
+    let (mut app, _) = app();
+    let (sender, events) = mpsc::channel();
+    app.integration_tx = sender;
+    app.text = "Synthetic corrected text.".into();
+    app.edit_baseline = "Earlier text.".into();
+    app.edited_at = Some(Instant::now());
+    app.desktop_set_learning(false);
+    assert!(!app.settings.learn_corrections);
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        integration::Action::StopLearning
+    ));
+    assert!(app.edited_at.is_none());
+    assert_eq!(app.edit_baseline, app.text);
+    app.desktop_set_learning(true);
+    assert!(app.edited_at.is_none());
+    assert!(events.try_recv().is_err());
+    // The settings patch applies the same side effects after saving.
+    app.edited_at = Some(Instant::now());
+    app.desktop_action(action(
+        json!({"type": "settings_patch", "learn_corrections": false}),
+    ))
+    .unwrap();
+    assert!(!app.settings.learn_corrections);
+    assert!(app.edited_at.is_none());
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        integration::Action::StopLearning
+    ));
+}
+
+#[test]
+fn renderer_snapshot_excludes_pairing_key_and_model_path() {
+    let (mut app, _) = app();
+    app.settings.discord_pairing_key = "synthetic-private-pairing-value".into();
+    app.settings.model_path = "synthetic-private-model-path".into();
+    let snapshot = app.desktop_snapshot();
+    let serialized = snapshot.to_string();
+    assert!(!serialized.contains("synthetic-private"));
+    assert!(snapshot["settings"]["clean_speech"].is_boolean());
+    assert!(snapshot["history"].is_array());
+}
+
+#[test]
+fn renderer_cannot_supply_arbitrary_settings_or_actions() {
+    assert!(
+        serde_json::from_value::<Action>(
+            json!({"type":"settings_patch", "discord_pairing_key":"replace"})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<Action>(json!({"type":"run_shell", "command":"anything"}))
+            .is_err()
+    );
+    assert!(serde_json::from_value::<Action>(json!({"command":"anything"})).is_err());
+    assert!(
+        serde_json::from_value::<Action>(json!({"type":"call_start", "source":"elsewhere"}))
+            .is_err()
+    );
+    assert!(
+        serde_json::from_value::<Action>(json!({"type":"settings_patch", "clean_speech":false}))
+            .is_ok()
+    );
+}
+
+#[test]
+fn cancel_dictation_cannot_cancel_a_call() {
+    let (mut app, _) = app();
+    app.call = Some(call_capture::Control::new());
+    let token = app.cancel.clone();
+    assert!(
+        app.desktop_action(action(json!({"type": "dictation_cancel"})))
+            .is_err()
+    );
+    assert!(!token.is_cancelled());
+}
+
+#[test]
+fn document_commands_patch_only_notes_and_title_and_persist() {
+    let directory = std::env::temp_dir().join(format!(
+        "articulate-desktop-contract-{}",
+        history::Session::new(history::Kind::Note).id
+    ));
+    let (mut app, _) = app();
+    app.history.worker = Some(history::Worker::test_directory(directory.clone()));
+    let mut session = history::Session::new(history::Kind::Dictation);
+    session.text = "Synthetic transcript remains unchanged.".into();
+    session.original = "Synthetic original remains unchanged.".into();
+    let id = session.id.clone();
+    app.history.selected = Some(session);
+    app.desktop_action(action(json!({
+        "type": "session_patch",
+        "id": id,
+        "title": "Reviewed document",
+        "personal_notes": "A deliberately edited note.",
+    })))
+    .unwrap();
+    let mut current = history::Session::new(history::Kind::Call);
+    let call_id = current.id.clone();
+    current.text = "Earlier source.".into();
+    app.history.selected = Some(current.clone());
+    current.text = "The latest source includes the completed call.".into();
+    app.history.call = Some(current);
+    app.desktop_action(action(json!({
+        "type": "session_patch",
+        "id": call_id,
+        "personal_notes": "Keep the latest source.",
+    })))
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !app
+        .history
+        .worker
+        .as_ref()
+        .unwrap()
+        .saves_settled()
+        .unwrap()
+    {
+        assert!(Instant::now() < deadline, "Isolated history save timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(app);
+    let history = history::History::open(directory.clone()).unwrap();
+    let saved = history.load(&id).unwrap();
+    assert_eq!(saved.text, "Synthetic transcript remains unchanged.");
+    assert_eq!(saved.original, "Synthetic original remains unchanged.");
+    assert_eq!(saved.title, "Reviewed document");
+    assert!(saved.title_is_manual);
+    assert_eq!(saved.personal_notes, "A deliberately edited note.");
+    let saved_call = history.load(&call_id).unwrap();
+    assert_eq!(
+        saved_call.text,
+        "The latest source includes the completed call."
+    );
+    assert_eq!(saved_call.personal_notes, "Keep the latest source.");
+    drop(history);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn indicator_visibility_expires_without_focus_or_raw_text() {
+    let (mut app, _) = app();
+    app.raw = "Unrelated synthetic private transcript".into();
+    assert_eq!(app.desktop_snapshot()["overlay"]["visible"], false);
+    app.overlay_message = "Ready to copy".into();
+    app.overlay_until = Some(Instant::now() + Duration::from_secs(1));
+    let snapshot = app.desktop_snapshot();
+    assert_eq!(snapshot["overlay"]["visible"], true);
+    assert_eq!(snapshot["overlay"]["message"], "Ready to copy");
+    assert!(!snapshot["overlay"].to_string().contains(&app.raw));
+    app.overlay_until = Some(Instant::now() - Duration::from_secs(1));
+    assert_eq!(app.desktop_snapshot()["overlay"]["visible"], false);
+}
+
+#[test]
+fn stale_editor_cannot_delete_same_phrase_in_a_different_scope() {
+    let (mut app, _) = app();
+    let original = dictionary::validate("project", "Project").unwrap();
+    let mut other = original.clone();
+    other.app = Some("editor.exe".into());
+    app.settings.entries = vec![other.clone()];
+    let result = app.desktop_action(action(json!({
+        "type": "dictionary_delete",
+        "index": 0,
+        "expected_heard": original.heard,
+        "expected_entry": serde_json::to_value(&original).unwrap(),
+    })));
+    assert!(result.is_err());
+    assert!(app.settings.entries[0] == other);
+    let original = macros::validate("signature", "A synthetic signature", "").unwrap();
+    let mut other = original.clone();
+    other.app = Some("editor.exe".into());
+    app.settings.macros = vec![other];
+    let result = app.desktop_action(action(json!({
+        "type": "macro_delete",
+        "index": 0,
+        "expected_trigger": original.trigger,
+        "expected_macro": serde_json::to_value(original).unwrap(),
+    })));
+    assert!(result.is_err());
+    assert_eq!(app.settings.macros[0].app.as_deref(), Some("editor.exe"));
+}
+
+#[test]
+fn model_review_shapes_are_locked() {
+    let (app, _) = app();
+    let state = app.desktop_snapshot();
+    assert_eq!(
+        keys(&state["cleanup"]),
+        set(&["installed", "working", "status", "progress", "preview"])
+    );
+    assert_eq!(
+        keys(&state["assort"]),
+        set(&["working", "status", "candidates", "scores"])
+    );
+    assert_eq!(
+        keys(&state["notes"]),
+        set(&[
+            "ready",
+            "acceleration_installed",
+            "working",
+            "status",
+            "progress",
+            "download_status",
+            "download_progress",
+            "downloading"
+        ])
+    );
+    assert_eq!(
+        keys(&state["managed_models"][0]),
+        set(&["id", "installed", "disk_size", "path", "in_use"])
+    );
+    assert!(
+        state["settings"]["automatic_update_checks"]
+            .as_bool()
+            .unwrap()
+    );
+    assert_eq!(state["settings"]["close_to_tray"], false);
+    assert_eq!(state["settings"]["start_with_windows"], false);
+}
+#[test]
+fn leased_models_cannot_be_deleted_through_renderer() {
+    let (mut app, _) = app();
+    for id in [
+        model::ModelId::Speech,
+        model::ModelId::Verifier,
+        model::ModelId::Speaker,
+        model::ModelId::SoundCues,
+        model::ModelId::Polish,
+        model::ModelId::Notes,
+    ] {
+        let _lease = model::acquire(id);
+        assert!(
+            app.desktop_action(action(json!({"type":"model_delete", "id":id})))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn review_actions_validate_fields_and_cancel_without_changing_text() {
+    let (mut app, _) = app();
+    app.text = "Synthetic dictation.".into();
+    for kind in ["polish_cancel", "assort_cancel"] {
+        app.desktop_action(action(json!({"type":kind}))).unwrap();
+        assert_eq!(app.text, "Synthetic dictation.");
+    }
+    assert!(
+        serde_json::from_value::<Action>(
+            json!({"type":"assort_apply","index":-1,"saved_spelling":true})
+        )
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<Action>(json!({"type":"model_delete","id":"unknown"})).is_err()
+    );
+    app.desktop_action(action(json!({"type":"settings_patch","automatic_update_checks":false,"close_to_tray":true,"start_with_windows":true}))).unwrap();
+    assert!(!app.settings.automatic_update_checks);
+    assert!(app.settings.close_to_tray);
+    assert!(app.settings.start_with_windows);
+}
+
+#[test]
+fn model_cancellation_targets_the_requested_transfer() {
+    let (mut app, _) = app();
+    let speech = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let verifier = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.model_cancels
+        .insert(model::ModelId::Speech, speech.clone());
+    app.model_cancels
+        .insert(model::ModelId::Verifier, verifier.clone());
+    app.desktop_action(action(
+        json!({"type":"model_download_cancel", "id":"verifier"}),
+    ))
+    .unwrap();
+    assert!(verifier.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(!speech.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[test]
+fn input_preferences_validate_and_round_trip() {
+    let (mut app, _) = app();
+    app.desktop_action(action(json!({"type":"settings_patch", "spoken_editing_commands":true, "input_profiles":[{"app":"editor.exe","insert":true,"line_break":"ShiftEnter"}], "styles":[{"app":"editor.exe","style":"Chat"}]}))).unwrap();
+    let restored: Settings =
+        serde_json::from_slice(&serde_json::to_vec(&app.settings).unwrap()).unwrap();
+    assert!(restored.spoken_editing_commands);
+    assert_eq!(restored.input_profiles.len(), 1);
+    assert!(
+        app.desktop_action(action(
+            json!({"type":"settings_patch","input_profiles":[{"app":"C:/private/editor.exe"}]})
+        ))
+        .is_err()
+    );
+    assert_eq!(app.settings.input_profiles.len(), 1);
+    app.microphone_check.running = true;
+    assert!(
+        app.desktop_action(action(json!({"type":"microphone_check"})))
+            .is_err()
+    );
+}
+
+#[test]
+fn spoken_commands_use_only_finalized_segments() {
+    let (mut app, _) = app();
+    app.settings.spoken_editing_commands = true;
+    app.recording_spoken_editing = true;
+    for (text, chunk, final_pass) in [
+        ("Hello.", true, true),
+        ("scratch that", false, false),
+        ("new line", true, true),
+        ("World.", true, true),
+        ("scratch that", true, true),
+        ("undo that", false, true),
+    ] {
+        app.chunk_inflight = chunk;
+        app.event_tx
+            .send(crate::app::Event::Text(
+                Ok(text.into()),
+                0.1,
+                app.utterance,
+                final_pass,
+            ))
+            .unwrap();
+        app.receive();
+        assert!(!app.text.contains("scratch that"));
+    }
+    assert_eq!(app.text, "Hello.\nWorld.");
+}
+
+#[test]
+fn spoken_commands_replace_live_text_without_typing_command_words() {
+    let (mut app, _) = app();
+    let (tx, rx) = mpsc::channel();
+    let (ack, events) = mpsc::channel();
+    app.integration_tx = tx;
+    app.integration_rx = events;
+    app.target = Some(crate::platform::test_target());
+    app.live_mode = true;
+    app.settings.insert = true;
+    app.settings.spoken_editing_commands = true;
+    app.recording_spoken_editing = true;
+    for (spoken, finalized, expected) in [
+        ("Hello.", true, "Hello."),
+        ("scratch that", false, "Hello."),
+        ("scratch that", true, ""),
+    ] {
+        app.chunk_inflight = finalized;
+        app.event_tx
+            .send(crate::app::Event::Text(
+                Ok(spoken.into()),
+                0.1,
+                app.utterance,
+                finalized,
+            ))
+            .unwrap();
+        app.receive();
+        assert!(
+            matches!(rx.try_recv().unwrap(), integration::Action::Preview { text, .. } if text == expected)
+        );
+        ack.send(integration::Event::Previewed(app.utterance, Ok(())))
+            .unwrap();
+        app.receive();
+    }
+}
+
+#[test]
+fn profiles_override_defaults_only_for_the_destination() {
+    let (mut app, _) = app();
+    app.settings.input_profiles = serde_json::from_value(json!([{"app":"editor.exe", "insert":true,"spoken_editing_commands":true,"style":"Verbatim","hotkey_mode":"Toggle"}])).unwrap();
+    app.dictation_app = Some("EDITOR.EXE".into());
+    assert!(app.insert_enabled() && app.spoken_editing());
+    assert_eq!(app.input_hotkey_mode(), crate::platform::HotkeyMode::Toggle);
+    assert_eq!(
+        app.dictation_style(),
+        crate::writing_style::WritingStyle::Verbatim
+    );
+    app.dictation_app = Some("other.exe".into());
+    assert!(!app.insert_enabled() && !app.spoken_editing());
+    assert_eq!(
+        crate::writing_style::default_line_break(Some("DISCORD.EXE")),
+        crate::platform::LineBreak::ShiftEnter
+    );
+}
+
+#[test]
+fn microphone_worker_result_is_visible_without_loading_inference() {
+    let (mut app, commands) = app();
+    app.microphone_check.running = true;
+    app.event_tx
+        .send(crate::app::Event::MicrophoneChecked(Ok(
+            crate::audio::AudioCheck::measure("Synthetic input".into(), &[0.0, 1.0]),
+        )))
+        .unwrap();
+    app.receive();
+    let state = app.desktop_snapshot();
+    assert_eq!(state["settings"]["microphone_check"]["running"], false);
+    assert_eq!(
+        state["settings"]["microphone_check"]["result"]["device"],
+        "Synthetic input"
+    );
+    assert!(commands.try_recv().is_err());
+    app.event_tx
+        .send(crate::app::Event::MicrophoneChecked(Err("No input".into())))
+        .unwrap();
+    app.receive();
+    assert_eq!(app.microphone_check.error.as_deref(), Some("No input"));
+}
+
+#[test]
+fn manual_insertion_rejects_empty_text_before_waiting() {
+    let command = action(json!({"type":"insert_text","text":""}));
+    assert!(command.run_outside_controller().unwrap().is_err());
+}
+
+#[test]
+fn document_bodies_wait_for_background_pass_and_models_hide_directories() {
+    use super::publish::{Pass, Tracker};
+    let mut app = populated_app();
+    let state = app.desktop_snapshot();
+    for model in state["managed_models"].as_array().unwrap() {
+        let path = model["path"].as_str().unwrap();
+        assert!(!path.contains(['/', '\\']));
+        assert!(!path.is_empty());
+    }
+    let mut tracker = Tracker::default();
+    let mut pass = tracker.pass(Pass::Full);
+    super::view::collect(&app, &mut pass);
+    pass.finish();
+    app.history.selected.as_mut().unwrap().personal_notes = "Large notes. ".repeat(5000);
+    app.history.dictation.as_mut().unwrap().text = "Long dictation. ".repeat(5000);
+    let mut pass = tracker.pass(Pass::Tick);
+    super::view::collect(&app, &mut pass);
+    assert!(pass.finish().is_empty());
+    let mut pass = tracker.pass(Pass::Full);
+    super::view::collect(&app, &mut pass);
+    let mut published = super::publish::Published::default();
+    let update = published.apply(pass.finish());
+    assert!(update.contains("document_body"));
+    assert!(update.contains("capture_bodies"));
+}

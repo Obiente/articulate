@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createCaptureFeedbackTracker } from "../src/capture-feedback.js";
+import { createCaptureFeedbackTracker } from "../src/features/capture/capture-feedback.js";
 
 const event = (sequence, type = "started", kind = "call") => ({
   sequence,

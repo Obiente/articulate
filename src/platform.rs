@@ -1,6 +1,16 @@
 use anyhow::{Result, bail};
 use std::sync::mpsc::Sender;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LineBreak {
+    ShiftEnter,
+    #[default]
+    #[serde(other)]
+    Enter,
+}
+
+#[cfg(windows)]
+pub mod devices;
 mod hotkey_lifecycle;
 
 /// How the app interprets a shortcut gesture. Explicit choices are preserved.
@@ -8,6 +18,7 @@ mod hotkey_lifecycle;
 pub enum HotkeyMode {
     Toggle,
     #[default]
+    #[serde(other)]
     Hold,
 }
 
@@ -120,6 +131,18 @@ impl Hotkey {
         if !(self.ctrl || self.alt || self.win) {
             return Err("Include Ctrl, Alt, or Win so ordinary typing stays available.".into());
         }
+        if (self.ctrl
+            && !self.alt
+            && !self.win
+            && !self.shift
+            && matches!(self.key.as_str(), "C" | "V" | "X" | "Z" | "A" | "S"))
+            || (self.alt && !self.ctrl && !self.win && matches!(self.key.as_str(), "Tab" | "F4"))
+            || (self.win && self.key == "L")
+        {
+            return Err(
+                "This shortcut is reserved for Windows or editing. Choose another chord.".into(),
+            );
+        }
         Ok(())
     }
 
@@ -195,6 +218,38 @@ mod target_tests {
         assert_eq!(restored.label(), "Alt + Shift + Win + F8");
     }
 
+    #[test]
+    fn reserved_system_and_editing_chords_are_rejected() {
+        for key in ["C", "V", "X", "Z", "A", "S"] {
+            let chord = Hotkey {
+                alt: false,
+                key: key.into(),
+                ..Hotkey::default()
+            };
+            assert!(chord.validate().unwrap_err().contains("reserved"));
+        }
+        for key in ["Tab", "F4"] {
+            assert!(
+                Hotkey {
+                    ctrl: false,
+                    key: key.into(),
+                    ..Hotkey::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            Hotkey {
+                win: true,
+                key: "L".into(),
+                ..Hotkey::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(Hotkey::default().validate().is_ok());
+    }
     #[test]
     fn ordinary_typing_and_unknown_keys_cannot_be_registered() {
         let mut custom = Hotkey {
@@ -434,6 +489,26 @@ mod win {
     pub fn hotkey(initial: Hotkey, tx: Sender<HotkeyEvent>) -> Sender<Hotkey> {
         let (updates, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || unsafe {
+            let thread_id = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+            let mut initial_message: MSG = std::mem::zeroed();
+            PeekMessageW(
+                &mut initial_message,
+                std::ptr::null_mut(),
+                0,
+                0,
+                PM_NOREMOVE,
+            );
+            let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                while let Ok(requested) = rx.recv() {
+                    if wake_tx.send(requested).is_err() {
+                        return;
+                    }
+                    PostThreadMessageW(thread_id, WM_APP, 0, 0);
+                }
+                drop(wake_tx);
+                PostThreadMessageW(thread_id, WM_APP, 0, 0);
+            });
             let mut registration = HotkeyRegistration::default();
             let mut registry = WindowsRegistry;
             let mut lifecycle = hotkey_lifecycle::Lifecycle::default();
@@ -466,26 +541,36 @@ mod win {
                 return;
             }
             'worker: loop {
-                // Sleep on the command channel between message polls. This
-                // also notices controller shutdown without an orphaned thread.
-                match rx.recv_timeout(std::time::Duration::from_millis(20)) {
-                    Ok(requested) => {
-                        if !apply(requested, &mut registration, &mut registry, &mut lifecycle) {
-                            break;
+                let held = registration.active.is_some() && lifecycle.needs_poll();
+                MsgWaitForMultipleObjects(
+                    0,
+                    std::ptr::null(),
+                    0,
+                    if held { 20 } else { u32::MAX },
+                    QS_ALLINPUT,
+                );
+                loop {
+                    match wake_rx.try_recv() {
+                        Ok(requested) => {
+                            if !apply(requested, &mut registration, &mut registry, &mut lifecycle) {
+                                break 'worker;
+                            }
                         }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'worker,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
                 let mut msg: MSG = std::mem::zeroed();
                 while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
                     if msg.message == WM_QUIT {
                         break 'worker;
                     }
-                    if msg.message == WM_HOTKEY
-                        && registration.accepts(msg.wParam, msg.lParam)
-                        && lifecycle.press()
-                    {
+                    let accepted =
+                        msg.message == WM_HOTKEY && registration.accepts(msg.wParam, msg.lParam);
+                    if accepted && let Some((_, shortcut)) = &registration.active {
+                        mask_modifier_release(shortcut);
+                    }
+                    if accepted && lifecycle.press() {
                         let target = target().unwrap_or(Target {
                             window: 0,
                             focus: 0,
@@ -497,6 +582,19 @@ mod win {
                         {
                             break 'worker;
                         }
+                    }
+                }
+                // A wake can arrive during message dispatch. Consume its command
+                // before sleeping again, even if its message was already removed.
+                loop {
+                    match wake_rx.try_recv() {
+                        Ok(requested) => {
+                            if !apply(requested, &mut registration, &mut registry, &mut lifecycle) {
+                                break 'worker;
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'worker,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     }
                 }
                 // Drain queued presses before rearming a registration which
@@ -518,16 +616,38 @@ mod win {
         updates
     }
 
+    #[allow(dead_code, reason = "Compatibility wrapper for default line breaks")]
     pub fn insert(expected: Target, text: &str, same_field: impl Fn() -> bool) -> Result<()> {
-        send_text(expected, text, false, same_field)
+        send_text(expected, text, false, LineBreak::Enter, same_field)
     }
 
+    #[allow(dead_code, reason = "Available for per-application insertion settings")]
+    pub fn insert_with_line_break(
+        expected: Target,
+        text: &str,
+        line_break: LineBreak,
+        same_field: impl Fn() -> bool,
+    ) -> Result<()> {
+        send_text(expected, text, false, line_break, same_field)
+    }
+
+    #[allow(dead_code, reason = "Compatibility wrapper for default line breaks")]
     pub fn replace_selection(
         expected: Target,
         text: &str,
         same_field: impl Fn() -> bool,
     ) -> Result<()> {
-        send_text(expected, text, true, same_field)
+        send_text(expected, text, true, LineBreak::Enter, same_field)
+    }
+
+    #[allow(dead_code, reason = "Available for per-application insertion settings")]
+    pub fn replace_selection_with_line_break(
+        expected: Target,
+        text: &str,
+        line_break: LineBreak,
+        same_field: impl Fn() -> bool,
+    ) -> Result<()> {
+        send_text(expected, text, true, line_break, same_field)
     }
 
     /// Extends a verified selection by one native left-arrow step. The caller
@@ -556,6 +676,59 @@ mod win {
                 )
             })
         }
+    }
+
+    /// Not assigned to any key, so no app acts on it or turns it into a character.
+    const MASK_KEY: VIRTUAL_KEY = 0xE8;
+
+    /// Releasing Alt (or Win) with no other key seen since it went down opens
+    /// the app's menu (or Start). The shortcut key itself is swallowed by the
+    /// hotkey, so the target app sees exactly that: Alt alone. Its menu then
+    /// takes focus from the text field and insertion is refused. Tapping other
+    /// keys while the modifier is still held makes the release an ordinary
+    /// chord release.
+    fn mask_modifier_release(shortcut: &Hotkey) {
+        let held = |key: VIRTUAL_KEY| unsafe { GetAsyncKeyState(key as i32) < 0 };
+        let keys = release_mask_keys(
+            shortcut,
+            held(VK_MENU),
+            held(VK_LWIN) || held(VK_RWIN),
+            held(VK_CONTROL),
+        );
+        let input: Vec<INPUT> = keys
+            .iter()
+            .flat_map(|&key| [selection_key(key, 0), selection_key(key, KEYEVENTF_KEYUP)])
+            .collect();
+        if input.is_empty() {
+            return;
+        }
+        unsafe {
+            SendInput(
+                input.len() as u32,
+                input.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            );
+        }
+    }
+
+    /// Classic menus count the unassigned key, but Chromium and Electron apps
+    /// drop unknown keys and still see Alt alone, so Ctrl is tapped too. Ctrl
+    /// is skipped while it is physically held: an injected release would end
+    /// the user's own Ctrl press.
+    fn release_mask_keys(
+        shortcut: &Hotkey,
+        alt_held: bool,
+        win_held: bool,
+        ctrl_held: bool,
+    ) -> Vec<VIRTUAL_KEY> {
+        if !((shortcut.alt && alt_held) || (shortcut.win && win_held)) {
+            return Vec::new();
+        }
+        let mut keys = vec![MASK_KEY];
+        if !ctrl_held {
+            keys.push(VK_CONTROL);
+        }
+        keys
     }
 
     unsafe fn modifiers_released() -> bool {
@@ -610,6 +783,7 @@ mod win {
         expected: Target,
         text: &str,
         delete_empty: bool,
+        line_break: LineBreak,
         same_field: impl Fn() -> bool,
     ) -> Result<()> {
         unsafe {
@@ -646,22 +820,7 @@ mod win {
                     });
                 }
             }
-            for code in text.encode_utf16() {
-                for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
-                    input.push(INPUT {
-                        r#type: INPUT_KEYBOARD,
-                        Anonymous: INPUT_0 {
-                            ki: KEYBDINPUT {
-                                wVk: 0,
-                                wScan: code,
-                                dwFlags: flags,
-                                time: 0,
-                                dwExtraInfo: 0,
-                            },
-                        },
-                    });
-                }
-            }
+            input.extend(text_packets(text, line_break));
             if input.is_empty() {
                 return Ok(());
             }
@@ -675,12 +834,52 @@ mod win {
                 std::mem::size_of::<INPUT>() as i32,
             );
             if sent != input.len() as u32 {
+                if sent > 0 && line_break == LineBreak::ShiftEnter {
+                    let release = selection_key(VK_SHIFT, KEYEVENTF_KEYUP);
+                    SendInput(1, &release, std::mem::size_of::<INPUT>() as i32);
+                }
                 bail!(
                     "Windows blocked some or all of the insertion. Check the destination before copying to avoid duplicates."
                 );
             }
             Ok(())
         }
+    }
+
+    fn text_packets(text: &str, line_break: LineBreak) -> Vec<INPUT> {
+        let mut input = Vec::new();
+        for code in text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .encode_utf16()
+        {
+            if code == 10 {
+                if line_break == LineBreak::ShiftEnter {
+                    input.push(selection_key(VK_SHIFT, 0));
+                }
+                input.push(selection_key(VK_RETURN, 0));
+                input.push(selection_key(VK_RETURN, KEYEVENTF_KEYUP));
+                if line_break == LineBreak::ShiftEnter {
+                    input.push(selection_key(VK_SHIFT, KEYEVENTF_KEYUP));
+                }
+                continue;
+            }
+            for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+                input.push(INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: 0,
+                            wScan: code,
+                            dwFlags: flags,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                });
+            }
+        }
+        input
     }
 
     fn check_insertion_target(
@@ -700,7 +899,45 @@ mod win {
 
     pub fn copy(text: &str) -> Result<()> {
         unsafe {
-            if OpenClipboard(GetForegroundWindow()) == 0 {
+            // Own the clipboard on this thread without borrowing another app's window.
+            let class: Vec<u16> = "STATIC".encode_utf16().chain(Some(0)).collect();
+            let window = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if window.is_null() {
+                bail!("Could not create the clipboard owner");
+            }
+            struct Owner(HWND);
+            impl Drop for Owner {
+                fn drop(&mut self) {
+                    unsafe {
+                        DestroyWindow(self.0);
+                    }
+                }
+            }
+            let _owner = Owner(window);
+            let mut opened = false;
+            for attempt in 0..5 {
+                if OpenClipboard(window) != 0 {
+                    opened = true;
+                    break;
+                }
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            if !opened {
                 bail!("Clipboard is busy. Please try again.");
             }
             struct Close;
@@ -751,6 +988,49 @@ mod win {
     mod hotkey_tests {
         use super::*;
 
+        #[test]
+        fn alt_and_win_chords_mask_their_release_but_ctrl_alone_does_not() {
+            let chord = |ctrl, alt, win| Hotkey {
+                ctrl,
+                alt,
+                shift: false,
+                win,
+                key: "Space".into(),
+            };
+            // Alt + Space alone would open the target app's menu on release.
+            assert_eq!(
+                release_mask_keys(&chord(false, true, false), true, false, false),
+                [MASK_KEY, VK_CONTROL]
+            );
+            assert_eq!(
+                release_mask_keys(&chord(false, false, true), false, true, false),
+                [MASK_KEY, VK_CONTROL]
+            );
+            // A held Ctrl already breaks up the release and must stay held.
+            assert_eq!(
+                release_mask_keys(&chord(true, true, false), true, false, true),
+                [MASK_KEY]
+            );
+            // Already released, or not part of the chord: nothing to mask.
+            assert!(release_mask_keys(&chord(false, true, false), false, false, false).is_empty());
+            assert!(release_mask_keys(&chord(true, false, false), true, true, true).is_empty());
+        }
+
+        #[test]
+        fn multiline_input_uses_virtual_enter_and_preserves_unicode() {
+            let plain = text_packets("A\r\n😀", LineBreak::Enter);
+            assert_eq!(plain.len(), 8);
+            unsafe {
+                assert_eq!(plain[0].Anonymous.ki.wScan, 65);
+                assert_eq!(plain[2].Anonymous.ki.wVk, VK_RETURN);
+                assert_eq!(plain[3].Anonymous.ki.dwFlags, KEYEVENTF_KEYUP);
+                assert_eq!(plain[4].Anonymous.ki.wScan, 0xD83D);
+                let shifted = text_packets("\n", LineBreak::ShiftEnter);
+                assert_eq!(shifted.len(), 4);
+                assert_eq!(shifted[0].Anonymous.ki.wVk, VK_SHIFT);
+                assert_eq!(shifted[3].Anonymous.ki.dwFlags, KEYEVENTF_KEYUP);
+            }
+        }
         #[test]
         fn insertion_checks_native_state_after_slow_field_validation() {
             let expected = Target {
@@ -1030,8 +1310,10 @@ mod win {
 }
 
 #[cfg(windows)]
+#[allow(unused_imports)]
 pub use win::{
-    app_name, copy, hotkey, insert, replace_selection, select_previous_character, target,
+    app_name, copy, hotkey, insert, insert_with_line_break, replace_selection,
+    replace_selection_with_line_break, select_previous_character, target,
 };
 
 #[cfg(not(windows))]

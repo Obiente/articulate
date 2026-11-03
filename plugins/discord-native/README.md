@@ -68,8 +68,14 @@ and installs a hook for **future** connections. An already active connection nee
 a deliberate leave/rejoin after activation; the adapter does not force that action.
 There must be no unrelated/public call during the first controlled test.
 
-The bridge polls authenticated `GET /capture` every 250 ms after successful
-installation. Articulate supplies an active capture nonce, channel ID and allowed
+The bridge first pairs with Articulate through the mutual HMAC handshake
+described in the [Vencord companion notes](../../docs/vencord.md#local-protocol)
+and keeps one persistent connection. The session is bound to that connection's
+socket: if the keep-alive agent hands out a different connection, the bridge
+pairs again there before any control request or audio is written, so a listener
+that replaced Articulate on the port cannot arm capture or receive audio without
+the key. It then polls `GET /capture` on that
+session every 250 ms after successful installation. Articulate supplies an active capture nonce, channel ID and allowed
 remote participant IDs as decimal strings. Capture stops when inactive, unavailable,
 disabled or its 1.5-second native lease expires. The hook stays dormant after stop
 and its DLL is pinned until process exit, so surviving connection callbacks never
@@ -99,10 +105,14 @@ immediately. Diagnostic failures never change capture state.
 ## PCM transport
 
 The control response advertises `pcm_batch: true`. The companion then sends
-ordered `POST /pcm-batch` requests using the existing loopback pairing key in an
-authorization header. Each batch contains up to 64 packets within 128 KiB, each
-preceded by its `u32` little-endian byte length. Only one audio request is in
-flight at a time. Older receivers retain the single-packet `POST /pcm` route.
+ordered `POST /pcm-batch` requests over the same authenticated keep-alive
+connection, so a 20 ms batch no longer opens a TCP connection of its own. Each
+batch contains up to 64 packets within 128 KiB, each preceded by its `u32`
+little-endian byte length. Only one audio request is in flight at a time. A batch
+that gets no reply or a server error is retried up to three times in order; a
+`401` or a replaced connection re-pairs once; a `4xx` rejection means the receiver has already stopped
+that capture. Only exhausted retries report `audio-transport-unavailable`.
+Receivers retain the single-packet `POST /pcm` route.
 Each packet is a 64-byte little-endian header followed by interleaved signed PCM16:
 
 | Offset | Field |

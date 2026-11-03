@@ -176,7 +176,7 @@ pub(super) fn agent(cancel: Arc<AtomicBool>, idle: Duration, https_only: bool) -
             .chain(RustlsConnector::default());
     let config = ureq::Agent::config_builder()
         .https_only(https_only)
-        .timeout_global(Some(Duration::from_secs(3600)))
+        .timeout_global(None)
         .timeout_resolve(Some(Duration::from_secs(10)))
         .timeout_connect(Some(Duration::from_secs(15)))
         .timeout_recv_response(Some(Duration::from_secs(30)))

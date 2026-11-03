@@ -207,13 +207,18 @@ impl State {
 }
 
 impl App {
-    pub(super) fn desktop_notes_status(&self, id: &str) -> serde_json::Value {
+    pub(super) fn desktop_notes_status(&self, id: &str) -> NotesStatus<'_> {
         let state = self.brain.sessions.get(id);
-        serde_json::json!({"ready": polish::profile_installed(ModelProfile::Summary),
-            "acceleration_installed": polish::gpu_available(),
-            "working": self.brain.working_for(id), "status": state.map(|s|s.status.as_str()).unwrap_or(""),
-            "progress": state.and_then(|s|s.progress), "download_status": self.brain.download_status,
-            "downloading": self.brain.download.is_some()})
+        NotesStatus {
+            ready: polish::profile_installed(ModelProfile::Summary),
+            acceleration_installed: polish::gpu_available(),
+            working: self.brain.working_for(id),
+            status: state.map(|s| s.status.as_str()).unwrap_or(""),
+            progress: state.and_then(|s| s.progress),
+            download_status: &self.brain.download_status,
+            downloading: self.brain.download.is_some(),
+            download_progress: self.brain.download_progress,
+        }
     }
 
     pub(super) fn desktop_notes_generate(&mut self, session: Session) -> Result<(), String> {
@@ -707,6 +712,18 @@ impl App {
             .personal_notes
             .clone()
     }
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct NotesStatus<'a> {
+    ready: bool,
+    acceleration_installed: bool,
+    working: bool,
+    status: &'a str,
+    progress: Option<f32>,
+    download_status: &'a str,
+    pub downloading: bool,
+    download_progress: Option<f32>,
 }
 
 #[cfg(test)]

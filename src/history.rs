@@ -1,26 +1,59 @@
-//! Local text history. Audio is never part of the saved format.
+//! Local text history.
+//!
+//! Audio is not part of the record. When the user chooses to keep a
+//! recording, it is stored beside the record as `<id>.audio` (see
+//! `crate::audio_store`), sealed like the record when encryption at rest is
+//! on, and removed with every other copy when the session is deleted.
+//!
+//! Each session is one JSON file named by its identifier. Writes are atomic
+//! (temporary file, backup, rename) and recovery prefers the newest complete
+//! copy. Records that cannot be parsed are moved aside ("quarantined") rather
+//! than deleted, and can be listed, exported or restored. Records that cannot
+//! be read right now (another program holds them open) are skipped and retried.
+pub mod backup;
+pub mod protect;
+pub mod retention;
+pub mod search_index;
+
 use crate::{calls::Row, notes::Notes};
 use anyhow::{Context, Result, ensure};
+use search_index::SearchIndex;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque, hash_map::RandomState},
+    collections::{BTreeMap, HashMap, VecDeque, hash_map::RandomState},
     fs::{self, File, OpenOptions},
     hash::BuildHasher,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+/// Record format version.
+///
+/// Compatibility policy:
+/// - Adding an optional field with a serde default does not change `SCHEMA`.
+///   Every version ignores fields it does not know when reading. Unknown
+///   top-level session fields are kept in [`Session::unknown`] and written back
+///   unchanged, so an older version editing a newer record does not drop them.
+/// - Changing the meaning or shape of an existing field increments `SCHEMA`.
+///   Versions that do not understand it never load, overwrite or quarantine
+///   those records; they are reported as saved by a newer version.
 const SCHEMA: u32 = 5;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Encrypted records carry a small DPAPI envelope around the JSON.
+const MAX_STORED_BYTES: u64 = MAX_BYTES as u64 + 64 * 1024;
 const MAX_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ROWS: usize = 100_000;
+const MAX_RECORDS: usize = 100_000;
 const QUEUE_CAPACITY: usize = 32;
+/// Tombstones only guard against stale queued saves and interrupted cleanup.
+/// Once every copy is gone and this much time has passed, neither can happen.
+const TOMBSTONE_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_SAVE: AtomicU64 = AtomicU64::new(0);
 
@@ -33,7 +66,6 @@ pub enum Kind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Session {
     pub id: String,
     pub created_ms: u64,
@@ -70,6 +102,25 @@ pub struct Session {
     pub is_collection: bool,
     #[serde(default)]
     pub source_revision: String,
+    /// Pinned sessions are exempt from retention. Like topic membership, the
+    /// stored value wins over a stale editor copy; change it with `set_pinned`.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Recent speaker corrections that can be undone, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speaker_edits: Vec<crate::speaker_edits::Edit>,
+    /// Timestamped gaps in the captured audio.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interruptions: Vec<crate::calls::Interruption>,
+    /// Retained audio beside this record, when the user chose to keep it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<crate::audio_store::Info>,
+    /// Transcripts replaced by re-transcription, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript_versions: Vec<TranscriptVersion>,
+    /// Fields written by a newer version, preserved when this version saves.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
     /// Rebuilt from member sessions when a topic is opened; never persisted.
     #[serde(skip)]
     pub sources: Vec<crate::topics::Source>,
@@ -77,6 +128,67 @@ pub struct Session {
 
 fn manual_title_default() -> bool {
     true
+}
+
+/// Previous transcripts kept after re-transcription.
+pub const MAX_TRANSCRIPT_VERSIONS: usize = 2;
+
+/// A transcript replaced by re-transcription, kept so it can be restored.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TranscriptVersion {
+    /// When this transcript was replaced.
+    pub replaced_ms: u64,
+    /// The recognizer that produced it, when known.
+    #[serde(default)]
+    pub model: String,
+    pub text: String,
+    #[serde(default)]
+    pub original: String,
+    #[serde(default)]
+    pub rows: Vec<Row>,
+    #[serde(default)]
+    pub speaker_names: Vec<String>,
+}
+
+impl TranscriptVersion {
+    /// Capture the current transcript of `session`.
+    pub fn of(session: &Session, model: &str) -> Self {
+        Self {
+            replaced_ms: now_ms(),
+            model: model.to_owned(),
+            text: session.text.clone(),
+            original: session.original.clone(),
+            rows: session.rows.clone(),
+            speaker_names: session.speaker_names.clone(),
+        }
+    }
+}
+
+/// The history folder in the local data directory.
+pub fn directory() -> PathBuf {
+    crate::model::data_dir().join("history")
+}
+
+/// Whether any record, recovery copy or isolated file in `directory` is
+/// stored encrypted. Used when the saved encryption choice is
+/// unknown, so it is never turned off by accident.
+pub fn contains_protected(directory: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return false;
+        };
+        let Some((id, suffix)) = name.split_once('.') else {
+            return false;
+        };
+        if !valid_id(id) {
+            return false;
+        }
+        (matches!(suffix, "json" | "tmp" | "bak") || parse_quarantine_name(&name).is_some())
+            && protect::is_sealed_file(&entry.path())
+    })
 }
 
 impl Session {
@@ -114,12 +226,18 @@ impl Session {
             auto_file_pending: false,
             is_collection: false,
             source_revision: String::new(),
+            pinned: false,
+            speaker_edits: Vec::new(),
+            interruptions: Vec::new(),
+            audio: None,
+            transcript_versions: Vec::new(),
+            unknown: serde_json::Map::new(),
             sources: Vec::new(),
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Summary {
     pub id: String,
     pub created_ms: u64,
@@ -131,6 +249,7 @@ pub struct Summary {
     pub topic_id: Option<String>,
     pub is_collection: bool,
     pub can_receive_sources: bool,
+    pub pinned: bool,
 }
 
 impl From<&Session> for Summary {
@@ -151,6 +270,7 @@ impl From<&Session> for Summary {
             updated_ms: session.updated_ms,
             title: session.title.clone(),
             kind: session.kind,
+            pinned: session.pinned,
             duration_ms: session.rows.iter().map(|row| row.end_ms).max().unwrap_or(0),
             preview: source
                 .split_whitespace()
@@ -163,8 +283,8 @@ impl From<&Session> for Summary {
     }
 }
 
+/// Unknown top-level fields are tolerated; see `SCHEMA`.
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Stored {
     schema: u32,
     session: Session,
@@ -179,6 +299,19 @@ impl std::fmt::Display for UnsupportedSchema {
 }
 impl std::error::Error for UnsupportedSchema {}
 
+/// A save based on a version older than one installed by a restore. Saving
+/// it would silently replace the restored content.
+#[derive(Debug)]
+pub struct StaleSave;
+impl std::fmt::Display for StaleSave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "This item was replaced by a restore after it was opened, so the older copy was not saved. Reopen it to keep editing.",
+        )
+    }
+}
+impl std::error::Error for StaleSave {}
+
 #[derive(Debug)]
 struct DamagedRecord;
 impl std::fmt::Display for DamagedRecord {
@@ -188,8 +321,129 @@ impl std::fmt::Display for DamagedRecord {
 }
 impl std::error::Error for DamagedRecord {}
 
+/// The record exists but could not be read right now, for example because
+/// antivirus, backup or indexing software holds it open, or because it is
+/// encrypted for another Windows account. It is never quarantined.
+#[derive(Debug)]
+struct Unavailable(String);
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "This history item is temporarily unavailable and will be retried: {}",
+            self.0
+        )
+    }
+}
+impl std::error::Error for Unavailable {}
+
+fn unavailable(error: impl std::fmt::Display) -> anyhow::Error {
+    Unavailable(error.to_string()).into()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningKind {
+    /// Could not be parsed or validated. The file was moved to quarantine.
+    Damaged,
+    /// Could not be read right now. It stays in place and is retried.
+    Unavailable,
+    /// Saved by a newer version. Left untouched.
+    NewerVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RecordWarning {
+    pub id: String,
+    pub kind: WarningKind,
+    pub message: String,
+}
+
+/// The result of one history pass.
+#[derive(Clone, Debug, Default)]
+pub struct Listing {
+    pub items: Vec<Summary>,
+    /// Records skipped in this pass, one per identifier.
+    pub warnings: Vec<RecordWarning>,
+    /// Isolated files currently kept beside the history (see `quarantined`).
+    pub quarantined: usize,
+}
+
+/// A file moved aside because it could not be parsed or validated.
+#[derive(Clone, Debug, Serialize)]
+pub struct Quarantined {
+    /// Opaque handle for restore, export and discard.
+    pub file_name: String,
+    pub id: String,
+    pub bytes: u64,
+    pub modified_ms: u64,
+    /// Whether the file is a complete record that `restore_quarantined` accepts.
+    pub restorable: bool,
+    pub title: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct MigrationReport {
+    pub protect: bool,
+    pub changed: usize,
+    pub failed: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    modified: SystemTime,
+    len: u64,
+}
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    Some(Stamp {
+        modified: metadata.modified().ok()?,
+        len: metadata.len(),
+    })
+}
+
+/// Cached facts about one readable record, keyed by its file's (mtime, len).
+struct Indexed {
+    stamp: Option<Stamp>,
+    summary: Summary,
+    pending_filing: bool,
+    sample: crate::insights::Sample,
+}
+
+#[derive(Default)]
+struct Index {
+    entries: HashMap<String, Indexed>,
+    unreadable: BTreeMap<String, WarningKind>,
+}
+
+/// Files found for one identifier in a single directory pass.
+#[derive(Default)]
+struct Files {
+    json: bool,
+    tmp: bool,
+    bak: bool,
+    deleted: bool,
+    deleted_at: Option<SystemTime>,
+    corrupt: Vec<PathBuf>,
+}
+
+impl Files {
+    fn has_record(&self) -> bool {
+        self.json || self.tmp || self.bak
+    }
+}
+
 pub struct History {
     directory: PathBuf,
+    index: Mutex<Index>,
+    search: Option<SearchIndex>,
+    protect: AtomicBool,
+    quarantined_now: AtomicUsize,
+    /// `updated_ms` of records installed by a restore. Ordinary saves based
+    /// on an older version of these are rejected as stale.
+    replaced: Mutex<HashMap<String, u64>>,
 }
 
 impl History {
@@ -200,81 +454,317 @@ impl History {
             metadata.is_dir() && !metadata.file_type().is_symlink(),
             "History must be a local directory"
         );
-        Ok(Self { directory })
+        Ok(Self {
+            directory,
+            index: Mutex::new(Index::default()),
+            search: None,
+            protect: AtomicBool::new(false),
+            quarantined_now: AtomicUsize::new(0),
+            replaced: Mutex::new(HashMap::new()),
+        })
     }
 
-    fn ids(&self) -> Result<BTreeSet<String>> {
-        let mut ids = BTreeSet::new();
+    /// Keep `index` updated with every record this store reads, saves or deletes.
+    pub fn with_search(mut self, index: SearchIndex) -> Self {
+        self.search = Some(index);
+        self
+    }
+
+    /// Whether new writes are encrypted. Use `set_protection` to migrate.
+    pub fn with_protection(self, protect: bool) -> Self {
+        self.protect.store(protect, Ordering::Release);
+        self
+    }
+
+    fn lock_index(&self) -> MutexGuard<'_, Index> {
+        self.index.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One directory enumeration per pass. Every later step uses this result
+    /// instead of scanning again.
+    fn scan(&self) -> Result<BTreeMap<String, Files>> {
+        let mut files: BTreeMap<String, Files> = BTreeMap::new();
         for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            for suffix in [".json", ".bak", ".tmp", ".deleted"] {
-                if let Some(id) = name.strip_suffix(suffix)
-                    && valid_id(id)
-                {
-                    ids.insert(id.to_owned());
+            let Some((id, suffix)) = name.split_once('.') else {
+                continue;
+            };
+            if !valid_id(id) {
+                continue;
+            }
+            let known = matches!(suffix, "json" | "tmp" | "bak" | "deleted")
+                || suffix.strip_prefix("corrupt-").is_some_and(valid_id);
+            if !known {
+                continue;
+            }
+            if !files.contains_key(id) {
+                ensure!(
+                    files.len() < MAX_RECORDS,
+                    "Local history contains too many items"
+                );
+            }
+            let found = files.entry(id.to_owned()).or_default();
+            match suffix {
+                "json" => found.json = true,
+                "tmp" => found.tmp = true,
+                "bak" => found.bak = true,
+                "deleted" => {
+                    found.deleted = true;
+                    found.deleted_at = entry.metadata().ok().and_then(|m| m.modified().ok());
+                }
+                _ => found.corrupt.push(entry.path()),
+            }
+        }
+        Ok(files)
+    }
+
+    /// Bring the index up to date. Unchanged records are not read again.
+    fn refresh(&self) -> Result<Vec<RecordWarning>> {
+        let files = self.scan()?;
+        let removed: Vec<String> = {
+            let mut index = self.lock_index();
+            let removed = index
+                .entries
+                .keys()
+                .filter(|id| {
+                    files
+                        .get(*id)
+                        .is_none_or(|found| found.deleted || !found.has_record())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for id in &removed {
+                index.entries.remove(id);
+            }
+            removed
+        };
+        for id in &removed {
+            self.forget_search(id);
+        }
+        let mut warnings = Vec::new();
+        let mut unreadable = BTreeMap::new();
+        let mut warn = |id: &str, kind, message: String| {
+            unreadable.insert(id.to_owned(), kind);
+            warnings.push(RecordWarning {
+                id: id.to_owned(),
+                kind,
+                message,
+            });
+        };
+        for (id, found) in &files {
+            if found.deleted {
+                if let Err(error) = self.purge_deleted(id, found) {
+                    warn(id, WarningKind::Unavailable, error.to_string());
+                }
+                continue;
+            }
+            if !found.has_record() {
+                continue;
+            }
+            let main = self.path(id, "json")?;
+            let before = if found.json { stamp(&main) } else { None };
+            if !found.tmp
+                && !found.bak
+                && before.is_some()
+                && self
+                    .lock_index()
+                    .entries
+                    .get(id)
+                    .is_some_and(|entry| entry.stamp == before)
+            {
+                continue;
+            }
+            match self.recover(id) {
+                Ok(Some(session)) => {
+                    let after = stamp(&main);
+                    let trusted = after == before || found.tmp || found.bak;
+                    self.remember(&session, if trusted { after } else { None });
+                }
+                Ok(None) => self.forget(id),
+                Err(error) => {
+                    let kind = if error.is::<UnsupportedSchema>() {
+                        WarningKind::NewerVersion
+                    } else if error.is::<DamagedRecord>() {
+                        WarningKind::Damaged
+                    } else {
+                        WarningKind::Unavailable
+                    };
+                    // A transiently unreadable record keeps its last known
+                    // summary so it does not vanish from the list.
+                    if kind != WarningKind::Unavailable {
+                        self.forget(id);
+                    }
+                    warn(id, kind, error.to_string());
                 }
             }
-            ensure!(
-                ids.len() <= 100_000,
-                "Local history contains too many items"
-            );
         }
-        Ok(ids)
+        self.lock_index().unreadable = unreadable;
+        if let Some(search) = &self.search {
+            search.set_ready(warnings.len());
+        }
+        Ok(warnings)
+    }
+
+    /// Finish an interrupted delete and compact old tombstones.
+    fn purge_deleted(&self, id: &str, found: &Files) -> Result<()> {
+        self.remove_copies(id, Some(&found.corrupt))?;
+        let old = found.deleted_at.is_some_and(|at| {
+            SystemTime::now()
+                .duration_since(at)
+                .is_ok_and(|age| age >= TOMBSTONE_RETENTION)
+        });
+        if old {
+            remove_if_present(&self.path(id, "deleted")?)?;
+        }
+        Ok(())
+    }
+
+    fn remember(&self, session: &Session, stamp: Option<Stamp>) {
+        let entry = Indexed {
+            stamp,
+            summary: Summary::from(session),
+            pending_filing: session.auto_file_pending
+                && !session.is_collection
+                && session.topic_id.is_none()
+                && !session.text.trim().is_empty(),
+            sample: crate::insights::Sample::from(session),
+        };
+        {
+            let mut index = self.lock_index();
+            index.unreadable.remove(&session.id);
+            index.entries.insert(session.id.clone(), entry);
+        }
+        if let Some(search) = &self.search {
+            let _ = search.upsert(session);
+        }
+    }
+
+    fn forget(&self, id: &str) {
+        self.lock_index().entries.remove(id);
+        self.forget_search(id);
+    }
+
+    fn forget_search(&self, id: &str) {
+        if let Some(search) = &self.search {
+            let _ = search.remove(id);
+        }
+    }
+
+    fn quarantine_count(&self) -> usize {
+        fs::read_dir(&self.directory)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .and_then(parse_quarantine_name)
+                            .is_some()
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     pub fn insights(&self) -> Result<crate::insights::Report> {
+        self.refresh()?;
         let mut aggregate = crate::insights::Aggregate::new(now_ms());
-        for id in self.ids()? {
-            if let Some(session) = self.recover(&id).ok().flatten() {
-                aggregate.push(&session);
-            }
+        for entry in self.lock_index().entries.values() {
+            aggregate.push_sample(&entry.sample);
         }
         Ok(aggregate.finish())
     }
 
     #[cfg(test)]
     pub fn list(&self) -> Result<Vec<Summary>> {
-        self.list_with_pending().map(|(summaries, _)| summaries)
+        self.list_with_pending().map(|(listing, _)| listing.items)
     }
 
-    fn list_with_pending(&self) -> Result<(Vec<Summary>, Vec<Session>)> {
-        let ids = self.ids()?;
-        let mut summaries = Vec::new();
-        let mut pending = Vec::new();
-        let mut pending_bytes = 0_usize;
-        // A damaged individual item cannot prevent other recordings from opening.
-        for id in ids {
-            if let Some(session) = self.recover(&id).ok().flatten() {
-                summaries.push(Summary::from(&session));
-                if session.auto_file_pending
-                    && !session.is_collection
-                    && session.topic_id.is_none()
-                    && !session.text.trim().is_empty()
-                    && pending.len() < 32
-                {
-                    let bytes = session
-                        .text
-                        .len()
-                        .saturating_add(session.original.len())
-                        .saturating_add(
-                            session.rows.iter().map(|row| row.text.len()).sum::<usize>(),
-                        );
-                    if pending_bytes.saturating_add(bytes) <= MAX_TEXT_BYTES {
-                        pending_bytes += bytes;
-                        pending.push(session);
-                    }
-                }
-            }
-        }
-        summaries.sort_by(|a, b| {
+    #[cfg(test)]
+    pub fn listing(&self) -> Result<Listing> {
+        self.list_with_pending().map(|(listing, _)| listing)
+    }
+
+    fn list_with_pending(&self) -> Result<(Listing, Vec<Session>)> {
+        self.quarantined_now.store(0, Ordering::Relaxed);
+        let warnings = self.refresh()?;
+        let (mut items, mut pending_ids) = {
+            let index = self.lock_index();
+            (
+                index
+                    .entries
+                    .values()
+                    .map(|entry| entry.summary.clone())
+                    .collect::<Vec<_>>(),
+                index
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| entry.pending_filing)
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        items.sort_by(|a, b| {
             b.updated_ms
                 .cmp(&a.updated_ms)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        Ok((summaries, pending))
+        pending_ids.sort();
+        let mut pending = Vec::new();
+        let mut pending_bytes = 0_usize;
+        for id in pending_ids {
+            if pending.len() >= 32 {
+                break;
+            }
+            let Ok(Some(session)) = self.recover(&id) else {
+                continue;
+            };
+            if !session.auto_file_pending || session.topic_id.is_some() || session.is_collection {
+                continue;
+            }
+            let bytes = session
+                .text
+                .len()
+                .saturating_add(session.original.len())
+                .saturating_add(session.rows.iter().map(|row| row.text.len()).sum::<usize>());
+            if pending_bytes.saturating_add(bytes) <= MAX_TEXT_BYTES {
+                pending_bytes += bytes;
+                pending.push(session);
+            }
+        }
+        Ok((
+            Listing {
+                items,
+                warnings,
+                quarantined: self.quarantine_count(),
+            },
+            pending,
+        ))
+    }
+
+    /// Visit every readable record once. Used by backup and bulk export.
+    pub(crate) fn for_each_session(
+        &self,
+        mut visit: impl FnMut(Session) -> Result<()>,
+    ) -> Result<Vec<RecordWarning>> {
+        let warnings = self.refresh()?;
+        let mut ids: Vec<String> = self.lock_index().entries.keys().cloned().collect();
+        ids.sort();
+        for id in ids {
+            match self.recover(&id) {
+                Ok(Some(session)) => visit(session)?,
+                Ok(None) => {}
+                Err(error) if error.is::<Unavailable>() => {
+                    anyhow::bail!("{error} Try again in a moment.")
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(warnings)
     }
 
     pub fn load(&self, id: &str) -> Result<Session> {
@@ -306,8 +796,27 @@ impl History {
         self.save_inner(session, true)
     }
 
+    /// Apply `change` to the latest stored copy of `id` and save it. The
+    /// change checks what it relies on and fails rather than overwrite.
+    pub fn update(&self, id: &str, change: Change) -> Result<Session> {
+        let mut session = self
+            .recover(id)?
+            .context("This history item is no longer available")?;
+        change(&mut session)?;
+        self.save(session)
+    }
+
     fn save_inner(&self, mut session: Session, preserve_membership: bool) -> Result<Session> {
         validate(&session)?;
+        if self
+            .replaced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session.id)
+            .is_some_and(|installed| session.updated_ms < *installed)
+        {
+            return Err(StaleSave.into());
+        }
         ensure!(
             !self.path(&session.id, "deleted")?.exists(),
             "This history item was deleted"
@@ -321,6 +830,7 @@ impl History {
             if preserve_membership {
                 session.topic_id = existing.topic_id.clone();
                 session.auto_file_pending = existing.auto_file_pending;
+                session.pinned = existing.pinned;
             }
             if existing.is_collection {
                 let current = self.collection(existing.clone())?;
@@ -370,14 +880,22 @@ impl History {
             stored_session.original.clear();
             stored_session.notes = None;
         }
+        stored_session.sources.clear();
+        self.write_record(&stored_session)?;
+        Ok(session)
+    }
+
+    /// Atomically replace the stored record exactly as given and index it.
+    fn write_record(&self, session: &Session) -> Result<()> {
         let bytes = serde_json::to_vec(&Stored {
             schema: SCHEMA,
-            session: stored_session,
+            session: session.clone(),
         })?;
         ensure!(
             bytes.len() <= MAX_BYTES,
             "This transcript is too large to save as one history item"
         );
+        let bytes = protect::seal_if(self.protect.load(Ordering::Acquire), bytes)?;
         let main = self.path(&session.id, "json")?;
         let temporary = self.path(&session.id, "tmp")?;
         let backup = self.path(&session.id, "bak")?;
@@ -385,8 +903,11 @@ impl History {
             .create_new(true)
             .write(true)
             .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(error.into());
+        }
         drop(file);
         if main.exists() {
             fs::rename(&main, &backup)?;
@@ -399,26 +920,94 @@ impl History {
         }
         // The durable replacement is now installed. Keeping a leftover backup is safe.
         let _ = remove_if_present(&backup);
-        Ok(session)
+        self.remember(session, stamp(&main));
+        Ok(())
+    }
+
+    /// Install a complete record without changing its timestamps. Used by
+    /// restore paths after the caller has decided it must not lose newer data.
+    pub(crate) fn install(&self, session: &Session) -> Result<()> {
+        validate(session)?;
+        ensure!(
+            !self.path(&session.id, "deleted")?.exists(),
+            "This history item was deleted"
+        );
+        self.write_record(session)?;
+        self.replaced_by_restore(session);
+        Ok(())
+    }
+
+    /// Open copies older than `session` can no longer be saved over it.
+    fn replaced_by_restore(&self, session: &Session) {
+        let mut replaced = self.replaced.lock().unwrap_or_else(|e| e.into_inner());
+        let floor = replaced.entry(session.id.clone()).or_default();
+        *floor = (*floor).max(session.updated_ms);
+    }
+
+    /// The stored version of a record, if any, without hydrating topics.
+    pub(crate) fn stored(&self, id: &str) -> Result<Option<Session>> {
+        self.recover(id)
+    }
+
+    pub(crate) fn is_deleted(&self, id: &str) -> Result<bool> {
+        Ok(self.path(id, "deleted")?.exists())
+    }
+
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<Summary> {
+        let mut session = self
+            .recover(id)?
+            .context("This history item is no longer available")?;
+        if session.pinned != pinned {
+            session.pinned = pinned;
+            self.write_record(&session)?;
+        }
+        Ok(Summary::from(&session))
     }
 
     fn collection(&self, session: Session) -> Result<Session> {
+        self.refresh()?;
+        let (members, unreadable) = {
+            let index = self.lock_index();
+            let mut members: Vec<String> = index
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    !entry.summary.is_collection
+                        && entry.summary.topic_id.as_deref() == Some(session.id.as_str())
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            members.sort();
+            (members, index.unreadable.clone())
+        };
+        for (id, kind) in unreadable {
+            match kind {
+                // Recovery already quarantined damaged records, just as the
+                // history list does. They cannot prevent intact recordings opening.
+                WarningKind::Damaged => {}
+                // A newer or temporarily unreadable unrelated recording must not
+                // disable every topic. Preserve the error whenever its ownership
+                // is unknown or points here, so saving cannot erase a member.
+                WarningKind::NewerVersion
+                    if !self.unreadable_record_is_unrelated(&id, &session.id) =>
+                {
+                    return Err(UnsupportedSchema.into());
+                }
+                WarningKind::Unavailable
+                    if !self.unreadable_record_is_unrelated(&id, &session.id) =>
+                {
+                    return Err(unavailable(
+                        "A recording in this topic could not be read. Try again in a moment.",
+                    ));
+                }
+                _ => {}
+            }
+        }
         let mut sources = Vec::new();
         let mut bytes = 0_usize;
-        for id in self.ids()? {
+        for id in members {
             let recovered = match self.recover(&id) {
                 Ok(source) => source,
-                Err(error) if error.is::<UnsupportedSchema>() => {
-                    // A newer unrelated recording must not disable every topic.
-                    // Preserve the error whenever its ownership is unknown or
-                    // points here, so saving cannot erase an unreadable member.
-                    if !self.unreadable_record_is_unrelated(&id, &session.id) {
-                        return Err(error);
-                    }
-                    continue;
-                }
-                // Recovery quarantines damaged records, just as the history
-                // list does. They cannot prevent intact recordings opening.
                 Err(error) if error.is::<DamagedRecord>() => continue,
                 Err(error) => return Err(error),
             };
@@ -590,23 +1179,36 @@ impl History {
                 .open(marker)?;
             file.sync_all()?;
         }
-        self.remove_copies(id)
+        self.forget(id);
+        self.remove_copies(id, None)
     }
 
-    fn remove_copies(&self, id: &str) -> Result<()> {
+    /// Remove every copy of a deleted record. `corrupt` lists its quarantined
+    /// files when the caller already enumerated the directory.
+    fn remove_copies(&self, id: &str, corrupt: Option<&[PathBuf]>) -> Result<()> {
         for suffix in ["json", "bak", "tmp"] {
             remove_if_present(&self.path(id, suffix)?)?;
         }
-        let prefix = format!("{id}.corrupt-");
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.strip_prefix(&prefix))
-                .is_some_and(valid_id)
-            {
-                remove_if_present(&entry.path())?;
+        // Retained audio, an unfinished recording and rewrite temporaries.
+        crate::audio_store::remove(&self.directory, id)?;
+        match corrupt {
+            Some(paths) => {
+                for path in paths {
+                    remove_if_present(path)?;
+                }
+            }
+            None => {
+                for entry in fs::read_dir(&self.directory)? {
+                    let entry = entry?;
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .and_then(parse_quarantine_name)
+                        .is_some_and(|owner| owner == id)
+                    {
+                        remove_if_present(&entry.path())?;
+                    }
+                }
             }
         }
         Ok(())
@@ -619,7 +1221,7 @@ impl History {
 
     fn recover(&self, id: &str) -> Result<Option<Session>> {
         if self.path(id, "deleted")?.exists() {
-            self.remove_copies(id)?;
+            self.remove_copies(id, None)?;
             return Ok(None);
         }
         let main = self.path(id, "json")?;
@@ -637,12 +1239,24 @@ impl History {
                             self.quarantine(&main, id)?;
                         }
                         fs::rename(candidate, &main)?;
+                        // A copy written before an encryption change must not
+                        // bring the old form back. A failure leaves a readable
+                        // record that the next migration pass converts.
+                        let protect = self.protect.load(Ordering::Acquire);
+                        if let Err(error) = protect::migrate_file(&main, protect, MAX_STORED_BYTES)
+                        {
+                            log::warn!("Could not update a recovered history record: {error:#}");
+                        }
                     }
                     remove_if_present(&temporary)?;
                     remove_if_present(&backup)?;
                     return Ok(Some(session));
                 }
-                Err(error) if error.is::<UnsupportedSchema>() => return Err(error),
+                // Never decide anything about a record from a partial view. An
+                // unreadable copy may be the only good one.
+                Err(error) if error.is::<UnsupportedSchema>() || error.is::<Unavailable>() => {
+                    return Err(error);
+                }
                 Err(_) => invalid.push(candidate.clone()),
             }
         }
@@ -660,8 +1274,260 @@ impl History {
             path,
             self.directory.join(format!("{id}.corrupt-{}", new_id())),
         )?;
+        self.quarantined_now.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+
+    fn quarantine_file(&self, file_name: &str) -> Result<(PathBuf, String)> {
+        let id = parse_quarantine_name(file_name).context("Unknown isolated history file")?;
+        let path = self.directory.join(file_name);
+        let metadata =
+            fs::symlink_metadata(&path).context("This isolated file no longer exists")?;
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "Unknown isolated history file"
+        );
+        Ok((path, id.to_owned()))
+    }
+
+    /// Files moved aside because they could not be parsed or validated.
+    pub fn quarantined(&self) -> Result<Vec<Quarantined>> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = parse_quarantine_name(&name) else {
+                continue;
+            };
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let (restorable, title, reason) = match read_session(&entry.path(), id) {
+                Ok(session) => (true, Some(session.title), "Complete record".to_owned()),
+                Err(error) => (
+                    false,
+                    read_session_value(&entry.path())
+                        .ok()
+                        .and_then(|value| value["session"]["title"].as_str().map(str::to_owned)),
+                    error.to_string(),
+                ),
+            };
+            found.push(Quarantined {
+                file_name: name.clone(),
+                id: id.to_owned(),
+                bytes: metadata.len(),
+                modified_ms: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|at| at.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |at| at.as_millis().min(u64::MAX as u128) as u64),
+                restorable,
+                title,
+                reason,
+            });
+            if found.len() >= 1000 {
+                break;
+            }
+        }
+        found.sort_by(|a, b| {
+            b.modified_ms
+                .cmp(&a.modified_ms)
+                .then_with(|| a.file_name.cmp(&b.file_name))
+        });
+        Ok(found)
+    }
+
+    /// Put an isolated record back. Refuses to replace a newer saved version.
+    pub fn restore_quarantined(&self, file_name: &str) -> Result<Session> {
+        let (path, id) = self.quarantine_file(file_name)?;
+        let session = read_session(&path, &id).map_err(|error| {
+            anyhow::anyhow!(
+                "This file cannot be restored automatically ({error}). Export it to inspect its contents."
+            )
+        })?;
+        ensure!(
+            !self.is_deleted(&id)?,
+            "This item was deleted. Export the isolated copy instead."
+        );
+        if let Some(existing) = self.recover(&id)? {
+            ensure!(
+                existing.updated_ms < session.updated_ms,
+                "A newer saved version of this item exists. Export the isolated copy instead."
+            );
+        }
+        self.write_record(&session)?;
+        self.replaced_by_restore(&session);
+        remove_if_present(&path)?;
+        Ok(session)
+    }
+
+    /// Write the isolated file's contents, decrypted when possible, to `destination`.
+    pub fn export_quarantined(&self, file_name: &str, destination: &Path) -> Result<()> {
+        let (path, _) = self.quarantine_file(file_name)?;
+        let metadata = fs::metadata(&path)?;
+        ensure!(
+            metadata.len() <= MAX_STORED_BYTES,
+            "This isolated file is too large to export"
+        );
+        let bytes = fs::read(&path)?;
+        let bytes = protect::open(bytes.clone()).unwrap_or(bytes);
+        protect::write_atomic(destination, &bytes)?;
+        Ok(())
+    }
+
+    pub fn discard_quarantined(&self, file_name: &str) -> Result<()> {
+        let (path, _) = self.quarantine_file(file_name)?;
+        remove_if_present(&path)
+    }
+
+    /// Rewrite every stored record, backup and isolated file so it is encrypted
+    /// (`protect`) or plaintext. Each file is replaced atomically, and readers
+    /// accept both forms, so an interrupted migration is safe and resumes when
+    /// this is called again. Interrupted saves are recovered first, so a
+    /// temporary copy can never later install the old form; any copy that
+    /// could not be recovered is converted in place.
+    pub fn set_protection(&self, protect: bool) -> Result<MigrationReport> {
+        self.protect.store(protect, Ordering::Release);
+        // Retained audio is sealed segment by segment, and leftovers of an
+        // interrupted rewrite are removed; recordings follow their recorder.
+        let audio = crate::audio_store::set_protection(&self.directory, protect)?;
+        let mut report = MigrationReport {
+            protect,
+            changed: audio.changed,
+            failed: audio.failed,
+        };
+        for (id, found) in self.scan()? {
+            if found.deleted || !(found.tmp || found.bak) {
+                continue;
+            }
+            match self.recover(&id) {
+                Ok(_) => {}
+                // Damaged copies were isolated and are converted below.
+                Err(error) if error.is::<DamagedRecord>() => {}
+                Err(_) => report.failed += 1,
+            }
+        }
+        for entry in fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some((id, suffix)) = name.split_once('.') else {
+                continue;
+            };
+            let eligible = valid_id(id)
+                && (matches!(suffix, "json" | "tmp" | "bak")
+                    || parse_quarantine_name(&name).is_some());
+            if !eligible {
+                continue;
+            }
+            let path = entry.path();
+            let before = stamp(&path);
+            match protect::migrate_file(&path, protect, MAX_STORED_BYTES) {
+                Ok(true) => {
+                    report.changed += 1;
+                    if suffix == "json" {
+                        // Same content, new bytes: keep the cached entry valid.
+                        let mut index = self.lock_index();
+                        if let Some(cached) = index.entries.get_mut(id)
+                            && cached.stamp == before
+                        {
+                            cached.stamp = stamp(&path);
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(_) => report.failed += 1,
+            }
+        }
+        Ok(report)
+    }
+
+    /// Sessions the policy would delete now. Nothing is changed.
+    pub fn retention_preview(
+        &self,
+        policy: &retention::Policy,
+        active: &[String],
+    ) -> Result<Vec<Summary>> {
+        policy.validate()?;
+        self.refresh()?;
+        let now = now_ms();
+        let mut affected: Vec<Summary> = self
+            .lock_index()
+            .entries
+            .values()
+            .filter(|entry| {
+                retention::eligible(
+                    policy,
+                    &retention::Facts {
+                        id: &entry.summary.id,
+                        kind: entry.summary.kind,
+                        updated_ms: entry.summary.updated_ms,
+                        pinned: entry.summary.pinned,
+                        is_collection: entry.summary.is_collection,
+                        topic_id: entry.summary.topic_id.as_deref(),
+                    },
+                    now,
+                    active,
+                )
+            })
+            .map(|entry| entry.summary.clone())
+            .collect();
+        affected.sort_by(|a, b| {
+            a.updated_ms
+                .cmp(&b.updated_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(affected)
+    }
+
+    /// Delete what the policy selects. With `confirmed`, only sessions from that
+    /// earlier preview are deleted, and only if they still qualify.
+    pub fn apply_retention(
+        &self,
+        policy: &retention::Policy,
+        confirmed: Option<&[String]>,
+        active: &[String],
+    ) -> Result<retention::Applied> {
+        let eligible: Vec<String> = self
+            .retention_preview(policy, active)?
+            .into_iter()
+            .map(|summary| summary.id)
+            .collect();
+        let mut applied = retention::Applied::default();
+        let selected: Vec<String> = match confirmed {
+            Some(confirmed) => {
+                for id in confirmed {
+                    if !eligible.contains(id) {
+                        applied.skipped.push(id.clone());
+                    }
+                }
+                eligible
+                    .into_iter()
+                    .filter(|id| confirmed.contains(id))
+                    .collect()
+            }
+            None => eligible,
+        };
+        for id in selected {
+            match self.delete(&id) {
+                Ok(()) => applied.deleted.push(id),
+                Err(error) => applied.failed.push((id, error.to_string())),
+            }
+        }
+        Ok(applied)
+    }
+}
+
+/// `{id}.corrupt-{suffix}` names the record a quarantined file belongs to.
+fn parse_quarantine_name(name: &str) -> Option<&str> {
+    let (id, suffix) = name.split_once('.')?;
+    (valid_id(id) && suffix.strip_prefix("corrupt-").is_some_and(valid_id)).then_some(id)
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -672,24 +1538,43 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
-fn read_session_value(path: &Path) -> Result<serde_json::Value> {
-    let metadata = fs::symlink_metadata(path)?;
+/// Plaintext bytes of a stored file. I/O failures and decryption failures are
+/// `Unavailable`; a wrong file type or size is damage.
+fn read_record_bytes(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).map_err(unavailable)?;
     ensure!(
         metadata.is_file()
             && !metadata.file_type().is_symlink()
-            && metadata.len() <= MAX_BYTES as u64,
+            && metadata.len() <= MAX_STORED_BYTES,
         "Invalid history file"
     );
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take((MAX_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
+    File::open(path)
+        .map_err(unavailable)?
+        .take(MAX_STORED_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unavailable)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_STORED_BYTES,
+        "History item exceeds size limit"
+    );
+    let bytes = protect::open(bytes).map_err(|error| {
+        if error.is::<protect::Undecryptable>() {
+            unavailable(error)
+        } else {
+            error
+        }
+    })?;
     ensure!(bytes.len() <= MAX_BYTES, "History item exceeds size limit");
-    Ok(serde_json::from_slice(&bytes)?)
+    Ok(bytes)
 }
 
-fn read_session(path: &Path, expected_id: &str) -> Result<Session> {
-    let value = read_session_value(path)?;
+fn read_session_value(path: &Path) -> Result<serde_json::Value> {
+    Ok(serde_json::from_slice(&read_record_bytes(path)?)?)
+}
+
+/// Parse a stored record, tolerating unknown fields (see `SCHEMA`).
+pub(crate) fn parse_record(value: serde_json::Value, expected_id: &str) -> Result<Session> {
     if value["schema"]
         .as_u64()
         .is_some_and(|schema| schema > SCHEMA as u64)
@@ -729,6 +1614,28 @@ fn read_session(path: &Path, expected_id: &str) -> Result<Session> {
     Ok(stored.session)
 }
 
+/// Serialize a record in the stored format, for portable archives.
+pub(crate) fn encode_record(session: &Session) -> Result<Vec<u8>> {
+    let mut session = session.clone();
+    session.sources.clear();
+    let bytes = serde_json::to_vec(&Stored {
+        schema: SCHEMA,
+        session,
+    })?;
+    ensure!(
+        bytes.len() <= MAX_BYTES,
+        "This transcript is too large to save as one history item"
+    );
+    Ok(bytes)
+}
+
+pub(crate) const RECORD_SCHEMA: u32 = SCHEMA;
+pub(crate) const MAX_RECORD_BYTES: usize = MAX_BYTES;
+
+fn read_session(path: &Path, expected_id: &str) -> Result<Session> {
+    parse_record(read_session_value(path)?, expected_id)
+}
+
 fn validate(session: &Session) -> Result<()> {
     if let Some(app) = &session.metrics.app {
         ensure!(
@@ -764,6 +1671,35 @@ fn validate(session: &Session) -> Result<()> {
             && session.speaker_names.iter().all(|name| name.len() <= 512),
         "Speaker name exceeds size limit"
     );
+    ensure!(
+        session.speaker_edits.len() <= 4 * crate::speaker_edits::MAX_UNDO
+            && session
+                .speaker_edits
+                .iter()
+                .all(|edit| edit.rows.len() <= MAX_ROWS && edit.summary.len() <= 1024),
+        "Speaker corrections exceed size limit"
+    );
+    ensure!(
+        session.interruptions.len() <= 2 * crate::calls::interruptions::MAX_STORED
+            && session
+                .interruptions
+                .iter()
+                .all(|interruption| interruption.end_ms >= interruption.start_ms),
+        "Invalid audio interruption"
+    );
+    ensure!(
+        session
+            .audio
+            .as_ref()
+            .is_none_or(|audio| audio.channels.len() <= 8
+                && audio.format.len() <= 64
+                && audio.channels.iter().all(|name| name.len() <= 64)),
+        "Invalid retained audio details"
+    );
+    ensure!(
+        session.transcript_versions.len() <= 2 * MAX_TRANSCRIPT_VERSIONS,
+        "Too many saved transcript versions"
+    );
     let mut text_bytes = session
         .text
         .len()
@@ -783,6 +1719,19 @@ fn validate(session: &Session) -> Result<()> {
         "Note edit history exceeds size limit"
     );
     text_bytes = text_bytes.saturating_add(protection_bytes);
+    for version in &session.transcript_versions {
+        ensure!(
+            version.rows.len() <= MAX_ROWS
+                && version.text.len() <= MAX_TEXT_BYTES
+                && version.original.len() <= MAX_TEXT_BYTES
+                && version.speaker_names.len() <= 8,
+            "Saved transcript version exceeds size limit"
+        );
+        text_bytes = text_bytes
+            .saturating_add(version.text.len())
+            .saturating_add(version.original.len())
+            .saturating_add(version.rows.iter().map(|row| row.text.len()).sum());
+    }
     for row in &session.rows {
         ensure!(
             row.end_ms >= row.start_ms && row.speakers.len() <= 4,
@@ -841,7 +1790,7 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -864,20 +1813,93 @@ fn new_id() -> String {
     format!("{a:016x}{b:016x}")
 }
 
+/// Remove temporary call-audio WAV files left behind when an earlier run of
+/// Articulate stopped during audio analysis. Audio is never meant to persist.
+/// Files written by this process are kept, since analysis may be running.
+/// Returns how many files were removed.
+pub fn remove_leftover_call_audio(directory: &Path) -> usize {
+    let current = format!("{}-", std::process::id());
+    let Ok(entries) = fs::read_dir(directory) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".wav") else {
+            continue;
+        };
+        let generated = stem.split_once('-').is_some_and(|(pid, serial)| {
+            !pid.is_empty()
+                && !serial.is_empty()
+                && pid.bytes().all(|b| b.is_ascii_digit())
+                && serial.bytes().all(|b| b.is_ascii_digit())
+        });
+        let is_file = entry
+            .file_type()
+            .is_ok_and(|kind| kind.is_file() && !kind.is_symlink());
+        if generated
+            && is_file
+            && !name.starts_with(&current)
+            && fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 pub enum Event {
     Insights(crate::insights::Report),
     InsightsFailed(String),
-    Listed(Vec<Summary>),
+    Listed(Listing),
     Loaded(Box<Session>),
     SourceMoved(Box<crate::topics::Moved>),
-    SourceMoveFailed { id: String, error: String },
+    SourceMoveFailed {
+        id: String,
+        error: String,
+    },
     CollectionsChanged(Vec<Session>),
     FilingPending(Vec<Session>),
-    Saved { id: String, updated_ms: u64 },
-    Deleted { id: String },
-    DeleteFailed { id: String, error: String },
+    /// `summary` reflects the stored record, so lists update without a reload.
+    Saved {
+        id: String,
+        updated_ms: u64,
+        summary: Box<Summary>,
+    },
+    Deleted {
+        id: String,
+    },
+    DeleteFailed {
+        id: String,
+        error: String,
+    },
     Failed(String),
+    Quarantine(Vec<Quarantined>),
+    QuarantineRestored(Box<Session>),
+    QuarantineExported {
+        file_name: String,
+        path: PathBuf,
+    },
+    QuarantineDiscarded {
+        file_name: String,
+    },
+    QuarantineFailed {
+        file_name: String,
+        error: String,
+    },
+    Pinned(Box<Summary>),
+    ProtectionChanged(Result<MigrationReport, String>),
+    RetentionPreview(Result<Vec<Summary>, String>),
+    RetentionApplied(Result<retention::Applied, String>),
+    BackupCreated(Result<backup::Created, String>),
+    RestoreFinished(Result<Box<backup::Restored>, String>),
+    MarkdownExported(Result<backup::Exported, String>),
 }
+
+/// A change to the latest stored copy of one session; see `Worker::update`.
+pub type Change = Box<dyn FnOnce(&mut Session) -> Result<()> + Send>;
 
 enum Command {
     Insights,
@@ -885,7 +1907,19 @@ enum Command {
     Load(String),
     MoveSource(String, crate::topics::Destination, Option<String>),
     Save(PendingSave),
+    Update(String, Change),
     Delete(String),
+    Quarantined,
+    RestoreQuarantined(String),
+    ExportQuarantined(String, PathBuf),
+    DiscardQuarantined(String),
+    SetPinned(String, bool),
+    SetProtection(bool),
+    RetentionPreview(retention::Policy, Vec<String>),
+    ApplyRetention(retention::Policy, Option<Vec<String>>, Vec<String>),
+    Backup(Box<backup::Request>),
+    Restore(Box<backup::RestoreRequest>),
+    ExportMarkdown(PathBuf),
 }
 
 #[derive(Clone)]
@@ -917,6 +1951,7 @@ struct Shared {
 pub struct Worker {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    search: Option<SearchIndex>,
 }
 
 impl Worker {
@@ -925,14 +1960,37 @@ impl Worker {
         Self::start_directory(directory)
     }
 
+    /// Start the history worker with plaintext writes.
+    #[cfg(test)]
     pub fn start() -> Self {
-        Self::start_directory(crate::model::data_dir().join("history"))
+        Self::start_protected(false, true)
     }
 
+    /// Start the history worker. `protect` selects encryption for new writes.
+    /// With `migrate`, the saved choice is confirmed and any interrupted
+    /// encryption change is finished before listing; otherwise stored files
+    /// keep their current form until the user changes the setting.
+    pub fn start_protected(protect: bool, migrate: bool) -> Self {
+        let data = crate::model::data_dir();
+        remove_leftover_call_audio(&data.join("audio-context-temp"));
+        crate::audio_store::recover_interrupted(&directory());
+        Self::start_directory_protected(directory(), protect, migrate)
+    }
+
+    #[cfg(test)]
     fn start_directory(directory: PathBuf) -> Self {
+        Self::start_directory_protected(directory, false, true)
+    }
+
+    fn start_directory_protected(directory: PathBuf, protect: bool, migrate: bool) -> Self {
+        let search = SearchIndex::in_memory().ok();
+        let mut commands = VecDeque::from([Command::List]);
+        if migrate {
+            commands.push_front(Command::SetProtection(protect));
+        }
         let shared = Arc::new(Shared {
             state: Mutex::new(WorkState {
-                commands: VecDeque::from([Command::List]),
+                commands,
                 events: VecDeque::new(),
                 stopped: false,
                 failed_saves: BTreeMap::new(),
@@ -942,9 +2000,10 @@ impl Worker {
             wake: Condvar::new(),
         });
         let worker_shared = shared.clone();
+        let worker_search = search.clone();
         let thread = thread::Builder::new()
             .name("local-history".into())
-            .spawn(move || history_worker(worker_shared, directory));
+            .spawn(move || history_worker(worker_shared, directory, worker_search, protect));
         let thread = match thread {
             Ok(thread) => Some(thread),
             Err(_) => {
@@ -957,7 +2016,17 @@ impl Worker {
                 None
             }
         };
-        Self { shared, thread }
+        Self {
+            shared,
+            thread,
+            search,
+        }
+    }
+
+    /// The live full-text index maintained by this worker, if it could be
+    /// created. Check `is_ready` before relying on complete results.
+    pub fn search_index(&self) -> Option<SearchIndex> {
+        self.search.clone()
     }
 
     pub fn insights(&self) {
@@ -984,8 +2053,97 @@ impl Worker {
             session: Box::new(session),
         }));
     }
+    /// Apply `change` to the latest stored copy of `id`, after saves already
+    /// queued, and save the result. Replies with `Saved`, or `Failed` with the
+    /// change's error.
+    pub fn update(&self, id: String, change: Change) {
+        self.enqueue(Command::Update(id, change));
+    }
     pub fn delete(&self, id: String) {
         self.enqueue(Command::Delete(id));
+    }
+    /// Replies with `Event::Quarantine`.
+    pub fn quarantined(&self) {
+        self.enqueue(Command::Quarantined);
+    }
+    /// Replies with `QuarantineRestored` or `QuarantineFailed`.
+    pub fn restore_quarantined(&self, file_name: String) {
+        self.enqueue(Command::RestoreQuarantined(file_name));
+    }
+    /// Replies with `QuarantineExported` or `QuarantineFailed`.
+    pub fn export_quarantined(&self, file_name: String, destination: PathBuf) {
+        self.enqueue(Command::ExportQuarantined(file_name, destination));
+    }
+    /// Replies with `QuarantineDiscarded` or `QuarantineFailed`.
+    pub fn discard_quarantined(&self, file_name: String) {
+        self.enqueue(Command::DiscardQuarantined(file_name));
+    }
+    /// Replies with `Pinned` or `Failed`.
+    pub fn set_pinned(&self, id: String, pinned: bool) {
+        self.enqueue(Command::SetPinned(id, pinned));
+    }
+    /// Stop accepting work, as when the worker has ended.
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .stopped = true;
+        self.shared.wake.notify_one();
+    }
+
+    /// Replies with `ProtectionChanged`. A protection change is always queued
+    /// while the worker runs, even when the queue is full, because the saved
+    /// preference already depends on it. Returns `false` only if the worker
+    /// has stopped, in which case nothing will change.
+    pub fn set_protection(&self, protect: bool) -> bool {
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.stopped
+            || self
+                .thread
+                .as_ref()
+                .is_none_or(|thread| thread.is_finished())
+        {
+            return false;
+        }
+        // Only the latest choice matters; an earlier queued change is replaced.
+        if let Some(queued) = state
+            .commands
+            .iter_mut()
+            .find(|command| matches!(command, Command::SetProtection(_)))
+        {
+            *queued = Command::SetProtection(protect);
+        } else {
+            state.commands.push_back(Command::SetProtection(protect));
+        }
+        self.shared.wake.notify_one();
+        true
+    }
+    /// Replies with `RetentionPreview`. `active` sessions are always kept.
+    pub fn retention_preview(&self, policy: retention::Policy, active: Vec<String>) {
+        self.enqueue(Command::RetentionPreview(policy, active));
+    }
+    /// Replies with `RetentionApplied`, preceded by `Deleted` for each removal.
+    pub fn apply_retention(
+        &self,
+        policy: retention::Policy,
+        confirmed: Option<Vec<String>>,
+        active: Vec<String>,
+    ) {
+        self.enqueue(Command::ApplyRetention(policy, confirmed, active));
+    }
+    /// Replies with `BackupCreated`.
+    pub fn backup(&self, request: backup::Request) {
+        self.enqueue(Command::Backup(Box::new(request)));
+    }
+    /// Replies with `RestoreFinished`, then a fresh `Listed`.
+    pub fn restore(&self, request: backup::RestoreRequest) {
+        self.enqueue(Command::Restore(Box::new(request)));
+    }
+    /// Replies with `MarkdownExported`.
+    pub fn export_markdown(&self, folder: PathBuf) {
+        self.enqueue(Command::ExportMarkdown(folder));
     }
     pub fn retry(&self) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1079,14 +2237,7 @@ impl Worker {
             _ => {}
         }
         if state.stopped || state.commands.len() >= QUEUE_CAPACITY {
-            let deleting = match &command {
-                Command::Delete(id) => Some(id.clone()),
-                _ => None,
-            };
-            let moving = match &command {
-                Command::MoveSource(id, _, _) => Some(id.clone()),
-                _ => None,
-            };
+            let busy = busy_event(&command);
             if let Command::Save(session) = command
                 && (state.failed_saves.len() < QUEUE_CAPACITY
                     || state.failed_saves.contains_key(&session.id))
@@ -1098,23 +2249,41 @@ impl Worker {
             }
             state.events.push_back(if insights {
                 Event::InsightsFailed("History is busy. Refresh Insights shortly.".into())
-            } else if let Some(id) = deleting {
-                Event::DeleteFailed {
-                    id,
-                    error: "History is busy. Please try deleting again.".into(),
-                }
-            } else if let Some(id) = moving {
-                Event::SourceMoveFailed {
-                    id,
-                    error: "History is busy. Please try moving again.".into(),
-                }
             } else {
-                Event::Failed("History is busy. Please try saving again.".into())
+                busy
             });
         } else {
             state.commands.push_back(command);
             self.shared.wake.notify_one();
         }
+    }
+}
+
+/// The failure reported when a command cannot be queued.
+fn busy_event(command: &Command) -> Event {
+    let busy = "History is busy. Please try again.".to_owned();
+    match command {
+        Command::Delete(id) => Event::DeleteFailed {
+            id: id.clone(),
+            error: "History is busy. Please try deleting again.".into(),
+        },
+        Command::MoveSource(id, _, _) => Event::SourceMoveFailed {
+            id: id.clone(),
+            error: "History is busy. Please try moving again.".into(),
+        },
+        Command::RestoreQuarantined(file_name)
+        | Command::ExportQuarantined(file_name, _)
+        | Command::DiscardQuarantined(file_name) => Event::QuarantineFailed {
+            file_name: file_name.clone(),
+            error: busy,
+        },
+        Command::SetProtection(_) => Event::ProtectionChanged(Err(busy)),
+        Command::RetentionPreview(..) => Event::RetentionPreview(Err(busy)),
+        Command::ApplyRetention(..) => Event::RetentionApplied(Err(busy)),
+        Command::Backup(_) => Event::BackupCreated(Err(busy)),
+        Command::Restore(_) => Event::RestoreFinished(Err(busy)),
+        Command::ExportMarkdown(_) => Event::MarkdownExported(Err(busy)),
+        _ => Event::Failed("History is busy. Please try saving again.".into()),
     }
 }
 
@@ -1133,8 +2302,23 @@ impl Drop for Worker {
     }
 }
 
-fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
-    let mut history = History::open(directory.clone());
+fn open_history(directory: &Path, search: &Option<SearchIndex>, protect: bool) -> Result<History> {
+    let mut history = History::open(directory.to_path_buf())?.with_protection(protect);
+    if let Some(search) = search {
+        // A reopened store starts from an empty index and rebuilds it.
+        let _ = search.clear();
+        history = history.with_search(search.clone());
+    }
+    Ok(history)
+}
+
+fn history_worker(
+    shared: Arc<Shared>,
+    directory: PathBuf,
+    search: Option<SearchIndex>,
+    mut protect: bool,
+) {
+    let mut history = open_history(&directory, &search, protect);
     loop {
         let command = {
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1151,8 +2335,11 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
             };
             command
         };
+        if let Command::SetProtection(value) = &command {
+            protect = *value;
+        }
         if history.is_err() {
-            history = History::open(directory.clone());
+            history = open_history(&directory, &search, protect);
         }
         let insights = matches!(command, Command::Insights);
         let deleting = match &command {
@@ -1167,8 +2354,11 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
             Command::Save(session) => Some(session.clone()),
             _ => None,
         };
+        let failure = busy_event(&command);
         let mut refreshed_collections = Vec::new();
         let mut pending_filing = None;
+        let mut preceding = Vec::new();
+        let mut relist = false;
         let result = match &history {
             Ok(history) => match command {
                 Command::Insights => history.insights().map(Event::Insights),
@@ -1181,8 +2371,16 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
                     .map(|session| Event::Loaded(Box::new(session))),
                 Command::Save(pending) => {
                     history.save(*pending.session).map(|session| Event::Saved {
-                        id: session.id,
+                        id: session.id.clone(),
                         updated_ms: session.updated_ms,
+                        summary: Box::new(Summary::from(&session)),
+                    })
+                }
+                Command::Update(id, change) => {
+                    history.update(&id, change).map(|session| Event::Saved {
+                        id: session.id.clone(),
+                        updated_ms: session.updated_ms,
+                        summary: Box::new(Summary::from(&session)),
                     })
                 }
                 Command::Delete(id) => {
@@ -1203,6 +2401,75 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
                 Command::MoveSource(id, destination, expected) => history
                     .move_source(&id, destination, expected)
                     .map(|moved| Event::SourceMoved(Box::new(moved))),
+                Command::Quarantined => history.quarantined().map(Event::Quarantine),
+                Command::RestoreQuarantined(file_name) => {
+                    relist = true;
+                    Ok(match history.restore_quarantined(&file_name) {
+                        Ok(session) => Event::QuarantineRestored(Box::new(session)),
+                        Err(error) => Event::QuarantineFailed {
+                            file_name,
+                            error: error.to_string(),
+                        },
+                    })
+                }
+                Command::ExportQuarantined(file_name, path) => {
+                    Ok(match history.export_quarantined(&file_name, &path) {
+                        Ok(()) => Event::QuarantineExported { file_name, path },
+                        Err(error) => Event::QuarantineFailed {
+                            file_name,
+                            error: error.to_string(),
+                        },
+                    })
+                }
+                Command::DiscardQuarantined(file_name) => {
+                    relist = true;
+                    Ok(match history.discard_quarantined(&file_name) {
+                        Ok(()) => Event::QuarantineDiscarded { file_name },
+                        Err(error) => Event::QuarantineFailed {
+                            file_name,
+                            error: error.to_string(),
+                        },
+                    })
+                }
+                Command::SetPinned(id, pinned) => history
+                    .set_pinned(&id, pinned)
+                    .map(|summary| Event::Pinned(Box::new(summary))),
+                Command::SetProtection(protect) => Ok(Event::ProtectionChanged(
+                    history.set_protection(protect).map_err(|e| e.to_string()),
+                )),
+                Command::RetentionPreview(policy, active) => Ok(Event::RetentionPreview(
+                    history
+                        .retention_preview(&policy, &active)
+                        .map_err(|e| e.to_string()),
+                )),
+                Command::ApplyRetention(policy, confirmed, active) => {
+                    let applied = history
+                        .apply_retention(&policy, confirmed.as_deref(), &active)
+                        .map_err(|e| e.to_string());
+                    if let Ok(applied) = &applied {
+                        preceding.extend(
+                            applied
+                                .deleted
+                                .iter()
+                                .map(|id| Event::Deleted { id: id.clone() }),
+                        );
+                    }
+                    Ok(Event::RetentionApplied(applied))
+                }
+                Command::Backup(request) => Ok(Event::BackupCreated(
+                    backup::create(history, &request).map_err(|e| e.to_string()),
+                )),
+                Command::Restore(request) => {
+                    relist = true;
+                    Ok(Event::RestoreFinished(
+                        backup::restore(history, &request)
+                            .map(Box::new)
+                            .map_err(|e| e.to_string()),
+                    ))
+                }
+                Command::ExportMarkdown(folder) => Ok(Event::MarkdownExported(
+                    backup::export_markdown(history, &folder).map_err(|e| e.to_string()),
+                )),
             },
             Err(_) => Err(anyhow::anyhow!(
                 "Could not open local history. Check that the local data folder is writable."
@@ -1211,7 +2478,17 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active_save = None;
         state.active_operation = false;
+        let stale = result.as_ref().is_err_and(|error| error.is::<StaleSave>());
         match (&result, retry) {
+            (Err(_), Some(session)) if stale => {
+                if state
+                    .failed_saves
+                    .get(&session.id)
+                    .is_some_and(|failed| failed.revision <= session.revision)
+                {
+                    state.failed_saves.remove(&session.id);
+                }
+            }
             (Err(_), Some(session)) => {
                 if (state.failed_saves.len() < QUEUE_CAPACITY
                     || state.failed_saves.contains_key(&session.id))
@@ -1237,21 +2514,26 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
             }
             _ => {}
         }
+        for event in &preceding {
+            if let Event::Deleted { id } = event {
+                state.failed_saves.remove(id);
+            }
+        }
         let event = result.unwrap_or_else(|error| {
+            let error = error.to_string();
             if insights {
-                Event::InsightsFailed(error.to_string())
+                Event::InsightsFailed(error)
             } else if let Some(id) = deleting {
-                Event::DeleteFailed {
-                    id,
-                    error: error.to_string(),
-                }
+                Event::DeleteFailed { id, error }
             } else if let Some(id) = moving {
-                Event::SourceMoveFailed {
-                    id,
-                    error: error.to_string(),
-                }
+                Event::SourceMoveFailed { id, error }
             } else {
-                Event::Failed(error.to_string())
+                match failure {
+                    Event::QuarantineFailed { file_name, .. } => {
+                        Event::QuarantineFailed { file_name, error }
+                    }
+                    _ => Event::Failed(error),
+                }
             }
         });
         // Keep important acknowledgements, coalesce replaceable list responses.
@@ -1263,10 +2545,12 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
                 .events
                 .retain(|old| !matches!(old, Event::Insights(_) | Event::InsightsFailed(_)));
         }
-        if state.events.len() >= 128 {
-            state.events.pop_front();
+        for event in preceding.into_iter().chain(Some(event)) {
+            if state.events.len() >= 128 {
+                state.events.pop_front();
+            }
+            state.events.push_back(event);
         }
-        state.events.push_back(event);
         if !refreshed_collections.is_empty() {
             state
                 .events
@@ -1278,6 +2562,15 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
                 .retain(|event| !matches!(event, Event::FilingPending(_)));
             state.events.push_back(Event::FilingPending(pending));
         }
+        if relist
+            && !state.stopped
+            && !state
+                .commands
+                .iter()
+                .any(|command| matches!(command, Command::List))
+        {
+            state.commands.push_back(Command::List);
+        }
     }
 }
 
@@ -1285,6 +2578,7 @@ fn history_worker(shared: Arc<Shared>, directory: PathBuf) {
 mod tests {
     use super::*;
     use crate::discord_attribution::{Attribution, NamedSpeaker};
+    use std::collections::BTreeSet;
 
     struct TestDirectory(PathBuf);
     impl TestDirectory {
@@ -1892,6 +3186,610 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), future);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn locked_records_are_skipped_and_retried_never_quarantined() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let session = history.save(meeting()).unwrap();
+        let path = history.path(&session.id, "json").unwrap();
+        let reopened = directory.history();
+        // No sharing: every other open fails, as with antivirus or backup tools.
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let listing = reopened.listing().unwrap();
+        assert!(listing.items.is_empty());
+        assert_eq!(listing.warnings.len(), 1);
+        assert_eq!(listing.warnings[0].kind, WarningKind::Unavailable);
+        assert_eq!(listing.quarantined, 0);
+        assert!(reopened.load(&session.id).is_err());
+        drop(lock);
+        assert!(path.exists());
+        let listing = reopened.listing().unwrap();
+        assert_eq!(listing.items.len(), 1);
+        assert!(listing.warnings.is_empty());
+        assert_eq!(reopened.load(&session.id).unwrap().text, session.text);
+    }
+
+    #[test]
+    fn damaged_records_are_reported_listed_exported_and_discarded() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        history.save(meeting()).unwrap();
+        let bad_id = new_id();
+        fs::write(
+            history.path(&bad_id, "json").unwrap(),
+            b"{\"schema\": 5, trunc",
+        )
+        .unwrap();
+        let listing = history.listing().unwrap();
+        assert_eq!(listing.items.len(), 1);
+        assert_eq!(listing.warnings.len(), 1);
+        assert_eq!(listing.warnings[0].id, bad_id);
+        assert_eq!(listing.warnings[0].kind, WarningKind::Damaged);
+        assert_eq!(listing.quarantined, 1);
+        // The next pass no longer warns, but the isolated file stays counted.
+        let listing = history.listing().unwrap();
+        assert!(listing.warnings.is_empty());
+        assert_eq!(listing.quarantined, 1);
+        let files = history.quarantined().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, bad_id);
+        assert!(!files[0].restorable);
+        assert!(history.restore_quarantined(&files[0].file_name).is_err());
+        let exported = directory.0.join("exported.json");
+        history
+            .export_quarantined(&files[0].file_name, &exported)
+            .unwrap();
+        assert_eq!(fs::read(&exported).unwrap(), b"{\"schema\": 5, trunc");
+        for invalid in ["../x", "settings.json", &format!("{bad_id}.json")] {
+            assert!(history.discard_quarantined(invalid).is_err());
+        }
+        history.discard_quarantined(&files[0].file_name).unwrap();
+        assert!(history.quarantined().unwrap().is_empty());
+        assert_eq!(history.listing().unwrap().quarantined, 0);
+    }
+
+    #[test]
+    fn complete_quarantined_records_restore_without_replacing_newer_copies() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = meeting();
+        session.updated_ms = 1000;
+        let isolated = format!("{}.corrupt-{}", session.id, new_id());
+        fs::write(
+            directory.0.join(&isolated),
+            serde_json::to_vec(&Stored {
+                schema: SCHEMA,
+                session: session.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut newer = session.clone();
+        newer.text = "A newer saved version.".into();
+        let newer = history.save(newer).unwrap();
+        let files = history.quarantined().unwrap();
+        assert!(files[0].restorable);
+        assert_eq!(files[0].title.as_deref(), Some("Café meeting 東京"));
+        assert!(history.restore_quarantined(&isolated).is_err());
+        assert_eq!(history.load(&newer.id).unwrap().text, newer.text);
+        history.delete(&newer.id).unwrap();
+        let other = meeting();
+        let isolated = format!("{}.corrupt-{}", other.id, new_id());
+        fs::write(
+            directory.0.join(&isolated),
+            serde_json::to_vec(&Stored {
+                schema: SCHEMA,
+                session: other.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let restored = history.restore_quarantined(&isolated).unwrap();
+        assert_eq!(restored.id, other.id);
+        assert_eq!(history.list().unwrap()[0].id, other.id);
+        assert!(!directory.0.join(&isolated).exists());
+    }
+
+    /// Schema compatibility policy (see `SCHEMA`): unknown fields from newer
+    /// versions are ignored on read and top-level session fields survive a
+    /// save; a newer schema number is reported and never touched.
+    #[test]
+    fn newer_optional_fields_are_tolerated_and_preserved_newer_schemas_untouched() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let session = meeting();
+        let path = history.path(&session.id, "json").unwrap();
+        let mut stored = serde_json::to_value(Stored {
+            schema: SCHEMA,
+            session: session.clone(),
+        })
+        .unwrap();
+        stored["written_by"] = serde_json::json!("a later version");
+        stored["session"]["future_field"] = serde_json::json!({"nested": [1, 2]});
+        stored["session"]["metrics"]["future_metric"] = serde_json::json!(7);
+        fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        let mut loaded = history.load(&session.id).unwrap();
+        assert_eq!(loaded.text, session.text);
+        assert_eq!(loaded.unknown["future_field"]["nested"][1], 2);
+        loaded.title = "Edited by this version".into();
+        history.save(loaded).unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["session"]["future_field"]["nested"][0], 1);
+        assert_eq!(disk["session"]["title"], "Edited by this version");
+        assert!(disk["session"].get("unknown").is_none());
+
+        let future = meeting();
+        let future_path = history.path(&future.id, "json").unwrap();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "schema": SCHEMA + 1,
+            "session": {"id": future.id, "shape": "different"},
+        }))
+        .unwrap();
+        fs::write(&future_path, &bytes).unwrap();
+        let listing = history.listing().unwrap();
+        assert_eq!(listing.items.len(), 1);
+        assert_eq!(listing.warnings[0].kind, WarningKind::NewerVersion);
+        assert_eq!(listing.quarantined, 0);
+        assert_eq!(fs::read(&future_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn tombstones_are_cleaned_in_one_pass_and_old_ones_compacted() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let kept = history.save(meeting()).unwrap();
+        let mut deleted = Vec::new();
+        for _ in 0..50 {
+            let session = history.save(meeting()).unwrap();
+            history.delete(&session.id).unwrap();
+            deleted.push(session.id);
+        }
+        // An interrupted cleanup left a copy and a quarantined file behind.
+        fs::write(history.path(&deleted[0], "bak").unwrap(), b"stale").unwrap();
+        fs::write(
+            directory
+                .0
+                .join(format!("{}.corrupt-{}", deleted[0], new_id())),
+            b"stale",
+        )
+        .unwrap();
+        let old = SystemTime::now() - TOMBSTONE_RETENTION - Duration::from_secs(60);
+        for id in &deleted[..10] {
+            File::options()
+                .write(true)
+                .open(history.path(id, "deleted").unwrap())
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let listing = history.listing().unwrap();
+        assert_eq!(listing.items.len(), 1);
+        assert_eq!(listing.items[0].id, kept.id);
+        assert_eq!(listing.quarantined, 0);
+        let remaining: Vec<String> = fs::read_dir(&directory.0)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(remaining.len(), 1 + 40);
+        assert!(
+            remaining
+                .iter()
+                .filter(|name| name.ends_with(".deleted"))
+                .count()
+                == 40
+        );
+        for id in &deleted[..10] {
+            assert!(!history.path(id, "deleted").unwrap().exists());
+        }
+    }
+
+    #[test]
+    fn summaries_are_cached_until_the_file_changes() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = history.save(meeting()).unwrap();
+        assert_eq!(history.list().unwrap()[0].title, "Café meeting 東京");
+        // A change by another process is noticed through size and time.
+        session.title = "Changed elsewhere with a longer title".into();
+        let path = history.path(&session.id, "json").unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&Stored {
+                schema: SCHEMA,
+                session: session.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(history.list().unwrap()[0].title, session.title);
+        // Removal by another process is noticed too.
+        fs::remove_file(&path).unwrap();
+        assert!(history.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_reports_saved_summaries_without_listing_again() {
+        let directory = TestDirectory::new();
+        let worker = Worker::test_directory(directory.0.clone());
+        let mut session = meeting();
+        session.title = "A saved summary".into();
+        worker.save(session.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut listed = 0;
+        loop {
+            let mut saved = None;
+            for event in worker.drain() {
+                match event {
+                    Event::Listed(_) => listed += 1,
+                    Event::Saved { summary, .. } => saved = Some(summary),
+                    Event::Failed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            if let Some(summary) = saved {
+                assert_eq!(summary.id, session.id);
+                assert_eq!(summary.title, "A saved summary");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Only the startup listing ran.
+        assert!(listed <= 1);
+    }
+
+    #[test]
+    fn index_search_follows_saves_deletes_and_restart() {
+        let directory = TestDirectory::new();
+        let index = SearchIndex::in_memory().unwrap();
+        let history = directory.history().with_search(index.clone());
+        let mut session = meeting();
+        session.personal_notes = "Remember the zephyr budget.".into();
+        let session = history.save(session).unwrap();
+        let filters = search_index::Filters::default();
+        assert_eq!(index.search("zephyr", &filters).unwrap().hits.len(), 1);
+        history.delete(&session.id).unwrap();
+        assert!(index.search("zephyr", &filters).unwrap().hits.is_empty());
+        let other = history.save(meeting()).unwrap();
+        // A fresh index is rebuilt from disk by the first listing.
+        let rebuilt = SearchIndex::in_memory().unwrap();
+        let reopened = directory.history().with_search(rebuilt.clone());
+        assert!(!rebuilt.is_ready());
+        reopened.listing().unwrap();
+        assert!(rebuilt.is_ready());
+        let found = rebuilt.search("résumé", &filters).unwrap();
+        assert!(found.hits.iter().all(|hit| hit.session_id == other.id));
+        assert!(!found.hits.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encryption_migrates_both_ways_without_plaintext_on_disk() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = meeting();
+        session.personal_notes = "synthetic-private-note".into();
+        let session = history.save(session).unwrap();
+        let bad = new_id();
+        fs::write(
+            history.path(&bad, "json").unwrap(),
+            b"synthetic-private-damage",
+        )
+        .unwrap();
+        history.listing().unwrap();
+        let contains_secret = |directory: &Path| {
+            fs::read_dir(directory).unwrap().flatten().any(|entry| {
+                let bytes = fs::read(entry.path()).unwrap();
+                String::from_utf8_lossy(&bytes).contains("synthetic-private")
+            })
+        };
+        assert!(contains_secret(&directory.0));
+        let report = history.set_protection(true).unwrap();
+        assert_eq!((report.changed, report.failed), (2, 0));
+        assert!(!contains_secret(&directory.0));
+        assert_eq!(
+            history.load(&session.id).unwrap().personal_notes,
+            "synthetic-private-note"
+        );
+        // New saves stay protected, and a fresh store reads them.
+        let mut edited = history.load(&session.id).unwrap();
+        edited.personal_notes = "synthetic-private-edit".into();
+        history.save(edited).unwrap();
+        assert!(!contains_secret(&directory.0));
+        let reopened = directory.history();
+        assert_eq!(reopened.list().unwrap().len(), 1);
+        assert_eq!(reopened.set_protection(true).unwrap().changed, 0);
+        let files = reopened.quarantined().unwrap();
+        let exported = directory.0.join("damage.txt");
+        reopened
+            .export_quarantined(&files[0].file_name, &exported)
+            .unwrap();
+        assert_eq!(fs::read(&exported).unwrap(), b"synthetic-private-damage");
+        fs::remove_file(&exported).unwrap();
+        reopened.set_protection(false).unwrap();
+        let disk = fs::read_to_string(history.path(&session.id, "json").unwrap()).unwrap();
+        assert!(disk.contains("synthetic-private-edit"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn encryption_recovers_interrupted_saves_before_migrating() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = meeting();
+        session.personal_notes = "synthetic-private-committed".into();
+        let session = history.save(session).unwrap();
+        // An interrupted save left a plaintext temporary beside the record.
+        let mut newer = session.clone();
+        newer.personal_notes = "synthetic-private-temporary".into();
+        newer.updated_ms += 10;
+        fs::write(
+            history.path(&session.id, "tmp").unwrap(),
+            encode_record(&newer).unwrap(),
+        )
+        .unwrap();
+        let report = history.set_protection(true).unwrap();
+        assert_eq!(report.failed, 0);
+        for entry in fs::read_dir(&directory.0).unwrap().flatten() {
+            let bytes = fs::read(entry.path()).unwrap();
+            assert!(protect::is_sealed(&bytes), "{:?}", entry.file_name());
+        }
+        // The committed record is intact, so recovery kept it and removed the
+        // plaintext temporary instead of leaving it to be installed later.
+        assert!(!history.path(&session.id, "tmp").unwrap().exists());
+        assert_eq!(
+            history.load(&session.id).unwrap().personal_notes,
+            "synthetic-private-committed"
+        );
+        // A temporary that appears after the change is installed protected.
+        let mut later = newer.clone();
+        later.personal_notes = "synthetic-private-later".into();
+        later.updated_ms += 10;
+        fs::write(
+            history.path(&session.id, "tmp").unwrap(),
+            encode_record(&later).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(history.path(&session.id, "json").unwrap()).unwrap();
+        let reopened = directory.history().with_protection(true);
+        assert_eq!(
+            reopened.load(&session.id).unwrap().personal_notes,
+            "synthetic-private-later"
+        );
+        let main = fs::read(history.path(&session.id, "json").unwrap()).unwrap();
+        assert!(protect::is_sealed(&main));
+        assert!(contains_protected(&directory.0));
+    }
+
+    #[test]
+    fn saves_of_copies_older_than_a_restore_are_rejected() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = Session::new(Kind::Note);
+        session.personal_notes = "Before the restore.".into();
+        let open = history.save(session).unwrap();
+        let mut restored = open.clone();
+        restored.personal_notes = "Restored text.".into();
+        restored.updated_ms = open.updated_ms + 1000;
+        history.install(&restored).unwrap();
+        // The cached copy predates the restore: renaming it must not win.
+        let mut renamed = open.clone();
+        renamed.title = "Renamed".into();
+        let error = history.save(renamed).unwrap_err();
+        assert!(error.is::<StaleSave>());
+        assert_eq!(
+            history.load(&open.id).unwrap().personal_notes,
+            "Restored text."
+        );
+        // A reloaded copy saves normally.
+        let mut reloaded = history.load(&open.id).unwrap();
+        reloaded.title = "Renamed".into();
+        let saved = history.save(reloaded).unwrap();
+        assert_eq!(saved.personal_notes, "Restored text.");
+        let mut again = saved.clone();
+        again.personal_notes = "Edited after reload.".into();
+        history.save(again).unwrap();
+        assert!(!contains_protected(&directory.0));
+    }
+
+    fn describe(event: &Event) -> String {
+        match event {
+            Event::Failed(error) => format!("Failed({error})"),
+            Event::RestoreFinished(result) => format!(
+                "RestoreFinished({:?})",
+                result.as_ref().map(|restored| restored.updated.len())
+            ),
+            Event::Saved { id, .. } => format!("Saved({id})"),
+            Event::Listed(_) => "Listed".into(),
+            Event::ProtectionChanged(_) => "ProtectionChanged".into(),
+            _ => "Other".into(),
+        }
+    }
+
+    #[test]
+    fn worker_reports_stale_saves_without_retrying_them() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let session = history.save(Session::new(Kind::Note)).unwrap();
+        // Only the worker writes from here on, as in the app.
+        let worker = Worker::test_directory(directory.0.clone());
+        let mut restored = session.clone();
+        restored.updated_ms += 1000;
+        // The worker's own store installs the restored copy.
+        let path = directory.0.join("restore.articulate-backup");
+        {
+            let source = TestDirectory::new();
+            let archive_history = source.history();
+            archive_history.install(&restored).unwrap();
+            backup::create(
+                &archive_history,
+                &backup::Request {
+                    destination: path.clone(),
+                    passphrase: None,
+                    settings: serde_json::json!({}),
+                    library: crate::library::export(&[], &[]).unwrap(),
+                    include_audio: false,
+                },
+            )
+            .unwrap();
+        }
+        worker.restore(backup::RestoreRequest {
+            source: path,
+            passphrase: None,
+            replace_older: true,
+            include_settings: false,
+        });
+        worker.save(session.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut events = Vec::new();
+        while !events.iter().any(|event| matches!(event, Event::Failed(_))) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                events.iter().map(describe).collect::<Vec<_>>()
+            );
+            events.extend(worker.drain());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::RestoreFinished(Ok(restored)) if restored.updated.len() == 1
+            )),
+            "{:?}",
+            events.iter().map(describe).collect::<Vec<_>>()
+        );
+        assert!(worker.saves_settled().is_ok());
+    }
+
+    #[test]
+    fn protection_changes_are_queued_even_when_history_is_busy() {
+        let directory = TestDirectory::new();
+        let worker = Worker::test_directory(directory.0.clone());
+        {
+            let mut state = worker.shared.state.lock().unwrap();
+            while state.commands.len() < QUEUE_CAPACITY {
+                state.commands.push_back(Command::Quarantined);
+            }
+        }
+        assert!(worker.set_protection(false));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let events = worker.drain();
+            if let Some(result) = events.into_iter().find_map(|event| match event {
+                Event::ProtectionChanged(result) => Some(result),
+                _ => None,
+            }) {
+                assert!(result.is_ok());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(worker);
+    }
+
+    #[test]
+    fn startup_without_a_confirmed_choice_never_migrates() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let session = history.save(Session::new(Kind::Note)).unwrap();
+        let worker = Worker::start_directory_protected(directory.0.clone(), true, false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut events = Vec::new();
+        while !events.iter().any(|event| matches!(event, Event::Listed(_))) {
+            assert!(std::time::Instant::now() < deadline);
+            events.extend(worker.drain());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ProtectionChanged(_)))
+        );
+        drop(worker);
+        let bytes = fs::read(history.path(&session.id, "json").unwrap()).unwrap();
+        assert!(!protect::is_sealed(&bytes));
+    }
+
+    #[test]
+    fn retention_previews_then_deletes_only_eligible_unpinned_sessions() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let old = now_ms() - 40 * 24 * 60 * 60 * 1000;
+        let install = |kind, pinned| {
+            let mut session = Session::new(kind);
+            session.text = "Synthetic retained words.".into();
+            session.created_ms = old;
+            session.updated_ms = old;
+            session.pinned = pinned;
+            history.install(&session).unwrap();
+            session.id
+        };
+        let dictation = install(Kind::Dictation, false);
+        let pinned = install(Kind::Dictation, true);
+        let call = install(Kind::Call, false);
+        let active = install(Kind::Note, false);
+        let recent = history.save(meeting()).unwrap().id;
+        let policy = retention::Policy {
+            enabled: true,
+            days: 30,
+            calls: false,
+            ..Default::default()
+        };
+        let preview = history
+            .retention_preview(&policy, std::slice::from_ref(&active))
+            .unwrap();
+        assert_eq!(
+            preview.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            std::slice::from_ref(&dictation)
+        );
+        assert_eq!(history.list().unwrap().len(), 5);
+        // A stale editor copy cannot unpin a pinned session.
+        let mut stale = history.load(&pinned).unwrap();
+        stale.pinned = false;
+        history.save(stale).unwrap();
+        assert!(history.load(&pinned).unwrap().pinned);
+        let applied = history
+            .apply_retention(&policy, Some(&[dictation.clone(), recent.clone()]), &[])
+            .unwrap();
+        assert_eq!(applied.deleted, std::slice::from_ref(&dictation));
+        assert_eq!(applied.skipped, std::slice::from_ref(&recent));
+        assert!(history.load(&dictation).is_err());
+        for id in [&pinned, &call, &active, &recent] {
+            assert!(history.load(id).is_ok());
+        }
+        // Pinning is not an edit: it leaves the last-changed time alone.
+        let before = history.load(&pinned).unwrap().updated_ms;
+        history.set_pinned(&pinned, false).unwrap();
+        assert_eq!(history.load(&pinned).unwrap().updated_ms, before);
+        assert!(!history.load(&pinned).unwrap().pinned);
+        let preview = history.retention_preview(&policy, &[]).unwrap();
+        assert!(preview.iter().all(|s| s.id != call));
+    }
+
+    #[test]
+    fn leftover_call_audio_is_removed_but_current_and_unrelated_files_kept() {
+        let directory = TestDirectory::new();
+        fs::create_dir_all(&directory.0).unwrap();
+        let other = directory.0.join("99999999-3.wav");
+        let current = directory.0.join(format!("{}-1.wav", std::process::id()));
+        let unrelated = directory.0.join("notes.wav");
+        for path in [&other, &current, &unrelated] {
+            fs::write(path, b"RIFF").unwrap();
+        }
+        assert_eq!(remove_leftover_call_audio(&directory.0), 1);
+        assert!(!other.exists() && current.exists() && unrelated.exists());
+        assert_eq!(remove_leftover_call_audio(&directory.0.join("missing")), 0);
+    }
+
     #[test]
     fn session_ids_are_safe_and_unique() {
         let ids: BTreeSet<_> = (0..1000).map(|_| new_id()).collect();
@@ -2122,5 +4020,123 @@ mod tests {
             assert!(start.elapsed() < std::time::Duration::from_secs(5));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// Calls gained optional fields (speaker corrections, interruptions,
+    /// retained audio, earlier transcripts) without changing `SCHEMA`.
+    #[test]
+    fn call_fields_are_optional_and_round_trip_without_a_schema_change() {
+        use crate::calls::interruptions::{Cause, Source};
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let session = meeting();
+        let stored = serde_json::to_value(Stored {
+            schema: SCHEMA,
+            session: session.clone(),
+        })
+        .unwrap();
+        for field in [
+            "speaker_edits",
+            "interruptions",
+            "audio",
+            "transcript_versions",
+        ] {
+            assert!(stored["session"].get(field).is_none(), "{field} is omitted");
+        }
+        let path = history.path(&session.id, "json").unwrap();
+        fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        let mut loaded = history.load(&session.id).unwrap();
+        assert!(loaded.speaker_edits.is_empty() && loaded.audio.is_none());
+        assert!(loaded.interruptions.is_empty() && loaded.transcript_versions.is_empty());
+        let mut rows = loaded.rows.clone();
+        let mut names = loaded.speaker_names.clone();
+        let key = crate::speaker_edits::roster(&rows, &names)[0].key.clone();
+        let edit = crate::speaker_edits::rename(&mut rows, &mut names, &key, "Morgan").unwrap();
+        loaded.rows = rows;
+        loaded.speaker_names = names;
+        loaded.speaker_edits.push(edit);
+        loaded.interruptions.push(crate::calls::Interruption::new(
+            1000,
+            2000,
+            Source::Microphone,
+            Cause::DeviceLost,
+        ));
+        loaded.audio = Some(crate::audio_store::Info {
+            format: crate::audio_store::FORMAT.into(),
+            duration_ms: 3000,
+            bytes: 10,
+            channels: vec!["microphone".into(), "call".into()],
+            incomplete: false,
+        });
+        loaded
+            .transcript_versions
+            .push(TranscriptVersion::of(&session, "model.gguf"));
+        history.save(loaded.clone()).unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["schema"], SCHEMA);
+        let text = disk.to_string();
+        assert!(
+            !text.contains("private-user-fixture") && !text.contains("private-channel-fixture")
+        );
+        let reloaded = history.load(&session.id).unwrap();
+        assert_eq!(
+            reloaded.speaker_edits[0].summary,
+            "Renamed Élodie to Morgan"
+        );
+        assert_eq!(
+            crate::calls::label(&reloaded.rows[0], &reloaded.speaker_names),
+            "Morgan"
+        );
+        assert_eq!(reloaded.interruptions, loaded.interruptions);
+        assert_eq!(reloaded.audio, loaded.audio);
+        assert_eq!(reloaded.transcript_versions[0].text, session.text);
+        assert_eq!(reloaded.transcript_versions[0].model, "model.gguf");
+        // Undo after reopening restores the participant name.
+        let mut rows = reloaded.rows.clone();
+        let mut names = reloaded.speaker_names.clone();
+        crate::speaker_edits::undo(&mut rows, &mut names, &reloaded.speaker_edits[0]);
+        assert_eq!(crate::calls::label(&rows[0], &names), "Élodie");
+    }
+
+    #[test]
+    fn retained_audio_is_sealed_with_history_and_removed_by_retention() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = meeting();
+        session.created_ms = 1;
+        session.updated_ms = 1;
+        let audio = crate::audio_store::path(&directory.0, &session.id);
+        let recorder =
+            crate::audio_store::Recorder::start(audio.clone(), vec!["recording".into()], false)
+                .unwrap();
+        recorder.push(0, vec![0.1; 16_000]);
+        session.audio = Some(recorder.finish().unwrap());
+        history.install(&session).unwrap();
+        let plain = fs::read(&audio).unwrap();
+        let report = history.set_protection(true).unwrap();
+        assert!(report.changed >= 2, "record and audio: {report:?}");
+        let sealed = fs::read(&audio).unwrap();
+        assert_ne!(plain, sealed);
+        assert!(protect::is_sealed(&sealed[23..]));
+        assert_eq!(
+            crate::audio_store::read_all(&audio).unwrap()[0].len(),
+            16_000
+        );
+        history.set_protection(false).unwrap();
+        assert_eq!(fs::read(&audio).unwrap(), plain);
+        let policy = retention::Policy {
+            enabled: true,
+            days: 30,
+            ..Default::default()
+        };
+        let applied = history.apply_retention(&policy, None, &[]).unwrap();
+        assert_eq!(applied.deleted, std::slice::from_ref(&session.id));
+        assert!(!audio.exists(), "retention removes retained audio");
+        // A recording interrupted before it finished is also removed with its session.
+        let other = history.save(meeting()).unwrap();
+        let partial = directory.0.join(format!("{}.audio.recording", other.id));
+        fs::write(&partial, b"partial").unwrap();
+        history.delete(&other.id).unwrap();
+        assert!(!partial.exists());
     }
 }

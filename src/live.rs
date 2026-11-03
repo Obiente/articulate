@@ -101,8 +101,10 @@ pub mod win {
     use windows::Win32::UI::Accessibility::*;
 
     pub struct Session {
+        pub line_break: platform::LineBreak,
         pattern: IUIAutomationTextPattern,
         selected: String,
+        original_selection: String,
         pub before: String,
         current: String,
         prefix: String,
@@ -176,8 +178,10 @@ pub mod win {
                 );
                 let empty_placeholder = field.empty_placeholder();
                 Ok(Self {
+                    line_break: platform::LineBreak::Enter,
                     empty_placeholder,
                     pattern,
+                    original_selection: field.selected.clone(),
                     selected: field.selected,
                     current: field.document.clone(),
                     before: if empty_placeholder {
@@ -201,6 +205,9 @@ pub mod win {
                     &self.suffix,
                 )
             })
+        }
+        pub fn original_selection(&self) -> &str {
+            &self.original_selection
         }
         pub fn current(&self) -> &str {
             &self.current
@@ -366,17 +373,22 @@ pub mod win {
                     selected,
                     "The app did not confirm the selection. Live typing paused."
                 );
-                platform::replace_selection(target, new_tail, || {
-                    guard()
-                        && snapshot(&self.pattern).is_ok_and(|(field, _)| {
-                            field.matches(
-                                &self.current,
-                                &replacement_left,
-                                replacement_selected,
-                                &self.suffix,
-                            )
-                        })
-                })?;
+                platform::replace_selection_with_line_break(
+                    target,
+                    new_tail,
+                    self.line_break,
+                    || {
+                        guard()
+                            && snapshot(&self.pattern).is_ok_and(|(field, _)| {
+                                field.matches(
+                                    &self.current,
+                                    &replacement_left,
+                                    replacement_selected,
+                                    &self.suffix,
+                                )
+                            })
+                    },
+                )?;
                 let mut acknowledgement = super::OwnUpdate {
                     before: &self.current,
                     left: if replacing_placeholder {

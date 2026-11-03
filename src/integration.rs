@@ -2,6 +2,7 @@ use crate::{dictionary::Entry, platform::Target};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 pub enum Action {
+    LineBreak(crate::platform::LineBreak),
     Arm(u64, Target, bool),
     Preview {
         id: u64,
@@ -16,6 +17,12 @@ pub enum Action {
         learn: bool,
         cancel: transcribe_cpp::CancelToken,
     },
+    EditPrevious {
+        id: u64,
+        target: Target,
+        undo: bool,
+        cancel: transcribe_cpp::CancelToken,
+    },
     Cancel,
     StopLearning,
 }
@@ -23,6 +30,7 @@ pub enum Event {
     LiveSupport(u64, bool),
     Previewed(u64, Result<(), String>),
     Inserted(u64, Result<bool, String>),
+    Edited(u64, Result<(), String>),
     Learned(Entry, String),
 }
 
@@ -141,6 +149,7 @@ mod win {
         target: Target,
         field: IUIAutomationElement,
         live: Option<crate::live::win::Session>,
+        line_break: platform::LineBreak,
     }
     struct Watch {
         target: Target,
@@ -234,7 +243,7 @@ mod win {
         }
         false
     }
-    fn arm(ui: &IUIAutomation, id: u64, target: Target, use_live: bool) -> Result<Armed> {
+    fn arm(ui: &IUIAutomation, id: u64, target: Target, _use_live: bool) -> Result<Armed> {
         let field = unsafe { ui.GetFocusedElement() }
             .context("Windows could not read the focused field. Focus the editor and try again.")?;
         ensure!(
@@ -242,14 +251,13 @@ mod win {
             "Focus changed before dictation started."
         );
         editable(&field)?;
-        let live = use_live
-            .then(|| crate::live::win::Session::new(&field).ok())
-            .flatten();
+        let live = crate::live::win::Session::new(&field).ok();
         Ok(Armed {
             id,
             target,
             field,
             live,
+            line_break: platform::LineBreak::Enter,
         })
     }
     fn editable(field: &IUIAutomationElement) -> Result<()> {
@@ -309,16 +317,13 @@ mod win {
     }
     fn insert(
         ui: &IUIAutomation,
-        armed: Option<Armed>,
+        armed: &mut Armed,
         id: u64,
         target: Target,
         text: &str,
         learn: bool,
         cancel: &transcribe_cpp::CancelToken,
     ) -> Result<Option<Watch>> {
-        let mut armed = armed.context(
-            "The text field changed or could not be identified. Your transcript is ready to copy.",
-        )?;
         ensure!(
             armed.id == id && armed.target == target && same(ui, target, &armed.field),
             "Focus changed. Your transcript is ready to copy."
@@ -331,7 +336,7 @@ mod win {
             return Ok(if learn {
                 learning::Span::inserted(&live.before, live.current(), text).map(|span| Watch {
                     target,
-                    field: armed.field,
+                    field: armed.field.clone(),
                     span,
                     pending: text.into(),
                     changed: Instant::now(),
@@ -342,7 +347,7 @@ mod win {
             });
         }
         let before = if learn { contents(&armed.field) } else { None };
-        platform::insert(target, text, || {
+        platform::insert_with_line_break(target, text, armed.line_break, || {
             !cancel.is_cancelled() && same(ui, target, &armed.field)
         })?;
         let Some(before) = before else {
@@ -359,7 +364,7 @@ mod win {
             {
                 return Ok(Some(Watch {
                     target,
-                    field: armed.field,
+                    field: armed.field.clone(),
                     span,
                     pending: text.into(),
                     changed: Instant::now(),
@@ -369,29 +374,85 @@ mod win {
         }
         Ok(None)
     }
+    fn receive_action(
+        rx: &Receiver<Action>,
+        observing: bool,
+        since_poll: Duration,
+    ) -> Result<Action, mpsc::RecvTimeoutError> {
+        if observing {
+            rx.recv_timeout(Duration::from_millis(300).saturating_sub(since_poll))
+        } else {
+            rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        }
+    }
+
     pub fn run(rx: Receiver<Action>, emit: impl Fn(Event)) {
         // COM objects stay on this MTA worker. A slow provider never blocks the UI/audio thread.
         let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
         let _com = initialized.then_some(Com);
         let ui = initialized.then(automation).and_then(Result::ok);
         let mut armed: Option<Armed> = None;
+        let mut previous: Option<(Armed, crate::macros::InsertionHistory)> = None;
+        let mut line_break = platform::LineBreak::Enter;
         let mut insertion_failure: Option<String> = None;
         let mut watch: Option<Watch> = None;
         let mut polled = Instant::now();
         loop {
-            match rx.recv_timeout(Duration::from_millis(50)) {
+            match receive_action(&rx, armed.is_some() || watch.is_some(), polled.elapsed()) {
                 Ok(Action::Cancel) => {
                     armed = None;
                     insertion_failure = None;
                     watch = None;
                 }
+                Ok(Action::EditPrevious {
+                    id,
+                    target,
+                    undo,
+                    cancel,
+                }) => {
+                    watch = None;
+                    armed = None;
+                    let result = (|| -> Result<()> {
+                        let ui = ui
+                            .as_ref()
+                            .context("Windows text-field access is unavailable")?;
+                        let (a, history) = previous
+                            .as_mut()
+                            .context("Nothing to edit in the previous field.")?;
+                        ensure!(
+                            a.target == target && same(ui, target, &a.field),
+                            "The target field changed. Previous dictation was left unchanged."
+                        );
+                        editable(&a.field)?;
+                        let live = a
+                            .live
+                            .as_mut()
+                            .context("This field does not support verified spoken edits.")?;
+                        let replacement = history.replacement(undo)?;
+                        live.update(target, &replacement, || {
+                            !cancel.is_cancelled() && same(ui, target, &a.field)
+                        })?;
+                        history.commit(replacement);
+                        Ok(())
+                    })()
+                    .map_err(|e| format!("{e:#}"));
+                    emit(Event::Edited(id, result));
+                }
                 Ok(Action::StopLearning) => watch = None,
+                Ok(Action::LineBreak(value)) => line_break = value,
                 Ok(Action::Arm(id, target, use_live)) => {
                     watch = None;
                     let result = ui
                         .as_ref()
                         .context("Windows text-field access is unavailable")
-                        .and_then(|ui| arm(ui, id, target, use_live));
+                        .and_then(|ui| arm(ui, id, target, use_live))
+                        .map(|mut armed| {
+                            armed.line_break = line_break;
+                            if let Some(live) = &mut armed.live {
+                                live.line_break = line_break;
+                            }
+                            armed
+                        });
                     insertion_failure = result.as_ref().err().map(|error| format!("{error:#}"));
                     armed = result.ok();
                     if use_live {
@@ -454,7 +515,30 @@ mod win {
                             }
                             Ok(ui)
                         })
-                        .and_then(|ui| insert(ui, armed.take(), id, target, &text, learn, &cancel));
+                        .and_then(|ui| {
+                            let a = armed
+                                .as_mut()
+                                .context("The text field changed or could not be identified.")?;
+                            insert(ui, a, id, target, &text, learn, &cancel)
+                        });
+                    if result.is_ok() {
+                        previous = armed.take().map(|a| {
+                            let before = a
+                                .live
+                                .as_ref()
+                                .map(|live| live.original_selection().to_owned());
+                            (
+                                a,
+                                crate::macros::InsertionHistory::new(
+                                    text.clone(),
+                                    before.unwrap_or_default(),
+                                ),
+                            )
+                        });
+                    } else {
+                        armed = None;
+                        previous = None;
+                    }
                     let result = result
                         .map(|next| {
                             let learning = next.is_some();
@@ -520,6 +604,25 @@ mod win {
     #[cfg(test)]
     mod live_tests {
         use super::*;
+
+        #[test]
+        fn idle_commands_disconnect_and_observation_deadlines_wake_the_worker() {
+            let (tx, rx) = mpsc::channel();
+            let waiting = std::thread::spawn(move || receive_action(&rx, false, Duration::ZERO));
+            tx.send(Action::Cancel).unwrap();
+            assert!(matches!(waiting.join().unwrap(), Ok(Action::Cancel)));
+
+            let (tx, rx) = mpsc::channel::<Action>();
+            assert!(matches!(
+                receive_action(&rx, true, Duration::from_millis(300)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(tx);
+            assert!(matches!(
+                receive_action(&rx, false, Duration::ZERO),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            ));
+        }
 
         #[test]
         #[ignore = "Interactive: focus an empty disposable TextPattern field; this test replaces its dictated text repeatedly"]
