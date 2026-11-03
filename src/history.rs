@@ -757,6 +757,16 @@ impl History {
         self.save_inner(session, true)
     }
 
+    /// Apply `change` to the latest stored copy of `id` and save it. The
+    /// change checks what it relies on and fails rather than overwrite.
+    pub fn update(&self, id: &str, change: Change) -> Result<Session> {
+        let mut session = self
+            .recover(id)?
+            .context("This history item is no longer available")?;
+        change(&mut session)?;
+        self.save(session)
+    }
+
     fn save_inner(&self, mut session: Session, preserve_membership: bool) -> Result<Session> {
         validate(&session)?;
         ensure!(
@@ -1119,9 +1129,11 @@ impl History {
     /// Remove every copy of a deleted record. `corrupt` lists its quarantined
     /// files when the caller already enumerated the directory.
     fn remove_copies(&self, id: &str, corrupt: Option<&[PathBuf]>) -> Result<()> {
-        for suffix in ["json", "bak", "tmp", "audio", "audio.recording"] {
+        for suffix in ["json", "bak", "tmp"] {
             remove_if_present(&self.path(id, suffix)?)?;
         }
+        // Retained audio, an unfinished recording and rewrite temporaries.
+        crate::audio_store::remove(&self.directory, id)?;
         match corrupt {
             Some(paths) => {
                 for path in paths {
@@ -1313,9 +1325,13 @@ impl History {
     /// this is called again. In-flight `.tmp` files are left to recovery.
     pub fn set_protection(&self, protect: bool) -> Result<MigrationReport> {
         self.protect.store(protect, Ordering::Release);
+        // Retained audio is sealed segment by segment, and leftovers of an
+        // interrupted rewrite are removed; recordings follow their recorder.
+        let audio = crate::audio_store::set_protection(&self.directory, protect)?;
         let mut report = MigrationReport {
             protect,
-            ..Default::default()
+            changed: audio.changed,
+            failed: audio.failed,
         };
         for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
@@ -1325,15 +1341,6 @@ impl History {
             let Some((id, suffix)) = name.split_once('.') else {
                 continue;
             };
-            if valid_id(id) && suffix == "audio" {
-                // Retained audio is sealed segment by segment.
-                match crate::audio_store::reprotect(&entry.path(), protect) {
-                    Ok(true) => report.changed += 1,
-                    Ok(false) => {}
-                    Err(_) => report.failed += 1,
-                }
-                continue;
-            }
             let eligible = valid_id(id)
                 && (matches!(suffix, "json" | "bak") || parse_quarantine_name(&name).is_some());
             if !eligible {
@@ -1811,12 +1818,16 @@ pub enum Event {
     MarkdownExported(Result<backup::Exported, String>),
 }
 
+/// A change to the latest stored copy of one session; see `Worker::update`.
+pub type Change = Box<dyn FnOnce(&mut Session) -> Result<()> + Send>;
+
 enum Command {
     Insights,
     List,
     Load(String),
     MoveSource(String, crate::topics::Destination, Option<String>),
     Save(PendingSave),
+    Update(String, Change),
     Delete(String),
     Quarantined,
     RestoreQuarantined(String),
@@ -1955,6 +1966,12 @@ impl Worker {
             revision: NEXT_SAVE.fetch_add(1, Ordering::Relaxed),
             session: Box::new(session),
         }));
+    }
+    /// Apply `change` to the latest stored copy of `id`, after saves already
+    /// queued, and save the result. Replies with `Saved`, or `Failed` with the
+    /// change's error.
+    pub fn update(&self, id: String, change: Change) {
+        self.enqueue(Command::Update(id, change));
     }
     pub fn delete(&self, id: String) {
         self.enqueue(Command::Delete(id));
@@ -2234,6 +2251,13 @@ fn history_worker(
                     .map(|session| Event::Loaded(Box::new(session))),
                 Command::Save(pending) => {
                     history.save(*pending.session).map(|session| Event::Saved {
+                        id: session.id.clone(),
+                        updated_ms: session.updated_ms,
+                        summary: Box::new(Summary::from(&session)),
+                    })
+                }
+                Command::Update(id, change) => {
+                    history.update(&id, change).map(|session| Event::Saved {
                         id: session.id.clone(),
                         updated_ms: session.updated_ms,
                         summary: Box::new(Summary::from(&session)),

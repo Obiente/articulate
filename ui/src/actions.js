@@ -224,6 +224,26 @@ const validators = {
   person_save(action) {
     validSpeakerName(action.name);
   },
+  // Destructive actions repeat what their confirmation showed; the
+  // controller refuses them when it no longer matches.
+  audio_delete(action) {
+    if (
+      action.confirm?.id !== action.id ||
+      !Number.isSafeInteger(action.confirm?.bytes)
+    )
+      throw Error("Confirm deleting the kept audio first.");
+  },
+  people_clear(action) {
+    if (!Number.isSafeInteger(action.confirm?.count))
+      throw Error("Confirm forgetting everyone first.");
+  },
+  transcript_restore(action) {
+    if (
+      typeof action.version !== "string" ||
+      typeof action.expected !== "string"
+    )
+      throw Error("Choose an earlier transcript to restore.");
+  },
 };
 
 // Names chosen for speakers. Messages match the native controller's.

@@ -144,6 +144,8 @@ pub(crate) struct AudioView<'a> {
 
 #[derive(Serialize)]
 pub(crate) struct VersionView<'a> {
+    /// What `transcript_restore` names; unlike `index`, it never changes.
+    id: String,
     index: usize,
     replaced_ms: u64,
     model: &'a str,
@@ -158,6 +160,9 @@ pub(crate) struct SessionCalls<'a> {
     speaker_undo: Option<&'a str>,
     audio: Option<AudioView<'a>>,
     transcript_versions: Vec<VersionView<'a>>,
+    /// The current transcript's revision, echoed by `transcript_restore`;
+    /// present when there are earlier versions to restore.
+    transcript_revision: Option<String>,
 }
 
 fn preview(text: &str) -> &str {
@@ -196,12 +201,15 @@ impl<'a> SessionCalls<'a> {
                 .iter()
                 .enumerate()
                 .map(|(index, version)| VersionView {
+                    id: crate::app::call_tools::version_id(version),
                     index,
                     replaced_ms: version.replaced_ms,
                     model: &version.model,
                     preview: preview(&version.text),
                 })
                 .collect(),
+            transcript_revision: (!session.transcript_versions.is_empty())
+                .then(|| crate::app::call_tools::transcript_revision(session)),
         }
     }
 }

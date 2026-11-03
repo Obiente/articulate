@@ -714,6 +714,7 @@ impl App {
             }
         } else {
             if self.busy
+                || self.calls_file_job_running()
                 || self.loading
                 || !self.ready
                 || self.downloading.is_some()
@@ -890,7 +891,7 @@ impl App {
         self.hold_recording = false;
         self.shortcut_gesture = Default::default();
         self.live_mode = false;
-        self.busy = false;
+        self.busy = self.calls_file_job_running();
         self.preview_inflight = false;
         self.chunk_inflight = false;
         self.integration_inflight = false;
@@ -1172,14 +1173,7 @@ impl App {
                         for annotation in &self.call_context {
                             crate::sensevoice::apply_existing(&mut rows, annotation);
                         }
-                        self.calls_prepare_rows(&mut rows);
-                        if self.is_note_capture() {
-                            // Keep source identities and timestamps immutable so
-                            // live note updates can reuse earlier model sections.
-                            self.call_committed.extend(rows);
-                        } else {
-                            calls::append_rows(&mut self.call_committed, rows);
-                        }
+                        self.calls_commit_rows(rows);
                         self.call_rows.clone_from(&self.call_committed);
                         self.refresh_call_notes();
                         self.history_call_changed();
@@ -1188,9 +1182,7 @@ impl App {
                         for annotation in &self.call_context {
                             crate::sensevoice::apply_existing(&mut rows, annotation);
                         }
-                        self.calls_prepare_rows(&mut rows);
-                        self.call_rows.clone_from(&self.call_committed);
-                        calls::append_rows(&mut self.call_rows, rows);
+                        self.calls_preview_rows(rows);
                         self.refresh_call_notes();
                         self.history_call_changed();
                     }
@@ -1675,6 +1667,10 @@ impl App {
         language_preference: Option<String>,
         audio_context: Option<bool>,
     ) -> bool {
+        if self.calls_file_job_running() {
+            self.call_status = "Wait for the import or re-transcription to finish.".into();
+            return false;
+        }
         let native_audio = match calls::select_native_source(
             !microphone_only && separate_discord_audio,
             self.discord

@@ -466,10 +466,9 @@ impl App {
                     self.history_notify(format!("{error} ({file_name})"), true);
                 }
                 HistoryEvent::Pinned(summary) => self.history.upsert(*summary),
-                HistoryEvent::ProtectionChanged(result) => {
-                    self.history.storage.encryption_working = false;
-                    self.history.protection = Some(result);
-                }
+                // Reported once known people and recordings in progress
+                // have converted too (see call_tools).
+                HistoryEvent::ProtectionChanged(result) => self.calls_protection_changed(result),
                 HistoryEvent::RetentionPreview(result) => {
                     self.history.storage.retention_preview_working = false;
                     self.history.retention_preview = Some(result);
@@ -779,11 +778,9 @@ impl App {
             return Err(format!("Could not save preferences: {error}"));
         }
         worker.set_protection(enabled);
-        // Known people follow the same protection; retained audio is
-        // migrated with the history files.
-        if let Err(error) = self.call_tools.people.set_protection(enabled) {
-            log::warn!("{error:#}");
-        }
+        // Known people and recordings in progress follow the same protection;
+        // retained audio is migrated with the history files.
+        self.calls_set_protection(enabled);
         self.history.protection = None;
         self.history.storage.encryption_working = true;
         Ok(())

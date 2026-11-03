@@ -8,16 +8,71 @@
 use crate::audio::StreamingResampler;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
+    io::{Read, Seek},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
 };
 use symphonia::core::{
     codecs::audio::AudioDecoderOptions,
     errors::Error,
     formats::{FormatOptions, TrackType, probe::Hint},
-    io::{MediaSourceStream, MediaSourceStreamOptions},
+    io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions},
     meta::MetadataOptions,
 };
+
+/// Asked while a file is read and decoded; `true` stops with "Import cancelled".
+pub type Cancel = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// A `Cancel` that never stops.
+pub fn uncancelled() -> Cancel {
+    Arc::new(|| false)
+}
+
+const CANCELLED: &str = "Import cancelled";
+
+/// A file whose reads fail once decoding is cancelled, so probing or
+/// scanning a large file stops too, not only the packet loop.
+struct Source {
+    file: std::fs::File,
+    cancel: Cancel,
+}
+
+impl Read for Source {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if (self.cancel)() {
+            return Err(std::io::Error::other(CANCELLED));
+        }
+        self.file.read(buffer)
+    }
+}
+
+impl Seek for Source {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        if (self.cancel)() {
+            return Err(std::io::Error::other(CANCELLED));
+        }
+        self.file.seek(position)
+    }
+}
+
+impl MediaSource for Source {
+    fn is_seekable(&self) -> bool {
+        self.file.is_seekable()
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.file.byte_len()
+    }
+}
+
+/// What a stream must hold, checked while it is decoded: a retained audio
+/// segment is never decoded past the length its header states.
+#[derive(Clone, Copy, Debug)]
+pub struct Limit {
+    pub rate: u32,
+    pub channels: usize,
+    pub frames: u64,
+}
 
 /// File extensions offered for import.
 pub const EXTENSIONS: &[&str] = &[
@@ -59,7 +114,7 @@ pub enum Layout {
 pub fn decode_file(
     path: &Path,
     layout: Layout,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     progress: impl FnMut(f32),
 ) -> Result<Decoded> {
     let mut channels: Vec<Vec<f32>> = Vec::new();
@@ -78,27 +133,34 @@ pub fn decode_file(
 pub fn stream_file(
     path: &Path,
     layout: Layout,
-    cancel: &AtomicBool,
+    cancel: &Cancel,
     progress: impl FnMut(f32),
     sink: impl FnMut(Vec<Vec<f32>>) -> Result<()>,
 ) -> Result<usize> {
+    ensure!(!cancel(), CANCELLED);
     let file = std::fs::File::open(path).context("Could not open the audio file")?;
     let mut hint = Hint::new();
     if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(extension);
     }
+    let source = Source {
+        file,
+        cancel: cancel.clone(),
+    };
     decode(
-        MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default()),
+        MediaSourceStream::new(Box::new(source), MediaSourceStreamOptions::default()),
         hint,
         layout,
-        cancel,
+        None,
+        &**cancel,
         progress,
         sink,
     )
 }
 
-/// Decode an in-memory FLAC stream (one retained audio segment).
-pub fn decode_flac(bytes: Vec<u8>, layout: Layout) -> Result<Decoded> {
+/// Decode an in-memory FLAC stream (one retained audio segment) that must
+/// fit `limit`; anything else is an error.
+pub fn decode_flac(bytes: Vec<u8>, limit: Limit) -> Result<Decoded> {
     let mut hint = Hint::new();
     hint.with_extension("flac");
     let mut channels: Vec<Vec<f32>> = Vec::new();
@@ -108,8 +170,9 @@ pub fn decode_flac(bytes: Vec<u8>, layout: Layout) -> Result<Decoded> {
             MediaSourceStreamOptions::default(),
         ),
         hint,
-        layout,
-        &AtomicBool::new(false),
+        Layout::Planar(limit.channels),
+        Some(limit),
+        &|| false,
         |_| {},
         |chunk| {
             channels.resize(chunk.len(), Vec::new());
@@ -131,14 +194,24 @@ fn unsupported(error: Error) -> anyhow::Error {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode(
     stream: MediaSourceStream,
     hint: Hint,
     layout: Layout,
-    cancel: &AtomicBool,
+    limit: Option<Limit>,
+    cancel: &dyn Fn() -> bool,
     mut progress: impl FnMut(f32),
     mut sink: impl FnMut(Vec<Vec<f32>>) -> Result<()>,
 ) -> Result<usize> {
+    // A read failed by cancellation surfaces as an I/O error from Symphonia.
+    let failed = |error: Error| {
+        if cancel() {
+            anyhow::anyhow!(CANCELLED)
+        } else {
+            unsupported(error)
+        }
+    };
     let mut format = symphonia::default::get_probe()
         .probe(
             &hint,
@@ -146,7 +219,7 @@ fn decode(
             FormatOptions::default(),
             MetadataOptions::default(),
         )
-        .map_err(unsupported)?;
+        .map_err(failed)?;
     let track = format
         .default_track(TrackType::Audio)
         .context("This file has no audio track")?;
@@ -158,9 +231,20 @@ fn decode(
         .and_then(|parameters| parameters.audio())
         .context("This file's audio codec is not supported")?
         .clone();
+    if let Some(limit) = limit {
+        ensure!(
+            parameters.sample_rate.is_none_or(|rate| rate == limit.rate)
+                && parameters
+                    .channels
+                    .as_ref()
+                    .is_none_or(|channels| channels.count() == limit.channels)
+                && total_frames.is_none_or(|total| total <= limit.frames),
+            "The audio stream does not match its stated format"
+        );
+    }
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&parameters, &AudioDecoderOptions::default())
-        .map_err(unsupported)?;
+        .map_err(failed)?;
     let outputs = match layout {
         Layout::Mono => 1,
         Layout::Planar(count) => count.max(1),
@@ -173,15 +257,16 @@ fn decode(
     let mut planes: Vec<Vec<f32>> = Vec::new();
     let mut mixed = Vec::new();
     loop {
-        ensure!(!cancel.load(Ordering::Relaxed), "Import cancelled");
+        ensure!(!cancel(), CANCELLED);
         let packet = match format.next_packet() {
             Ok(Some(packet)) => packet,
             Ok(None) => break,
+            Err(Error::IoError(_)) if cancel() => bail!(CANCELLED),
             Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break;
             }
             Err(Error::ResetRequired) => bail!("This file changes audio format part way through"),
-            Err(error) => return Err(unsupported(error)),
+            Err(error) => return Err(failed(error)),
         };
         if packet.track_id != track_id {
             continue;
@@ -190,10 +275,16 @@ fn decode(
             Ok(buffer) => buffer,
             // A damaged packet is skipped, as players do.
             Err(Error::DecodeError(_)) | Err(Error::IoError(_)) => continue,
-            Err(error) => return Err(unsupported(error)),
+            Err(error) => return Err(failed(error)),
         };
         let spec_rate = buffer.spec().rate();
         let spec_channels = buffer.spec().channels().count().max(1);
+        if let Some(limit) = limit {
+            ensure!(
+                spec_rate == limit.rate && spec_channels == limit.channels,
+                "The audio stream does not match its stated format"
+            );
+        }
         if converters.is_empty() {
             rate = spec_rate;
             source_channels = spec_channels;
@@ -211,6 +302,12 @@ fn decode(
         buffer.copy_to_vecs_planar::<f32>(&mut planes);
         let frames = planes.first().map_or(0, Vec::len);
         decoded_frames += frames as u64;
+        if let Some(limit) = limit {
+            ensure!(
+                decoded_frames <= limit.frames,
+                "The audio stream is longer than its stated length"
+            );
+        }
         ensure!(
             decoded_frames / u64::from(rate.max(1)) <= MAX_SECONDS,
             "Recordings longer than four hours cannot be imported"
@@ -299,10 +396,7 @@ pub(crate) mod tests {
         }
         writer.finalize().unwrap();
         let mut seen = Vec::new();
-        let mono = decode_file(&path, Layout::Mono, &AtomicBool::new(false), |p| {
-            seen.push(p)
-        })
-        .unwrap();
+        let mono = decode_file(&path, Layout::Mono, &uncancelled(), |p| seen.push(p)).unwrap();
         assert_eq!(mono.channels.len(), 1);
         assert_eq!(mono.channels[0].len(), 24_000);
         assert_eq!(mono.duration_ms(), 1500);
@@ -312,13 +406,80 @@ pub(crate) mod tests {
             "mono averages channels: {peak}"
         );
         assert_eq!(seen.last(), Some(&1.0));
-        let planar =
-            decode_file(&path, Layout::Planar(3), &AtomicBool::new(false), |_| {}).unwrap();
+        let planar = decode_file(&path, Layout::Planar(3), &uncancelled(), |_| {}).unwrap();
         assert_eq!(planar.channels.len(), 3);
         assert!(planar.channels[1].iter().all(|s| s.abs() < 1e-3));
         assert!(planar.channels[2].iter().all(|s| *s == 0.0));
-        assert!(decode_file(&path, Layout::Mono, &AtomicBool::new(true), |_| {}).is_err());
         let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn the_job_cancellation_stops_probing_and_decoding() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let folder = directory("cancel");
+        let path = folder.join("long.wav");
+        let mut writer = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for sample in tone(20.0, 16_000, 300.0) {
+            writer.write_sample((sample * 32767.0) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        // Cancelled before probing: no format is examined.
+        let cancelled: Cancel = Arc::new(|| true);
+        let error = decode_file(&path, Layout::Mono, &cancelled, |_| {})
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "Import cancelled");
+        // Cancelled part way: the job's flag is seen while reading packets.
+        let flag = Arc::new(AtomicBool::new(false));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let observed = (flag.clone(), checks.clone());
+        let cancel: Cancel = Arc::new(move || {
+            observed.1.fetch_add(1, Ordering::Relaxed);
+            observed.0.load(Ordering::Relaxed)
+        });
+        let mut chunks = 0;
+        let error = stream_file(
+            &path,
+            Layout::Mono,
+            &cancel,
+            |_| {},
+            |_| {
+                chunks += 1;
+                flag.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "Import cancelled");
+        assert_eq!(chunks, 1, "decoding stopped after the cancellation");
+        assert!(checks.load(Ordering::Relaxed) > 1);
+        let _ = std::fs::remove_dir_all(folder);
+    }
+
+    #[test]
+    fn a_limited_stream_must_match_and_never_decodes_past_its_length() {
+        let limit = |frames| Limit {
+            rate: 16_000,
+            channels: 1,
+            frames,
+        };
+        let one = crate::audio_store::tests::flac(&[tone(1.25, 16_000, 220.0)]);
+        let decoded = decode_flac(one.clone(), limit(20_000)).unwrap();
+        assert_eq!(decoded.channels.len(), 1);
+        assert_eq!(decoded.channels[0].len(), 20_000);
+        assert!(decode_flac(one, limit(8_000)).is_err());
+        let two = crate::audio_store::tests::flac(&[vec![0.1; 8_000], vec![0.2; 8_000]]);
+        assert!(decode_flac(two, limit(8_000)).is_err());
     }
 
     #[test]
@@ -326,7 +487,7 @@ pub(crate) mod tests {
         let folder = directory("bad");
         let path = folder.join("notes.mp3");
         std::fs::write(&path, b"this is not audio at all").unwrap();
-        let error = decode_file(&path, Layout::Mono, &AtomicBool::new(false), |_| {})
+        let error = decode_file(&path, Layout::Mono, &uncancelled(), |_| {})
             .err()
             .unwrap()
             .to_string();

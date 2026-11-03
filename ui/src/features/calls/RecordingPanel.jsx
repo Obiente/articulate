@@ -72,6 +72,7 @@ export function RecordingPanel({ session, importState, act, locked, live }) {
               size="compact-xs"
               variant="light"
               leftSection={<Play size={12} weight="fill" />}
+              disabled={busy}
               onClick={() =>
                 void run({ type: "audio_play", id: session.id, from_ms: 0 })
               }
@@ -82,7 +83,7 @@ export function RecordingPanel({ session, importState, act, locked, live }) {
               size="compact-xs"
               variant="subtle"
               leftSection={<ArrowsClockwise size={13} />}
-              disabled={locked || rebuilding || otherJob}
+              disabled={busy || locked || rebuilding || otherJob}
               onClick={() => setConfirming("rebuild")}
             >
               Re-transcribe
@@ -92,7 +93,7 @@ export function RecordingPanel({ session, importState, act, locked, live }) {
               variant="subtle"
               color="red"
               leftSection={<Trash size={13} />}
-              disabled={locked || rebuilding}
+              disabled={busy || locked || rebuilding}
               onClick={() => setConfirming("delete")}
             >
               Delete audio
@@ -114,6 +115,7 @@ export function RecordingPanel({ session, importState, act, locked, live }) {
             size="compact-xs"
             variant="subtle"
             color="gray"
+            disabled={busy}
             onClick={() => void run({ type: "audio_import_cancel" })}
           >
             Cancel
@@ -126,7 +128,7 @@ export function RecordingPanel({ session, importState, act, locked, live }) {
             Earlier transcripts
           </Text>
           {versions.map((version) => (
-            <div className="transcript-version" key={version.index}>
+            <div className="transcript-version" key={version.id}>
               <ClockCounterClockwise size={15} />
               <span title={version.preview}>
                 Replaced {formatDate(version.replaced_ms)}
@@ -135,12 +137,13 @@ export function RecordingPanel({ session, importState, act, locked, live }) {
               <Button
                 size="compact-xs"
                 variant="subtle"
-                disabled={locked || rebuilding}
+                disabled={busy || locked || rebuilding}
                 onClick={() =>
                   void run({
                     type: "transcript_restore",
                     id: session.id,
-                    index: version.index,
+                    version: version.id,
+                    expected: session.transcript_revision,
                   })
                 }
               >
@@ -172,7 +175,11 @@ export function RecordingPanel({ session, importState, act, locked, live }) {
             onClick={async () => {
               const done = await run(
                 confirming === "delete"
-                  ? { type: "audio_delete", id: session.id }
+                  ? {
+                      type: "audio_delete",
+                      id: session.id,
+                      confirm: { id: session.id, bytes: audio.bytes },
+                    }
                   : { type: "transcript_rebuild", id: session.id },
               );
               if (done) setConfirming(null);

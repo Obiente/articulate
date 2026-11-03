@@ -46,7 +46,18 @@ pub struct Row {
 // Bundle natural continuations without hiding a later turn's own timestamp.
 const ROW_CONTINUATION_GAP_MS: u64 = 1200;
 
-pub fn append_rows(transcript: &mut Vec<Row>, mut incoming: Vec<Row>) {
+pub fn append_rows(transcript: &mut Vec<Row>, incoming: Vec<Row>) {
+    append_rows_where(transcript, incoming, |_, _| true);
+}
+
+/// `append_rows`, where a row continues the last one only if `continues`
+/// also allows it. Live calls use this to keep a corrected turn from
+/// absorbing speech that arrives after the correction.
+pub fn append_rows_where(
+    transcript: &mut Vec<Row>,
+    mut incoming: Vec<Row>,
+    mut continues: impl FnMut(&Row, &Row) -> bool,
+) {
     incoming.sort_by_key(|row| row.start_ms);
     for row in incoming {
         if transcript
@@ -74,6 +85,7 @@ pub fn append_rows(transcript: &mut Vec<Row>, mut incoming: Vec<Row>) {
                 (None, None) => last.speakers == row.speakers,
                 _ => false,
             }
+            && continues(last, &row)
         {
             if !last.text.is_empty() && !row.text.is_empty() {
                 last.text.push(' ');

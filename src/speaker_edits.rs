@@ -8,10 +8,13 @@
 //! that do not know about corrections.
 //!
 //! Each edit keeps a compact inverse: the previous identity of the rows it
-//! changed and, when they changed, the previous acoustic names. The most recent
-//! edits are saved with the session so they can be undone after reopening it.
-//! Named participants are restored without their Discord identifiers, which are
-//! never written to history.
+//! changed and, when they changed, the previous acoustic names. During a live
+//! call, rows that a merge or participant rename re-attributes as they arrive
+//! are added to that edit's inverse with the speaker they arrived with, so
+//! undo restores them as well. The most recent edits are saved with the
+//! session so they can be undone after reopening it. Named participants are
+//! restored without their Discord identifiers, which are never written to
+//! history.
 use crate::{
     calls::Row,
     discord_attribution::{Attribution, NamedSpeaker},
@@ -69,12 +72,18 @@ impl Speaker {
 /// The previous identity of one changed row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RowBefore {
+    /// Where the row was; rows found elsewhere are matched by `start_ms`.
     pub index: usize,
     /// Guards against restoring onto a different row.
     pub start_ms: u64,
     pub microphone: bool,
     pub speakers: Vec<i32>,
     pub discord: Option<Attribution>,
+    /// Set while recording for a row a live rule re-attributed when it
+    /// arrived: which rules changed it and from which speaker. Later speech
+    /// only continues a row with the same provenance.
+    #[serde(skip)]
+    pub arrival: Option<String>,
 }
 
 impl RowBefore {
@@ -85,6 +94,19 @@ impl RowBefore {
             microphone: row.microphone,
             speakers: row.speakers.clone(),
             discord: row.discord.clone(),
+            arrival: None,
+        }
+    }
+
+    fn identity(&self, start_ms: u64) -> Row {
+        Row {
+            cues: Vec::new(),
+            start_ms,
+            end_ms: start_ms,
+            microphone: self.microphone,
+            speakers: self.speakers.clone(),
+            discord: self.discord.clone(),
+            text: String::new(),
         }
     }
 }
@@ -93,8 +115,19 @@ impl RowBefore {
 /// participant rename also covers speech that has not been transcribed yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveRule {
+    /// Ties the rule to its edit, whose inverse records rows it changes.
+    pub id: u64,
     pub from: String,
     pub to: Voice,
+}
+
+fn rule(from: String, to: Voice) -> LiveRule {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    LiveRule {
+        id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        from,
+        to,
+    }
 }
 
 /// The inverse of one correction.
@@ -394,10 +427,7 @@ pub fn rename(
             let mut before = Vec::new();
             substitute(rows, names, &current.key, &renamed, &mut before);
             let mut edit = edit(summary, None, before);
-            edit.rule = Some(LiveRule {
-                from: current.key.clone(),
-                to: renamed,
-            });
+            edit.rule = Some(rule(current.key.clone(), renamed));
             Ok(edit)
         }
         Voice::You => unreachable!("checked as not renamable"),
@@ -417,10 +447,7 @@ pub fn merge(rows: &mut [Row], names: &mut [String], from: &str, into: &str) -> 
         None,
         before,
     );
-    edit.rule = Some(LiveRule {
-        from: source.key,
-        to: target.voice,
-    });
+    edit.rule = Some(rule(source.key, target.voice));
     Ok(edit)
 }
 
@@ -489,17 +516,34 @@ pub fn reassign(
     ))
 }
 
-/// Restore what `edit` changed. Rows that no longer match are left alone;
-/// returns how many rows were restored.
+/// Where the row `before` describes is now: at its index, or, after rows
+/// were inserted earlier in a live call, the row with its start time nearest
+/// that index.
+fn locate(rows: &[Row], before: &RowBefore) -> Option<usize> {
+    if rows
+        .get(before.index)
+        .is_some_and(|row| row.start_ms == before.start_ms)
+    {
+        return Some(before.index);
+    }
+    rows.iter()
+        .enumerate()
+        .filter(|(_, row)| row.start_ms == before.start_ms)
+        .min_by_key(|(index, _)| index.abs_diff(before.index))
+        .map(|(index, _)| index)
+}
+
+/// Restore what `edit` changed, including rows a live rule re-attributed as
+/// they arrived. Rows that no longer exist are left alone; returns how many
+/// rows were restored.
 pub fn undo(rows: &mut [Row], names: &mut Vec<String>, edit: &Edit) -> usize {
     if let Some(previous) = &edit.names {
         names.clone_from(previous);
     }
     let mut restored = 0;
     for before in edit.rows.iter().rev() {
-        if let Some(row) = rows.get_mut(before.index)
-            && row.start_ms == before.start_ms
-        {
+        if let Some(index) = locate(rows, before) {
+            let row = &mut rows[index];
             row.microphone = before.microphone;
             row.speakers.clone_from(&before.speakers);
             row.discord.clone_from(&before.discord);
@@ -524,20 +568,42 @@ pub fn apply_rules(rows: &mut [Row], rules: &[LiveRule], names: &[String]) {
         return;
     }
     for row in rows {
-        let mut current = voices(row);
-        let mut changed = false;
-        for rule in rules {
-            for voice in &mut current {
-                if key(voice) == rule.from {
-                    *voice = rule.to.clone();
-                    changed = true;
-                }
+        apply_rules_traced(row, rules, names);
+    }
+}
+
+/// Apply live rules to one arriving row. Returns, for each rule that changed
+/// it, the rule's id and the row's identity just before that rule, so undoing
+/// the rules in reverse order restores the speaker the row arrived with.
+pub fn apply_rules_traced(
+    row: &mut Row,
+    rules: &[LiveRule],
+    names: &[String],
+) -> Vec<(u64, RowBefore)> {
+    let mut traced = Vec::new();
+    let mut current = voices(row);
+    for rule in rules {
+        if !current.iter().any(|voice| key(voice) == rule.from) {
+            continue;
+        }
+        let before = if traced.is_empty() {
+            RowBefore::of(0, row)
+        } else {
+            let mut scratch = RowBefore::of(0, row).identity(row.start_ms);
+            set_voices(&mut scratch, current.clone(), names, None);
+            RowBefore::of(0, &scratch)
+        };
+        traced.push((rule.id, before));
+        for voice in &mut current {
+            if key(voice) == rule.from {
+                *voice = rule.to.clone();
             }
         }
-        if changed {
-            set_voices(row, current, names, None);
-        }
     }
+    if !traced.is_empty() {
+        set_voices(row, current, names, None);
+    }
+    traced
 }
 
 /// Bring copies of row identities (notes quotes, citation labels) in line
@@ -781,6 +847,76 @@ mod tests {
             record(&mut history, edit.clone());
         }
         assert_eq!(history.len(), MAX_UNDO);
+    }
+
+    #[test]
+    fn rows_reattributed_on_arrival_are_restored_by_undo_in_order() {
+        let (mut rows, mut names) = sample();
+        let merge_edit = merge(&mut rows, &mut names, "s2", "s1").unwrap();
+        let participant = roster(&rows, &names)
+            .into_iter()
+            .find(|speaker| speaker.kind == Kind::Participant)
+            .unwrap();
+        let rename_edit = rename(&mut rows, &mut names, &participant.key, "Zoe").unwrap();
+        let rules = [
+            merge_edit.rule.clone().unwrap(),
+            rename_edit.rule.clone().unwrap(),
+        ];
+        assert_ne!(rules[0].id, rules[1].id);
+        let mut arriving = row(30_000, false, &[2], "Later.");
+        let traced = apply_rules_traced(&mut arriving, &rules, &names);
+        assert_eq!(arriving.speakers, [1]);
+        assert_eq!(traced.len(), 1);
+        assert_eq!(traced[0].0, rules[0].id);
+        assert_eq!(traced[0].1.speakers, [2]);
+        // Two rules on one row: each records the identity just before it.
+        let mut both = row(32_000, false, &[2], "Both.");
+        both.discord = None;
+        let chain = [
+            rules[0].clone(),
+            LiveRule {
+                id: 99,
+                from: "s1".into(),
+                to: Voice::Acoustic(3),
+            },
+        ];
+        let traced = apply_rules_traced(&mut both, &chain, &names);
+        assert_eq!(both.speakers, [3]);
+        assert_eq!(
+            traced
+                .iter()
+                .map(|(id, before)| (*id, before.speakers.clone()))
+                .collect::<Vec<_>>(),
+            [(rules[0].id, vec![2]), (99, vec![1])]
+        );
+        // The merge's inverse covers the row that arrived after it, even
+        // though a late row was inserted before it in the meantime.
+        let mut merge_edit = merge_edit;
+        rows.push(arriving);
+        merge_edit.rows.push(RowBefore {
+            index: rows.len() - 1,
+            arrival: Some("1:s2".into()),
+            ..traced_before(&rows[rows.len() - 1], &[2])
+        });
+        rows.insert(0, row(0, false, &[4], "Late."));
+        undo(&mut rows, &mut names, &rename_edit);
+        undo(&mut rows, &mut names, &merge_edit);
+        let last = rows.last().unwrap();
+        assert_eq!(last.speakers, [2], "the arrival returns to its own speaker");
+        assert_eq!(rows[3].speakers, [2]);
+        assert_eq!(rows[1].speakers, [1]);
+        assert!(rows[0].speakers == [4]);
+    }
+
+    fn traced_before(row: &Row, speakers: &[i32]) -> RowBefore {
+        RowBefore {
+            index: 0,
+            start_ms: row.start_ms,
+            microphone: false,
+            speakers: speakers.to_vec(),
+            discord: None,
+            arrival: None,
+        }
     }
 
     #[test]
