@@ -8,6 +8,10 @@ SenseVoice supplies optional sound and non-neutral tone tags. The installed mode
 
 The conversation view now presents speaker turns on separate colored lanes using saved row time bounds. Overlap may appear on more than one lane when attribution provides multiple speaker labels. Saved speaker names accept up to eight entries while old four-name sessions still load. These are transcript-turn bounds, not frame-level activity probabilities.
 
+## Speaker identity across recordings
+
+The pinned runtime returns only speaker segments: start and end times, a speaker number assigned in order of appearance within one run, and a probability. Sortformer's internal speaker cache holds pre-encoder frame features that are not part of the public API and are not trained to verify a speaker. None of the bundled speech models provide a speaker embedding. Articulate therefore names acoustic speakers per conversation and offers known names as quick picks; Discord participants are remembered by account. Recognizing a returning voice would need a speaker-verification model (for example TitaNet or ECAPA) with a calibrated threshold and a review step, packaged and evaluated like the models above.
+
 ## Model research
 
 | Model | Why consider it | Current decision |

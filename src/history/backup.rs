@@ -8,6 +8,9 @@
 //! - `library.json`: vocabulary corrections and voice macros.
 //! - `settings.json`: preferences without the Discord pairing key, model and
 //!   tool paths, or vocabulary (which lives in `library.json`).
+//! - `audio/<id>.audio`: retained session audio, only when the request opts
+//!   in with `include_audio`. It is written without DPAPI protection; the
+//!   archive passphrase protects it instead.
 //!
 //! Restore reads and validates the entire archive before changing anything.
 //! It adds missing sessions and never silently replaces a local session that is
@@ -37,6 +40,8 @@ pub const EXCLUDED_SETTINGS: &[&str] = &[
 const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ENTRIES: usize = super::MAX_RECORDS + 16;
 const MAX_SIDE_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// Retained audio added to one archive, keeping it below `MAX_ARCHIVE_BYTES`.
+const MAX_AUDIO_BYTES: u64 = 768 * 1024 * 1024;
 const AGE_MAGIC: &[u8] = b"age-encryption.org/v1";
 
 #[derive(Serialize, Deserialize)]
@@ -57,6 +62,9 @@ pub struct Request {
     pub settings: serde_json::Value,
     /// `crate::library::export` output for the current vocabulary and macros.
     pub library: String,
+    /// Include retained session audio. Off by default: audio is large and
+    /// more sensitive than text.
+    pub include_audio: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -66,6 +74,10 @@ pub struct Created {
     pub encrypted: bool,
     /// Records that could not be read and are therefore missing from the archive.
     pub skipped: Vec<RecordWarning>,
+    /// Sessions whose retained audio was included.
+    pub audio: usize,
+    /// Sessions whose retained audio was left out (unreadable or over the size limit).
+    pub audio_skipped: Vec<String>,
 }
 
 pub struct RestoreRequest {
@@ -94,6 +106,8 @@ pub struct Restored {
     pub settings: Option<serde_json::Value>,
     /// Validated library JSON for the caller to merge. Never applied here.
     pub library: Option<String>,
+    /// Sessions whose retained audio was restored.
+    pub audio: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -159,19 +173,45 @@ fn partial_beside(destination: &Path) -> Result<(Partial, File)> {
     bail!("Could not create a temporary backup file")
 }
 
-fn write_archive<W: Write>(
-    history: &History,
-    request: &Request,
-    sink: W,
-) -> Result<(W, usize, Vec<RecordWarning>)> {
+struct Written {
+    sessions: usize,
+    skipped: Vec<RecordWarning>,
+    audio: usize,
+    audio_skipped: Vec<String>,
+}
+
+fn write_archive<W: Write>(history: &History, request: &Request, sink: W) -> Result<(W, Written)> {
     let mut zip = zip::ZipWriter::new_stream(sink);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
+    // FLAC is already compressed.
+    let stored = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .large_file(true);
     let mut sessions = 0;
+    let mut audio = 0;
+    let mut audio_bytes = 0;
+    let mut audio_skipped = Vec::new();
     let skipped = history.for_each_session(|session| {
         zip.start_file(format!("history/{}.json", session.id), options)?;
         zip.write_all(&encode_record(&session)?)?;
         sessions += 1;
+        if request.include_audio && session.audio.is_some() {
+            let path = crate::audio_store::path(&history.directory, &session.id);
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let mut plain = Vec::new();
+            if size == 0
+                || audio_bytes + size > MAX_AUDIO_BYTES
+                || crate::audio_store::copy_plain(&path, &mut plain).is_err()
+            {
+                audio_skipped.push(session.id.clone());
+            } else {
+                zip.start_file(format!("audio/{}.audio", session.id), stored)?;
+                zip.write_all(&plain)?;
+                audio_bytes += plain.len() as u64;
+                audio += 1;
+            }
+        }
         Ok(())
     })?;
     crate::library::parse(&request.library).context("The vocabulary could not be backed up")?;
@@ -190,7 +230,15 @@ fn write_archive<W: Write>(
         app_version: env!("CARGO_PKG_VERSION").into(),
         sessions,
     })?)?;
-    Ok((zip.finish()?.into_inner(), sessions, skipped))
+    Ok((
+        zip.finish()?.into_inner(),
+        Written {
+            sessions,
+            skipped,
+            audio,
+            audio_skipped,
+        },
+    ))
 }
 
 /// Write a complete archive to `request.destination`, replacing it atomically.
@@ -207,14 +255,14 @@ pub fn create(history: &History, request: &Request) -> Result<Created> {
     }
     let (mut partial, file) = partial_beside(&request.destination)?;
     let buffered = BufWriter::new(file);
-    let (file, sessions, skipped) = match passphrase {
+    let (file, written) = match passphrase {
         Some(passphrase) => {
             let encryptor = age::Encryptor::with_user_passphrase(age::secrecy::SecretString::from(
                 passphrase.to_owned(),
             ));
             let encrypted = encryptor.wrap_output(buffered)?;
-            let (encrypted, sessions, skipped) = write_archive(history, request, encrypted)?;
-            (encrypted.finish()?, sessions, skipped)
+            let (encrypted, written) = write_archive(history, request, encrypted)?;
+            (encrypted.finish()?, written)
         }
         None => write_archive(history, request, buffered)?,
     };
@@ -225,9 +273,11 @@ pub fn create(history: &History, request: &Request) -> Result<Created> {
     partial.committed = true;
     Ok(Created {
         path: request.destination.clone(),
-        sessions,
+        sessions: written.sessions,
         encrypted: passphrase.is_some(),
-        skipped,
+        skipped: written.skipped,
+        audio: written.audio,
+        audio_skipped: written.audio_skipped,
     })
 }
 
@@ -236,6 +286,8 @@ pub struct Archive {
     pub sessions: Vec<Session>,
     pub settings: Option<serde_json::Value>,
     pub library: Option<String>,
+    /// Retained audio by session identifier, in the portable form.
+    pub audio: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 fn read_limited(reader: impl Read, limit: u64) -> Result<Vec<u8>> {
@@ -291,6 +343,7 @@ pub fn read(path: &Path, passphrase: Option<&str>) -> Result<Archive> {
         sessions: Vec::new(),
         settings: None,
         library: None,
+        audio: std::collections::BTreeMap::new(),
     };
     let mut seen = std::collections::BTreeSet::new();
     for index in 0..zip.len() {
@@ -324,10 +377,27 @@ pub fn read(path: &Path, passphrase: Option<&str>) -> Result<Archive> {
                 .context("The backed up vocabulary is damaged")?;
             crate::library::parse(&text).context("The backed up vocabulary is invalid")?;
             archive.library = Some(text);
+        } else if let Some(id) = name
+            .strip_prefix("audio/")
+            .and_then(|rest| rest.strip_suffix(".audio"))
+        {
+            ensure!(
+                super::valid_id(id) && !archive.audio.contains_key(id),
+                "The backup contains invalid audio"
+            );
+            let bytes = read_limited(entry, MAX_AUDIO_BYTES)?;
+            archive.audio.insert(id.to_owned(), bytes);
         } else {
             bail!("The backup contains an unexpected file: {name}");
         }
     }
+    ensure!(
+        archive
+            .audio
+            .keys()
+            .all(|id| archive.sessions.iter().any(|session| &session.id == id)),
+        "The backup contains audio without its session"
+    );
     ensure!(
         archive.sessions.len() == manifest.sessions,
         "The backup is incomplete"
@@ -349,6 +419,8 @@ pub fn restore(history: &History, request: &RestoreRequest) -> Result<Restored> 
         library,
         ..Default::default()
     };
+    let mut audio = archive.audio;
+    let protect = history.protect.load(std::sync::atomic::Ordering::Acquire);
     for session in archive.sessions {
         let id = session.id.clone();
         let outcome = (|| -> Result<()> {
@@ -356,21 +428,33 @@ pub fn restore(history: &History, request: &RestoreRequest) -> Result<Restored> 
                 restored.deleted_locally.push(id.clone());
                 return Ok(());
             }
-            match history.stored(&id)? {
+            let installed = match history.stored(&id)? {
                 None => {
                     history.install(&session)?;
                     restored.added.push(id.clone());
+                    true
                 }
                 Some(local) if local.updated_ms >= session.updated_ms => {
                     restored.kept_local.push(id.clone());
+                    false
                 }
                 Some(_) if !request.replace_older => {
                     restored.newer_in_backup.push(id.clone());
+                    false
                 }
                 Some(_) => {
                     history.install(&session)?;
                     restored.updated.push(id.clone());
+                    true
                 }
+            };
+            let destination = crate::audio_store::path(&history.directory, &id);
+            if let Some(bytes) = audio.remove(&id)
+                && session.audio.is_some()
+                && (installed || !destination.exists())
+            {
+                crate::audio_store::install(&bytes, &destination, protect)?;
+                restored.audio.push(id.clone());
             }
             Ok(())
         })();
@@ -477,6 +561,7 @@ mod tests {
                 "hotkey_mode": "Hold",
             }),
             library: crate::library::export(&[], &[]).unwrap(),
+            include_audio: false,
         }
     }
 
@@ -644,6 +729,63 @@ mod tests {
         assert!(history.list().unwrap().is_empty());
         fs::write(&path, b"not a zip").unwrap();
         assert!(read(&path, None).is_err());
+    }
+
+    #[test]
+    fn audio_is_backed_up_only_on_request_and_restored_with_its_session() {
+        let source = Directory::new("audio-source");
+        let folder = source.0.join("history");
+        let history = History::open(folder.clone()).unwrap();
+        let mut call = Session::new(Kind::Call);
+        call.text = "Synthetic call with retained audio.".into();
+        let recorder = crate::audio_store::Recorder::start(
+            crate::audio_store::path(&folder, &call.id),
+            vec!["recording".into()],
+            false,
+        )
+        .unwrap();
+        recorder.push(0, vec![0.25; 16_000]);
+        call.audio = Some(recorder.finish().unwrap());
+        let call = history.save(call).unwrap();
+        let plain = source.0.join("text-only.articulate-backup");
+        assert_eq!(
+            create(&history, &request(plain.clone(), None))
+                .unwrap()
+                .audio,
+            0
+        );
+        assert!(read(&plain, None).unwrap().audio.is_empty());
+        let with_audio = source.0.join("with-audio.articulate-backup");
+        let mut wanted = request(with_audio.clone(), Some("correct horse battery"));
+        wanted.include_audio = true;
+        assert_eq!(create(&history, &wanted).unwrap().audio, 1);
+        let target = Directory::new("audio-target");
+        let restored_folder = target.0.join("history");
+        let restored_history = History::open(restored_folder.clone())
+            .unwrap()
+            .with_protection(true);
+        let restored = restore(
+            &restored_history,
+            &RestoreRequest {
+                source: with_audio,
+                passphrase: Some("correct horse battery".into()),
+                replace_older: false,
+                include_settings: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(restored.audio, std::slice::from_ref(&call.id));
+        let audio = crate::audio_store::path(&restored_folder, &call.id);
+        assert!(super::super::protect::is_sealed(
+            &fs::read(&audio).unwrap()[23..]
+        ));
+        assert_eq!(
+            crate::audio_store::read_all(&audio).unwrap()[0].len(),
+            16_000
+        );
+        // Deleting the session, as retention does, removes its audio.
+        restored_history.delete(&call.id).unwrap();
+        assert!(!audio.exists());
     }
 
     #[test]

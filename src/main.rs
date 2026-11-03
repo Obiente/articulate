@@ -2,6 +2,7 @@
 mod app;
 mod audio;
 mod audio_cues;
+mod audio_store;
 mod brain;
 mod call_capture;
 #[allow(
@@ -29,6 +30,7 @@ mod discord;
 mod discord_attribution;
 mod engine;
 mod export_file;
+mod file_pipeline;
 mod history;
 mod insights;
 mod integration;
@@ -41,15 +43,19 @@ mod library;
 mod live;
 mod macros;
 mod meetings;
+mod media;
 mod model;
 mod notes;
+mod people;
 mod platform;
+mod playback;
 #[allow(
     dead_code,
     reason = "Preserve manual polish and model-management APIs for React controls"
 )]
 mod polish;
 mod sensevoice;
+mod speaker_edits;
 mod speakers;
 mod speech;
 mod startup;
@@ -458,6 +464,19 @@ fn run() -> anyhow::Result<()> {
         .on_window_event(|window, event| {
             if window.label() != "main" {
                 return;
+            }
+            if let tauri::WindowEvent::DragDrop(drop) = event {
+                // Dropped audio files wait for the user to choose how to import them.
+                match drop {
+                    tauri::DragDropEvent::Enter { paths, .. } => {
+                        app::call_tools::set_dragging(paths.iter().any(|p| media::supported(p)))
+                    }
+                    tauri::DragDropEvent::Drop { paths, .. } => {
+                        app::call_tools::offer_files(paths);
+                    }
+                    tauri::DragDropEvent::Leave => app::call_tools::set_dragging(false),
+                    _ => {}
+                }
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();

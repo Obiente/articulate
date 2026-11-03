@@ -11,8 +11,11 @@ use std::{
 };
 
 mod activity;
+pub mod interruptions;
 mod native;
 mod turns;
+
+pub use interruptions::Interruption;
 
 /// A requested companion capture never silently becomes mixed output capture.
 pub fn select_native_source(companion_selected: bool, native_ready: bool) -> Result<bool> {
@@ -102,6 +105,8 @@ pub enum Update {
     NativeAudio(bool),
     /// Cumulative missing native packets, retained with this recording.
     AudioGap(u64),
+    /// A timestamped interruption; repeated with the same start while ongoing.
+    Interruption(Interruption),
     AudioContext(Row),
     AudioContextStatus(String),
     Levels(f32, f32),
@@ -120,6 +125,9 @@ pub struct Request {
     /// Spoken notes capture only the microphone, even if Discord is connected.
     pub microphone_only: bool,
     pub control: Arc<Control>,
+    /// Keeps the captured audio when the user chose to: channel 0 is the
+    /// microphone, channel 1 the call audio.
+    pub recorder: Option<Arc<crate::audio_store::Recorder>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,7 +201,7 @@ pub fn process_window(
     Ok(rows)
 }
 
-fn process_unattributed_window(
+pub(crate) fn process_unattributed_window(
     engine: &mut Engine,
     mic: &[f32],
     remote: &[f32],
@@ -351,10 +359,17 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
             }
             let stopping = request.control.stop_ns.load(Ordering::SeqCst) != 0;
             let now = request.control.end_seconds();
-            anyhow::ensure!(
-                now - cursor < 40.0,
-                "Call transcription fell more than 40 seconds behind. Capture stopped; the latest transcript is retained."
-            );
+            if now - cursor >= 40.0 {
+                update(Update::Interruption(Interruption::new(
+                    (cursor * 1000.0) as u64,
+                    (now * 1000.0) as u64,
+                    interruptions::Source::Processing,
+                    interruptions::Cause::FellBehind,
+                )));
+                anyhow::bail!(
+                    "Call transcription fell more than 40 seconds behind. Capture stopped; the latest transcript is retained."
+                );
+            }
             let ready = if stopping { now } else { (now - 0.25).max(0.0) };
             let remaining = draft.remaining_seconds();
             if stopping || ready >= cursor + refresh_seconds.min(remaining) {
@@ -365,13 +380,29 @@ pub fn run(engine: &mut Engine, request: Request, mut update: impl FnMut(Update)
                 if end <= cursor {
                     break;
                 }
-                draft.mic.extend(microphone.take_until(end)?);
+                let heard = microphone.take_until(end)?;
+                if let Some(recorder) = &request.recorder {
+                    recorder.push(0, heard.clone());
+                }
+                draft.mic.extend(heard);
                 if let Some(output) = &mut output {
-                    draft.remote.extend(output.take_until(end)?);
+                    let played = output.take_until(end)?;
+                    if let Some(recorder) = &request.recorder {
+                        recorder.push(1, played.clone());
+                    }
+                    draft.remote.extend(played);
                 }
                 let gaps = microphone.gaps + output.as_ref().map_or(0, |track| track.gaps);
                 if gaps > 0 {
                     update(Update::AudioGap(gaps));
+                }
+                for gap in microphone.take_interruptions(end).into_iter().chain(
+                    output
+                        .as_mut()
+                        .map(|track| track.take_interruptions(end))
+                        .unwrap_or_default(),
+                ) {
+                    update(Update::Interruption(gap));
                 }
                 let final_pass = draft.endpoint(microphone_only) || (stopping && end >= now);
                 let offset_ms = (draft_start * 1000.0) as u64;
@@ -615,6 +646,7 @@ mod tests {
             native_audio: true,
             microphone_only: true,
             control: Control::new(),
+            recorder: None,
         };
         assert_eq!(request.source(), Source::Microphone);
         request.native_audio = false;

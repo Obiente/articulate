@@ -1,4 +1,9 @@
-//! Local text history. Audio is never part of the saved format.
+//! Local text history.
+//!
+//! Audio is not part of the record. When the user chooses to keep a
+//! recording, it is stored beside the record as `<id>.audio` (see
+//! `crate::audio_store`), sealed like the record when encryption at rest is
+//! on, and removed with every other copy when the session is deleted.
 //!
 //! Each session is one JSON file named by its identifier. Writes are atomic
 //! (temporary file, backup, rename) and recovery prefers the newest complete
@@ -101,6 +106,18 @@ pub struct Session {
     /// stored value wins over a stale editor copy; change it with `set_pinned`.
     #[serde(default)]
     pub pinned: bool,
+    /// Recent speaker corrections that can be undone, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speaker_edits: Vec<crate::speaker_edits::Edit>,
+    /// Timestamped gaps in the captured audio.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interruptions: Vec<crate::calls::Interruption>,
+    /// Retained audio beside this record, when the user chose to keep it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<crate::audio_store::Info>,
+    /// Transcripts replaced by re-transcription, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript_versions: Vec<TranscriptVersion>,
     /// Fields written by a newer version, preserved when this version saves.
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub unknown: serde_json::Map<String, serde_json::Value>,
@@ -111,6 +128,45 @@ pub struct Session {
 
 fn manual_title_default() -> bool {
     true
+}
+
+/// Previous transcripts kept after re-transcription.
+pub const MAX_TRANSCRIPT_VERSIONS: usize = 2;
+
+/// A transcript replaced by re-transcription, kept so it can be restored.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TranscriptVersion {
+    /// When this transcript was replaced.
+    pub replaced_ms: u64,
+    /// The recognizer that produced it, when known.
+    #[serde(default)]
+    pub model: String,
+    pub text: String,
+    #[serde(default)]
+    pub original: String,
+    #[serde(default)]
+    pub rows: Vec<Row>,
+    #[serde(default)]
+    pub speaker_names: Vec<String>,
+}
+
+impl TranscriptVersion {
+    /// Capture the current transcript of `session`.
+    pub fn of(session: &Session, model: &str) -> Self {
+        Self {
+            replaced_ms: now_ms(),
+            model: model.to_owned(),
+            text: session.text.clone(),
+            original: session.original.clone(),
+            rows: session.rows.clone(),
+            speaker_names: session.speaker_names.clone(),
+        }
+    }
+}
+
+/// The history folder in the local data directory.
+pub fn directory() -> PathBuf {
+    crate::model::data_dir().join("history")
 }
 
 impl Session {
@@ -149,6 +205,10 @@ impl Session {
             is_collection: false,
             source_revision: String::new(),
             pinned: false,
+            speaker_edits: Vec::new(),
+            interruptions: Vec::new(),
+            audio: None,
+            transcript_versions: Vec::new(),
             unknown: serde_json::Map::new(),
             sources: Vec::new(),
         }
@@ -1059,7 +1119,7 @@ impl History {
     /// Remove every copy of a deleted record. `corrupt` lists its quarantined
     /// files when the caller already enumerated the directory.
     fn remove_copies(&self, id: &str, corrupt: Option<&[PathBuf]>) -> Result<()> {
-        for suffix in ["json", "bak", "tmp"] {
+        for suffix in ["json", "bak", "tmp", "audio", "audio.recording"] {
             remove_if_present(&self.path(id, suffix)?)?;
         }
         match corrupt {
@@ -1265,6 +1325,15 @@ impl History {
             let Some((id, suffix)) = name.split_once('.') else {
                 continue;
             };
+            if valid_id(id) && suffix == "audio" {
+                // Retained audio is sealed segment by segment.
+                match crate::audio_store::reprotect(&entry.path(), protect) {
+                    Ok(true) => report.changed += 1,
+                    Ok(false) => {}
+                    Err(_) => report.failed += 1,
+                }
+                continue;
+            }
             let eligible = valid_id(id)
                 && (matches!(suffix, "json" | "bak") || parse_quarantine_name(&name).is_some());
             if !eligible {
@@ -1515,6 +1584,35 @@ fn validate(session: &Session) -> Result<()> {
             && session.speaker_names.iter().all(|name| name.len() <= 512),
         "Speaker name exceeds size limit"
     );
+    ensure!(
+        session.speaker_edits.len() <= 4 * crate::speaker_edits::MAX_UNDO
+            && session
+                .speaker_edits
+                .iter()
+                .all(|edit| edit.rows.len() <= MAX_ROWS && edit.summary.len() <= 1024),
+        "Speaker corrections exceed size limit"
+    );
+    ensure!(
+        session.interruptions.len() <= 2 * crate::calls::interruptions::MAX_STORED
+            && session
+                .interruptions
+                .iter()
+                .all(|interruption| interruption.end_ms >= interruption.start_ms),
+        "Invalid audio interruption"
+    );
+    ensure!(
+        session
+            .audio
+            .as_ref()
+            .is_none_or(|audio| audio.channels.len() <= 8
+                && audio.format.len() <= 64
+                && audio.channels.iter().all(|name| name.len() <= 64)),
+        "Invalid retained audio details"
+    );
+    ensure!(
+        session.transcript_versions.len() <= 2 * MAX_TRANSCRIPT_VERSIONS,
+        "Too many saved transcript versions"
+    );
     let mut text_bytes = session
         .text
         .len()
@@ -1534,6 +1632,19 @@ fn validate(session: &Session) -> Result<()> {
         "Note edit history exceeds size limit"
     );
     text_bytes = text_bytes.saturating_add(protection_bytes);
+    for version in &session.transcript_versions {
+        ensure!(
+            version.rows.len() <= MAX_ROWS
+                && version.text.len() <= MAX_TEXT_BYTES
+                && version.original.len() <= MAX_TEXT_BYTES
+                && version.speaker_names.len() <= 8,
+            "Saved transcript version exceeds size limit"
+        );
+        text_bytes = text_bytes
+            .saturating_add(version.text.len())
+            .saturating_add(version.original.len())
+            .saturating_add(version.rows.iter().map(|row| row.text.len()).sum());
+    }
     for row in &session.rows {
         ensure!(
             row.end_ms >= row.start_ms && row.speakers.len() <= 4,
@@ -1769,7 +1880,8 @@ impl Worker {
     pub fn start_protected(protect: bool) -> Self {
         let data = crate::model::data_dir();
         remove_leftover_call_audio(&data.join("audio-context-temp"));
-        Self::start_directory_protected(data.join("history"), protect)
+        crate::audio_store::recover_interrupted(&directory());
+        Self::start_directory_protected(directory(), protect)
     }
 
     #[cfg(test)]
@@ -3553,5 +3665,123 @@ mod tests {
             assert!(start.elapsed() < std::time::Duration::from_secs(5));
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// Calls gained optional fields (speaker corrections, interruptions,
+    /// retained audio, earlier transcripts) without changing `SCHEMA`.
+    #[test]
+    fn call_fields_are_optional_and_round_trip_without_a_schema_change() {
+        use crate::calls::interruptions::{Cause, Source};
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let session = meeting();
+        let stored = serde_json::to_value(Stored {
+            schema: SCHEMA,
+            session: session.clone(),
+        })
+        .unwrap();
+        for field in [
+            "speaker_edits",
+            "interruptions",
+            "audio",
+            "transcript_versions",
+        ] {
+            assert!(stored["session"].get(field).is_none(), "{field} is omitted");
+        }
+        let path = history.path(&session.id, "json").unwrap();
+        fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+        let mut loaded = history.load(&session.id).unwrap();
+        assert!(loaded.speaker_edits.is_empty() && loaded.audio.is_none());
+        assert!(loaded.interruptions.is_empty() && loaded.transcript_versions.is_empty());
+        let mut rows = loaded.rows.clone();
+        let mut names = loaded.speaker_names.clone();
+        let key = crate::speaker_edits::roster(&rows, &names)[0].key.clone();
+        let edit = crate::speaker_edits::rename(&mut rows, &mut names, &key, "Morgan").unwrap();
+        loaded.rows = rows;
+        loaded.speaker_names = names;
+        loaded.speaker_edits.push(edit);
+        loaded.interruptions.push(crate::calls::Interruption::new(
+            1000,
+            2000,
+            Source::Microphone,
+            Cause::DeviceLost,
+        ));
+        loaded.audio = Some(crate::audio_store::Info {
+            format: crate::audio_store::FORMAT.into(),
+            duration_ms: 3000,
+            bytes: 10,
+            channels: vec!["microphone".into(), "call".into()],
+            incomplete: false,
+        });
+        loaded
+            .transcript_versions
+            .push(TranscriptVersion::of(&session, "model.gguf"));
+        history.save(loaded.clone()).unwrap();
+        let disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["schema"], SCHEMA);
+        let text = disk.to_string();
+        assert!(
+            !text.contains("private-user-fixture") && !text.contains("private-channel-fixture")
+        );
+        let reloaded = history.load(&session.id).unwrap();
+        assert_eq!(
+            reloaded.speaker_edits[0].summary,
+            "Renamed Élodie to Morgan"
+        );
+        assert_eq!(
+            crate::calls::label(&reloaded.rows[0], &reloaded.speaker_names),
+            "Morgan"
+        );
+        assert_eq!(reloaded.interruptions, loaded.interruptions);
+        assert_eq!(reloaded.audio, loaded.audio);
+        assert_eq!(reloaded.transcript_versions[0].text, session.text);
+        assert_eq!(reloaded.transcript_versions[0].model, "model.gguf");
+        // Undo after reopening restores the participant name.
+        let mut rows = reloaded.rows.clone();
+        let mut names = reloaded.speaker_names.clone();
+        crate::speaker_edits::undo(&mut rows, &mut names, &reloaded.speaker_edits[0]);
+        assert_eq!(crate::calls::label(&rows[0], &names), "Élodie");
+    }
+
+    #[test]
+    fn retained_audio_is_sealed_with_history_and_removed_by_retention() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = meeting();
+        session.created_ms = 1;
+        session.updated_ms = 1;
+        let audio = crate::audio_store::path(&directory.0, &session.id);
+        let recorder =
+            crate::audio_store::Recorder::start(audio.clone(), vec!["recording".into()], false)
+                .unwrap();
+        recorder.push(0, vec![0.1; 16_000]);
+        session.audio = Some(recorder.finish().unwrap());
+        history.install(&session).unwrap();
+        let plain = fs::read(&audio).unwrap();
+        let report = history.set_protection(true).unwrap();
+        assert!(report.changed >= 2, "record and audio: {report:?}");
+        let sealed = fs::read(&audio).unwrap();
+        assert_ne!(plain, sealed);
+        assert!(protect::is_sealed(&sealed[23..]));
+        assert_eq!(
+            crate::audio_store::read_all(&audio).unwrap()[0].len(),
+            16_000
+        );
+        history.set_protection(false).unwrap();
+        assert_eq!(fs::read(&audio).unwrap(), plain);
+        let policy = retention::Policy {
+            enabled: true,
+            days: 30,
+            ..Default::default()
+        };
+        let applied = history.apply_retention(&policy, None, &[]).unwrap();
+        assert_eq!(applied.deleted, std::slice::from_ref(&session.id));
+        assert!(!audio.exists(), "retention removes retained audio");
+        // A recording interrupted before it finished is also removed with its session.
+        let other = history.save(meeting()).unwrap();
+        let partial = directory.0.join(format!("{}.audio.recording", other.id));
+        fs::write(&partial, b"partial").unwrap();
+        history.delete(&other.id).unwrap();
+        assert!(!partial.exists());
     }
 }

@@ -114,6 +114,8 @@ fn snapshot_sections_have_a_locked_shape() {
         ("meetings", set(&["meetings"])),
         ("updater", set(&["updater"])),
         ("overlay", set(&["overlay"])),
+        ("call_tools", set(&["audio_import", "playback"])),
+        ("people", set(&["people", "people_error"])),
         ("history", set(&["history"])),
         ("document_body", set(&["selected_body"])),
         ("vocabulary", set(&["dictionary", "macros", "assort"])),
@@ -147,6 +149,10 @@ fn snapshot_sections_have_a_locked_shape() {
         "pinned",
         "follow_ups",
         "subtitles_unavailable",
+        "interruptions",
+        "speaker_undo",
+        "audio",
+        "transcript_versions",
     ]);
     assert_eq!(keys(&state["selected"]), session_meta);
     assert_eq!(keys(&state["call_session"]), session_meta);
@@ -162,6 +168,7 @@ fn snapshot_sections_have_a_locked_shape() {
         "end_ms",
         "speaker",
         "speaker_labels",
+        "speaker_keys",
         "text",
         "cues",
         "provisional",
@@ -221,6 +228,7 @@ fn snapshot_sections_have_a_locked_shape() {
             "meetings_zoom",
             "meetings_meet",
             "meetings_start",
+            "keep_call_audio",
         ])
     );
     assert_eq!(

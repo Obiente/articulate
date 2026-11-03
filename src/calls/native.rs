@@ -438,6 +438,48 @@ fn consume(
     Ok(())
 }
 
+/// Reports newly missing and late participant packets as timestamped
+/// interruptions, between the previous observation and this one.
+#[derive(Default)]
+struct LossReport {
+    packets: u64,
+    late: u64,
+    checked_ms: u64,
+}
+
+impl LossReport {
+    fn observe(&mut self, packets: u64, late: u64, now: f64, update: &mut impl FnMut(Update)) {
+        use super::interruptions::{Cause, Source};
+        let now_ms = (now * 1000.0) as u64;
+        for (seen, current, cause) in [
+            (&mut self.packets, packets, Cause::PacketLoss),
+            (&mut self.late, late, Cause::FellBehind),
+        ] {
+            if current > *seen {
+                let mut gap = super::Interruption::new(
+                    self.checked_ms.min(now_ms),
+                    now_ms,
+                    Source::Participants,
+                    cause,
+                );
+                gap.count = current - *seen;
+                update(Update::Interruption(gap));
+                *seen = current;
+            }
+        }
+        self.checked_ms = now_ms;
+    }
+}
+
+fn fell_behind(from: f64, to: f64, source: super::interruptions::Source) -> Update {
+    Update::Interruption(super::Interruption::new(
+        (from * 1000.0) as u64,
+        (to * 1000.0) as u64,
+        source,
+        super::interruptions::Cause::FellBehind,
+    ))
+}
+
 pub(super) fn run(
     engine: &mut Engine,
     request: Request,
@@ -467,6 +509,12 @@ pub(super) fn run(
     let mut context = crate::sensevoice::Worker::start(request.audio_context);
     let mut received = false;
     let mut lost_packets = 0;
+    let mut losses = LossReport::default();
+    // Participants are mixed into one channel when the audio is kept.
+    let mut mixdown = request
+        .recorder
+        .as_ref()
+        .map(|_| crate::audio_store::Mixdown::default());
     let mut pending = VecDeque::new();
     let mut window = Window::default();
     let mut refresh_seconds = REFRESH_SECONDS;
@@ -484,8 +532,31 @@ pub(super) fn run(
             if lost != lost_packets {
                 lost_packets = lost;
                 update(Update::AudioGap(lost));
+                losses.observe(
+                    capture.lost_packets(),
+                    window.late_packets,
+                    request.control.end_seconds(),
+                    &mut update,
+                );
             }
             let frames = frames?;
+            if let Some(mixdown) = &mut mixdown {
+                for frame in &frames {
+                    let start = frame_start(frame).saturating_duration_since(origin);
+                    let voice = frame
+                        .attribution
+                        .speakers
+                        .first()
+                        .map_or("", |speaker| speaker.id.as_str());
+                    mixdown.add(
+                        voice,
+                        start.as_secs_f64(),
+                        frame.rate,
+                        frame.channels,
+                        &frame.samples,
+                    );
+                }
+            }
             if !received && !frames.is_empty() {
                 received = true;
                 update(Update::NativeAudio(true));
@@ -495,10 +566,14 @@ pub(super) fn run(
                 .iter()
                 .map(|frame| frame.samples.len() * 2)
                 .sum::<usize>();
-            ensure!(
-                queued_bytes + window.bytes() <= MAX_BYTES && pending.len() <= 8192,
-                "Participant capture fell behind; the latest transcript is retained"
-            );
+            if queued_bytes + window.bytes() > MAX_BYTES || pending.len() > 8192 {
+                update(fell_behind(
+                    cursor,
+                    request.control.end_seconds(),
+                    super::interruptions::Source::Participants,
+                ));
+                anyhow::bail!("Participant capture fell behind; the latest transcript is retained");
+            }
             let stopping = request.control.stop_ns.load(Ordering::SeqCst) != 0;
             let now = request.control.end_seconds();
             // Give already captured packets the same transport allowance as live
@@ -507,10 +582,16 @@ pub(super) fn run(
                 std::thread::sleep(Duration::from_millis(25));
                 continue;
             }
-            ensure!(
-                now - cursor < 40.0,
-                "Call transcription fell more than 40 seconds behind. The latest transcript is retained."
-            );
+            if now - cursor >= 40.0 {
+                update(fell_behind(
+                    cursor,
+                    now,
+                    super::interruptions::Source::Processing,
+                ));
+                anyhow::bail!(
+                    "Call transcription fell more than 40 seconds behind. The latest transcript is retained."
+                );
+            }
             let ready = if stopping { now } else { (now - 0.25).max(0.0) };
             let remaining = (MAX_SECONDS - (cursor - window.start)).max(0.0);
             if stopping || ready >= cursor + refresh_seconds.min(remaining) {
@@ -529,10 +610,26 @@ pub(super) fn run(
                 if lost != lost_packets {
                     lost_packets = lost;
                     update(Update::AudioGap(lost));
+                    losses.observe(
+                        capture.lost_packets(),
+                        window.late_packets,
+                        end,
+                        &mut update,
+                    );
                 }
-                window.mic.extend(mic.take_until(end)?);
+                let heard = mic.take_until(end)?;
+                if let Some(recorder) = &request.recorder {
+                    recorder.push(0, heard.clone());
+                    if let Some(mixdown) = &mut mixdown {
+                        recorder.push(1, mixdown.take_until(end));
+                    }
+                }
+                window.mic.extend(heard);
                 if mic.gaps > 0 {
                     update(Update::AudioGap(lost_packets + mic.gaps));
+                }
+                for gap in mic.take_interruptions(end) {
+                    update(Update::Interruption(gap));
                 }
                 let rows = window.decode_context(
                     end,

@@ -779,6 +779,11 @@ impl App {
             return Err(format!("Could not save preferences: {error}"));
         }
         worker.set_protection(enabled);
+        // Known people follow the same protection; retained audio is
+        // migrated with the history files.
+        if let Err(error) = self.call_tools.people.set_protection(enabled) {
+            log::warn!("{error:#}");
+        }
         self.history.protection = None;
         self.history.storage.encryption_working = true;
         Ok(())
@@ -991,6 +996,7 @@ impl App {
                             passphrase,
                             settings,
                             library,
+                            include_audio: false,
                         });
                         app.history.backup = None;
                         app.history.storage.backup = Progress::Working;

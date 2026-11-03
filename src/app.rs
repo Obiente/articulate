@@ -20,6 +20,7 @@ use transcribe_cpp::CancelToken;
 
 mod assort_ui;
 mod brain_ui;
+pub(crate) mod call_tools;
 mod capture_feedback;
 
 pub(crate) mod desktop;
@@ -81,6 +82,8 @@ struct Settings {
     encrypt_at_rest: bool,
     /// Optional automatic deletion of old sessions.
     retention: crate::history::retention::Policy,
+    /// Keep call audio beside the transcript by default (off unless chosen).
+    keep_call_audio: bool,
     /// Set when the saved file could not be read, so it is never overwritten.
     #[serde(skip)]
     save_blocked: Option<String>,
@@ -134,6 +137,7 @@ impl Default for Settings {
             polish_style: Default::default(),
             encrypt_at_rest: false,
             retention: Default::default(),
+            keep_call_audio: false,
             save_blocked: None,
         }
     }
@@ -143,6 +147,8 @@ enum Command {
     Load(PathBuf, bool, Option<String>),
     Transcribe(Vec<f32>, u64, bool, CancelToken),
     Call(calls::Request, CancelToken),
+    /// Import a file or rebuild a transcript from retained audio.
+    File(call_tools::FileJob, CancelToken),
 }
 enum Event {
     MicrophoneChecked(Result<audio::AudioCheck, String>),
@@ -153,6 +159,7 @@ enum Event {
     Downloaded(PathBuf),
     Call(calls::Update),
     CallFinished(Result<(), String>),
+    File(call_tools::FileEvent),
     #[allow(
         dead_code,
         reason = "Speaker model download event retained for model management"
@@ -171,6 +178,7 @@ pub struct App {
     polish: polish_ui::State,
     pending_install: Option<crate::update::InstallRequest>,
     history: history_ui::State,
+    call_tools: call_tools::State,
     insights: insights_ui::State,
     saved_search: search_ui::State,
     brain: brain_ui::State,
@@ -481,6 +489,19 @@ impl App {
                             Err(e) => Event::Error(format!("Could not load the model: {e:#}")),
                         }
                     }
+                    Command::File(job, token) => {
+                        let result = match engine.as_mut() {
+                            Some(engine) => {
+                                engine.set_cancel_token(&token);
+                                call_tools::run_file_job(engine, job, &token, &mut |event| {
+                                    let _ = worker_tx.send(Event::File(event));
+                                })
+                                .map_err(|e| format!("{e:#}"))
+                            }
+                            None => Err("Load a speech model first".into()),
+                        };
+                        Event::File(call_tools::FileEvent::Finished(result))
+                    }
                     Command::Transcribe(pcm, id, final_pass, token) => {
                         let start = Instant::now();
                         let result = match engine.as_mut() {
@@ -509,11 +530,13 @@ impl App {
             platform::hotkey(settings.quick_note_hotkey.clone(), quick_note_events);
 
         let (integration_tx, integration_rx) = integration::start(|| {});
+        let call_tools = call_tools::State::start(settings.encrypt_at_rest);
         let mut app = Self {
             polish: Default::default(),
 
             pending_install: None,
             history: history_ui::State::start(settings.encrypt_at_rest),
+            call_tools,
             insights: Default::default(),
             saved_search: Default::default(),
             brain: Default::default(),
@@ -1129,6 +1152,7 @@ impl App {
                         }
                     }
                     calls::Update::AudioContextStatus(message) => self.context_status = message,
+                    calls::Update::Interruption(gap) => self.calls_interruption(gap),
                     calls::Update::AudioGap(lost) => {
                         if self.call.is_some()
                             && let Some(session) = &mut self.history.call
@@ -1148,6 +1172,7 @@ impl App {
                         for annotation in &self.call_context {
                             crate::sensevoice::apply_existing(&mut rows, annotation);
                         }
+                        self.calls_prepare_rows(&mut rows);
                         if self.is_note_capture() {
                             // Keep source identities and timestamps immutable so
                             // live note updates can reuse earlier model sections.
@@ -1163,6 +1188,7 @@ impl App {
                         for annotation in &self.call_context {
                             crate::sensevoice::apply_existing(&mut rows, annotation);
                         }
+                        self.calls_prepare_rows(&mut rows);
                         self.call_rows.clone_from(&self.call_committed);
                         calls::append_rows(&mut self.call_rows, rows);
                         self.refresh_call_notes();
@@ -1181,6 +1207,7 @@ impl App {
                                 .is_some_and(|control| control.stop_ns.load(Ordering::SeqCst) != 0),
                         );
                     }
+                    self.calls_capture_finished();
                     self.history_save_call();
                     if spoken_note && let Some(session) = &self.history.call {
                         self.notetaker_queue_filing(session.clone());
@@ -1194,6 +1221,7 @@ impl App {
                         Err(error) => error,
                     };
                 }
+                Event::File(event) => self.calls_file_event(event),
                 Event::ContextProgress(p) => self.context_progress = Some(p),
                 Event::ContextInstalled(result) => {
                     self.context_progress = None;
@@ -1531,6 +1559,7 @@ impl App {
             self.shortcut_gesture = Default::default();
         }
         self.history_poll();
+        self.calls_tick();
         self.updater.poll();
         self.poll_saved_search();
         self.polish_poll();
@@ -1684,7 +1713,30 @@ impl App {
         self.call_native_received = false;
         self.context_status.clear();
         self.call_context.clear();
+        self.call_tools.live_rules.clear();
+        let kind = if microphone_only {
+            crate::history::Kind::Note
+        } else {
+            crate::history::Kind::Call
+        };
+        let mut session = crate::history::Session::new(kind);
+        if microphone_only {
+            session.title = "Spoken note".into();
+            session.auto_file_pending = true;
+        }
+        let keep_audio = self
+            .call_tools
+            .keep_audio
+            .take()
+            .unwrap_or(self.settings.keep_call_audio);
+        let recorder = if keep_audio && !microphone_only {
+            let remote = if native_audio { "participants" } else { "call" };
+            self.calls_start_recorder(&mut session, vec!["microphone".into(), remote.into()])
+        } else {
+            None
+        };
         let request = calls::Request {
+            recorder,
             audio_context: audio_context.unwrap_or(self.settings.audio_context),
             language_preference,
             microphone: self.settings.microphone.clone(),
@@ -1706,16 +1758,6 @@ impl App {
             Ok(()) => {
                 self.call = Some(control);
                 self.call_cues_enabled = call_cues_enabled;
-                let kind = if microphone_only {
-                    crate::history::Kind::Note
-                } else {
-                    crate::history::Kind::Call
-                };
-                let mut session = crate::history::Session::new(kind);
-                if microphone_only {
-                    session.title = "Spoken note".into();
-                    session.auto_file_pending = true;
-                }
                 self.history.call = Some(session);
                 self.capture_feedback.prepare(
                     if microphone_only {
@@ -1735,6 +1777,12 @@ impl App {
                 true
             }
             Err(_) => {
+                if let Some(recorder) = self.call_tools.recorder.take() {
+                    let _ = recorder.finish();
+                    if let Some(path) = self.call_tools.audio_path(&session.id) {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
                 self.call_status = "The speech worker stopped. Restart the app.".into();
                 self.capture_failed_feedback(
                     microphone_only,
@@ -2299,6 +2347,7 @@ mod tests {
 
                 pending_install: None,
                 history: history_ui::State::default(),
+                call_tools: Default::default(),
                 insights: Default::default(),
                 saved_search: Default::default(),
                 brain: Default::default(),

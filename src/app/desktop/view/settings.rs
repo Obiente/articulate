@@ -42,6 +42,7 @@ pub(crate) struct SettingsView<'a> {
     meetings_zoom: bool,
     meetings_meet: bool,
     meetings_start: meetings::StartMode,
+    keep_call_audio: bool,
 }
 
 #[derive(Serialize)]
@@ -89,6 +90,7 @@ pub(crate) fn settings(app: &App) -> Settings<'_> {
             meetings_zoom: settings.meetings.zoom,
             meetings_meet: settings.meetings.meet,
             meetings_start: settings.meetings.start,
+            keep_call_audio: settings.keep_call_audio,
         },
         microphones: &app.microphones,
         outputs: &app.outputs,

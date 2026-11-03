@@ -83,6 +83,8 @@ pub(crate) struct SessionMeta<'a> {
     follow_ups: usize,
     /// Why subtitle exports are unavailable, or `None` when they are.
     subtitles_unavailable: Option<&'static str>,
+    #[serde(flatten)]
+    calls: super::calls::SessionCalls<'a>,
 }
 
 /// Mirrors the checks in `call_export::session` without formatting anything.
@@ -133,6 +135,7 @@ impl<'a> SessionMeta<'a> {
             pinned: session.pinned,
             follow_ups: crate::brain::followups::reviewed_count(session),
             subtitles_unavailable: subtitles_unavailable(session),
+            calls: super::calls::SessionCalls::new(session),
         }
     }
 }

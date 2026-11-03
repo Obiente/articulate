@@ -9,6 +9,8 @@ pub(crate) struct RowView<'a> {
     end_ms: u64,
     speaker: String,
     speaker_labels: Vec<String>,
+    /// Opaque keys parallel to `speaker_labels`, for speaker corrections.
+    speaker_keys: Vec<String>,
     text: &'a str,
     cues: &'a [Cue],
     provisional: bool,
@@ -21,6 +23,7 @@ impl<'a> RowView<'a> {
             end_ms: row.end_ms,
             speaker: calls::label(row, names),
             speaker_labels: calls::speaker_labels(row, names),
+            speaker_keys: crate::speaker_edits::row_keys(row),
             text: &row.text,
             cues: &row.cues,
             provisional,

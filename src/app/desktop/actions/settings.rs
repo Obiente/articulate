@@ -40,6 +40,7 @@ pub(crate) enum Action {
         meetings_zoom: Option<bool>,
         meetings_meet: Option<bool>,
         meetings_start: Option<meetings::StartMode>,
+        keep_call_audio: Option<bool>,
     },
 }
 
@@ -73,6 +74,7 @@ struct Preferences {
     meetings_zoom: Option<bool>,
     meetings_meet: Option<bool>,
     meetings_start: Option<meetings::StartMode>,
+    keep_call_audio: Option<bool>,
 }
 
 impl Preferences {
@@ -132,6 +134,7 @@ impl Preferences {
         swap(&mut self.meetings_zoom, &mut settings.meetings.zoom);
         swap(&mut self.meetings_meet, &mut settings.meetings.meet);
         swap(&mut self.meetings_start, &mut settings.meetings.start);
+        swap(&mut self.keep_call_audio, &mut settings.keep_call_audio);
     }
 }
 
@@ -171,6 +174,7 @@ impl App {
             meetings_zoom,
             meetings_meet,
             meetings_start,
+            keep_call_audio,
         } = action;
         let mut preferences = Preferences {
             cpu,
@@ -200,6 +204,7 @@ impl App {
             meetings_zoom,
             meetings_meet,
             meetings_start,
+            keep_call_audio,
         };
         self.desktop_validate_settings(&preferences, hotkey.as_ref(), quick_note_hotkey.as_ref())?;
         if let Some(profiles) = &mut preferences.input_profiles {

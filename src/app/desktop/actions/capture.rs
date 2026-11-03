@@ -32,6 +32,9 @@ pub(crate) enum Action {
         language_preference: Option<String>,
         #[serde(default)]
         audio_context: Option<bool>,
+        /// Keep this recording's audio; defaults to the saved preference.
+        #[serde(default)]
+        keep_audio: Option<bool>,
     },
     CallStop,
     NoteCaptureStart,
@@ -82,6 +85,7 @@ impl App {
                 source,
                 language_preference,
                 audio_context,
+                keep_audio,
             } => {
                 self.desktop_capture_idle()?;
                 if language_preference.as_ref().is_some_and(|language| {
@@ -95,6 +99,7 @@ impl App {
                 if audio_context == Some(true) && !crate::sensevoice::installed() {
                     return Err("Install sound and tone cues in Settings first.".into());
                 }
+                self.call_tools.keep_audio = keep_audio;
                 if !self.start_manual_call_capture(
                     matches!(source, CallSource::Discord),
                     language_preference,

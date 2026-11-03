@@ -32,6 +32,7 @@ import {
   SearchResults,
   useLibrarySearch,
 } from "./SearchResults.jsx";
+import { ImportAudioButton } from "../calls/ImportAudio.jsx";
 
 const iconFor = (kind) =>
   kind === "call" ? Headphones : kind === "note" ? Notebook : Microphone;
@@ -118,6 +119,7 @@ export function LibraryPage({
   newNote,
   start,
   speak,
+  act,
 }) {
   const [preview, setPreview] = useState(null),
     [reviewing, setReviewing] = useState(false);
@@ -157,6 +159,9 @@ export function LibraryPage({
           </p>
         </div>
         <Group gap={10}>
+          {mode === "call" && act && (
+            <ImportAudioButton act={act} disabled={captureBlocked} />
+          )}
           {mode === "note" && (
             <Button
               variant="default"
