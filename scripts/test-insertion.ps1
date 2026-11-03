@@ -41,8 +41,11 @@ foreach ($target in $Targets.Split(',')) {
         $window = Wait-Window $process 'ArticulateInsertTest'
         Start-Sleep -Seconds 2
         $env:ARTICULATE_E2E_HWND = [string]$window.MainWindowHandle.ToInt64()
+        # A failing test writes to stderr; keep going so every target reports.
+        $ErrorActionPreference = 'Continue'
         & $binary.FullName 'integration::tests::shortcut_then_insertion_into_a_disposable_window' --ignored --exact --nocapture --test-threads=1 2>&1
         "exit: $LASTEXITCODE"
+        $ErrorActionPreference = 'Stop'
     } finally {
         Get-Process | Where-Object { $_.MainWindowTitle -like 'ArticulateInsertTest*' } | Stop-Process -ErrorAction SilentlyContinue
         if ($profile) {
