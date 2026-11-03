@@ -22,6 +22,16 @@ pub fn is_sealed(bytes: &[u8]) -> bool {
     bytes.starts_with(MAGIC)
 }
 
+/// Whether the file at `path` starts with the protected header. Unreadable or
+/// missing files count as not protected.
+pub fn is_sealed_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0; MAGIC.len()];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|()| header == MAGIC)
+}
+
 /// The file could be read, but this Windows account cannot decrypt it. It is not
 /// damaged and must never be quarantined or replaced because of this error.
 #[derive(Debug)]

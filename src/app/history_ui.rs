@@ -162,6 +162,9 @@ pub(super) struct Storage {
     pub restored_settings: Option<RestoredSettings>,
     /// Whether the isolated files have been listed since the app started.
     pub quarantine_listed: bool,
+    /// Preference copies updated with the latest encryption change, added to
+    /// the history migration report when it arrives.
+    pub settings_migration: Option<MigrationReport>,
     /// One file dialog at a time.
     pub dialog_open: bool,
     pub notice: Option<Notice>,
@@ -170,9 +173,11 @@ pub(super) struct Storage {
 }
 
 impl State {
-    pub fn start(protect: bool) -> Self {
+    /// `migrate` completes an interrupted encryption change; it is set only
+    /// when the saved encryption choice was read successfully.
+    pub fn start(protect: bool, migrate: bool) -> Self {
         Self {
-            worker: Some(Worker::start_protected(protect)),
+            worker: Some(Worker::start_protected(protect, migrate)),
             loading: true,
             ..Default::default()
         }
@@ -466,8 +471,14 @@ impl App {
                     self.history_notify(format!("{error} ({file_name})"), true);
                 }
                 HistoryEvent::Pinned(summary) => self.history.upsert(*summary),
-                HistoryEvent::ProtectionChanged(result) => {
+                HistoryEvent::ProtectionChanged(mut result) => {
                     self.history.storage.encryption_working = false;
+                    if let (Ok(report), Some(settings)) =
+                        (&mut result, self.history.storage.settings_migration.take())
+                    {
+                        report.changed += settings.changed;
+                        report.failed += settings.failed;
+                    }
                     self.history.protection = Some(result);
                 }
                 HistoryEvent::RetentionPreview(result) => {
@@ -778,7 +789,17 @@ impl App {
             self.settings.encrypt_at_rest = previous;
             return Err(format!("Could not save preferences: {error}"));
         }
-        worker.set_protection(enabled);
+        // A change is queued unless the worker has stopped. Then the saved
+        // preference goes back, so it never disagrees with the stored files.
+        if !worker.set_protection(enabled) {
+            self.settings.encrypt_at_rest = previous;
+            if let Err(error) = self.save_preferences() {
+                log::warn!("Could not restore the encryption preference: {error:#}");
+            }
+            return Err("Local history is unavailable. Restart Articulate and try again.".into());
+        }
+        self.history.storage.settings_migration =
+            Some(migrate_settings_copies(&model::data_dir(), enabled));
         // Known people follow the same protection; retained audio is
         // migrated with the history files.
         if let Err(error) = self.call_tools.people.set_protection(enabled) {
@@ -832,8 +853,9 @@ impl App {
         } else {
             Vec::new()
         };
-        self.settings.retention = policy.clone();
+        let previous = std::mem::replace(&mut self.settings.retention, policy.clone());
         if let Err(error) = self.save_preferences() {
+            self.settings.retention = previous;
             return Err(format!("Could not save preferences: {error}"));
         }
         // The confirmed items are removed now; the next automatic pass waits a day.
@@ -1462,5 +1484,38 @@ mod tests {
         app.history.dictation_deleted = false;
         app.history_save_dictation();
         assert_ne!(app.history.dictation.as_ref().unwrap().id, id);
+    }
+    #[test]
+    fn failed_preference_saves_roll_back_retention() {
+        let (mut app, _) = super::super::tests::app();
+        let previous = crate::history::retention::Policy {
+            enabled: true,
+            days: 30,
+            ..Default::default()
+        };
+        app.settings.retention = previous.clone();
+        app.settings.save_blocked = Some("Synthetic read failure".into());
+        let error = app
+            .history_save_retention(crate::history::retention::Policy::default())
+            .unwrap_err();
+        assert!(error.contains("Could not save preferences"));
+        assert_eq!(app.settings.retention, previous);
+    }
+
+    #[test]
+    fn encryption_is_not_changed_when_history_cannot_accept_it() {
+        let (mut app, _) = super::super::tests::app();
+        let directory = std::env::temp_dir().join(format!(
+            "articulate-encryption-stopped-{}",
+            Session::new(Kind::Note).id
+        ));
+        let worker = Worker::test_directory(directory.clone());
+        worker.stop_for_test();
+        app.history.worker = Some(worker);
+        assert!(app.history_set_encryption(true).is_err());
+        assert!(!app.settings.encrypt_at_rest);
+        assert!(!app.history.storage.encryption_working);
+        drop(app);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
