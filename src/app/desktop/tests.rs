@@ -233,6 +233,7 @@ fn snapshot_sections_have_a_locked_shape() {
             "shortcut_error",
             "microphone_check",
             "clean_speech",
+            "auto_polish",
             "insert",
             "live_insert",
             "cpu",

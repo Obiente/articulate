@@ -80,6 +80,8 @@ struct Settings {
     meetings: crate::meetings::Settings,
     assort: assort_ui::Configuration,
     polish_style: crate::polish::Style,
+    #[serde(default)]
+    auto_polish: bool,
     /// Encrypt history and this file with Windows DPAPI for the current user.
     encrypt_at_rest: bool,
     /// Optional automatic deletion of old sessions.
@@ -138,6 +140,7 @@ impl Default for Settings {
             meetings: Default::default(),
             assort: Default::default(),
             polish_style: Default::default(),
+            auto_polish: false,
             encrypt_at_rest: false,
             retention: Default::default(),
             keep_call_audio: false,
@@ -1614,6 +1617,9 @@ impl App {
                     } else {
                         "Your transcript is ready".into()
                     };
+                    if self.auto_polish_start() {
+                        continue;
+                    }
                     self.history_save_dictation();
                     if self.insert_enabled()
                         && (!self.text.is_empty() || self.live_mode)
