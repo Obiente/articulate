@@ -249,6 +249,9 @@ impl DictationEditor {
     }
     /// Call exactly once per finalized segment, before applying bang macros.
     pub fn apply(&mut self, segment: &str, settings: &EditingSettings) -> String {
+        if segment.trim().is_empty() {
+            return self.text();
+        }
         self.notice = None;
         if !segment.trim().is_empty() && previous_command(segment).is_none() {
             self.prior = None;
@@ -262,6 +265,7 @@ impl DictationEditor {
             self.undo = undo;
             if previous_command(segment) == Some(false) {
                 self.undo.push(std::mem::take(&mut self.segments));
+                self.notice = Some("Previous dictation removed.".into());
                 return self.text();
             }
             if !self.segments.is_empty() {
@@ -302,6 +306,7 @@ impl DictationEditor {
         if settings.spoken_editing_commands && command == "undo that" {
             if let Some(previous) = self.undo.pop() {
                 self.segments = previous;
+                self.notice = Some("Previous edit undone.".into());
             } else {
                 self.notice = Some("Nothing to undo.".into());
             }
@@ -325,6 +330,8 @@ impl DictationEditor {
                     if self.segments.pop().is_none() {
                         self.undo.pop();
                         self.notice = Some("Nothing to remove from this dictation.".into());
+                    } else {
+                        self.notice = Some("Previous sentence removed.".into());
                     }
                 }
                 (true, "new line") => self.segments.push("\n".into()),

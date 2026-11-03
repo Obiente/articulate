@@ -63,8 +63,8 @@ fn call_snapshot_reports_active_endpoints_without_changing_preferences() {
         (Some("Fallback mic".into()), Some("Fallback output".into()));
     app.call = Some(control);
     let state = app.desktop_snapshot();
-    assert_eq!(state["call_tools"]["active_microphone"], "Fallback mic");
-    assert_eq!(state["call_tools"]["active_output"], "Fallback output");
+    assert_eq!(state["active_microphone"], "Fallback mic");
+    assert_eq!(state["active_output"], "Fallback output");
     assert_eq!(app.settings.microphone.as_deref(), Some("Preferred mic"));
 }
 
@@ -1048,6 +1048,7 @@ fn input_preferences_validate_and_round_trip() {
 fn spoken_commands_use_only_finalized_segments() {
     let (mut app, _) = app();
     app.settings.spoken_editing_commands = true;
+    app.recording_spoken_editing = true;
     for (text, chunk, final_pass) in [
         ("Hello.", true, true),
         ("scratch that", false, false),
@@ -1082,6 +1083,7 @@ fn spoken_commands_replace_live_text_without_typing_command_words() {
     app.live_mode = true;
     app.settings.insert = true;
     app.settings.spoken_editing_commands = true;
+    app.recording_spoken_editing = true;
     for (spoken, finalized, expected) in [
         ("Hello.", true, "Hello."),
         ("scratch that", false, "Hello."),

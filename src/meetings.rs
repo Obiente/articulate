@@ -72,7 +72,6 @@ pub enum StartMode {
     Automatic,
     /// Show a prompt with the consent reminder and wait for the user.
     #[default]
-    #[serde(other)]
     Ask,
 }
 
@@ -83,7 +82,19 @@ pub struct Settings {
     pub teams: bool,
     pub zoom: bool,
     pub meet: bool,
+    #[serde(deserialize_with = "saved_start_mode")]
     pub start: StartMode,
+}
+
+fn saved_start_mode<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<StartMode, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    Ok(if value == "automatic" {
+        StartMode::Automatic
+    } else {
+        StartMode::Ask
+    })
 }
 
 impl Settings {

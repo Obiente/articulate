@@ -1111,7 +1111,10 @@ impl App {
     }
 
     fn publish_live_preview(&mut self) {
-        if self.recording_spoken_editing && self.raw.is_empty() {
+        if self.recording_spoken_editing
+            && self.raw.is_empty()
+            && self.dictation_editor.notice.is_none()
+        {
             return;
         }
         if self.live_mode
