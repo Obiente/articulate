@@ -430,36 +430,8 @@ fn write_segments(
     let mut queues: Vec<Vec<f32>> = vec![Vec::new(); names.len()];
     let mut written: u64 = 0;
     let mut failed = None;
-    let mut flush = |queues: &mut Vec<Vec<f32>>, all: bool, written: &mut u64| -> Result<()> {
-        loop {
-            let longest = queues.iter().map(Vec::len).max().unwrap_or(0);
-            let shortest = queues.iter().map(Vec::len).min().unwrap_or(0);
-            // A channel that stops arriving is treated as silence once the
-            // other is two segments ahead, keeping memory bounded.
-            let ready = if all {
-                longest.min(SEGMENT_FRAMES)
-            } else if shortest >= SEGMENT_FRAMES || longest >= 2 * SEGMENT_FRAMES {
-                SEGMENT_FRAMES
-            } else {
-                0
-            };
-            if ready == 0 {
-                return Ok(());
-            }
-            let segment: Vec<Vec<f32>> = queues
-                .iter_mut()
-                .map(|queue| {
-                    let take = ready.min(queue.len());
-                    let mut channel: Vec<f32> = queue.drain(..take).collect();
-                    channel.resize(ready, 0.0);
-                    channel
-                })
-                .collect();
-            let payload = encode_segment(&segment, *written)?;
-            write_record(&mut writer, &protect::seal_if(protect_records, payload)?)?;
-            writer.flush()?;
-            *written += ready as u64;
-        }
+    let mut flush = |queues: &mut [Vec<f32>], all: bool, written: &mut u64| {
+        flush_segments(&mut writer, protect_records, queues, all, written)
     };
     while let Ok(message) = receiver.recv() {
         match message {
@@ -483,7 +455,6 @@ fn write_segments(
     {
         failed = Some(error);
     }
-    drop(flush);
     writer.flush()?;
     writer.get_ref().sync_all()?;
     drop(writer);
@@ -499,6 +470,45 @@ fn write_segments(
         channels: names,
         incomplete: dropped.load(Ordering::Relaxed),
     })
+}
+
+/// Encode and write every complete segment, or everything with `all`.
+fn flush_segments(
+    writer: &mut impl Write,
+    protect_records: bool,
+    queues: &mut [Vec<f32>],
+    all: bool,
+    written: &mut u64,
+) -> Result<()> {
+    loop {
+        let longest = queues.iter().map(Vec::len).max().unwrap_or(0);
+        let shortest = queues.iter().map(Vec::len).min().unwrap_or(0);
+        // A channel that stops arriving is treated as silence once the
+        // other is two segments ahead, keeping memory bounded.
+        let ready = if all {
+            longest.min(SEGMENT_FRAMES)
+        } else if shortest >= SEGMENT_FRAMES || longest >= 2 * SEGMENT_FRAMES {
+            SEGMENT_FRAMES
+        } else {
+            0
+        };
+        if ready == 0 {
+            return Ok(());
+        }
+        let segment: Vec<Vec<f32>> = queues
+            .iter_mut()
+            .map(|queue| {
+                let take = ready.min(queue.len());
+                let mut channel: Vec<f32> = queue.drain(..take).collect();
+                channel.resize(ready, 0.0);
+                channel
+            })
+            .collect();
+        let payload = encode_segment(&segment, *written)?;
+        write_record(writer, &protect::seal_if(protect_records, payload)?)?;
+        writer.flush()?;
+        *written += ready as u64;
+    }
 }
 
 /// Mixes separately delivered participant audio into one 16 kHz timeline for

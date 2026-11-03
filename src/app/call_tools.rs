@@ -530,8 +530,9 @@ impl App {
 
     /// Save known people now and then, and pick up offered files.
     pub(super) fn calls_tick(&mut self) {
-        if let Some(path) = OFFERED.lock().unwrap_or_else(|e| e.into_inner()).take()
-            && !self.call_tools.import.working
+        // An offer made during an import waits until it finishes.
+        if !self.call_tools.import.working
+            && let Some(path) = OFFERED.lock().unwrap_or_else(|e| e.into_inner()).take()
         {
             let import = &mut self.call_tools.import;
             import.file_name = path
@@ -639,6 +640,11 @@ impl App {
         );
         self.refresh_call_notes();
         self.history_save_call();
+        // Generated notes cite rows by position; give them the new labels.
+        if let Some(session) = &mut self.history.call {
+            speaker_edits::refresh_derived(session);
+            self.history_call_changed();
+        }
         Ok(())
     }
 

@@ -774,7 +774,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(restored.audio, [call.id.clone()]);
+        assert_eq!(restored.audio, std::slice::from_ref(&call.id));
         let audio = crate::audio_store::path(&restored_folder, &call.id);
         assert!(super::super::protect::is_sealed(
             &fs::read(&audio).unwrap()[23..]

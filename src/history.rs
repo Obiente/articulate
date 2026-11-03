@@ -3775,7 +3775,7 @@ mod tests {
             ..Default::default()
         };
         let applied = history.apply_retention(&policy, None, &[]).unwrap();
-        assert_eq!(applied.deleted, [session.id.clone()]);
+        assert_eq!(applied.deleted, std::slice::from_ref(&session.id));
         assert!(!audio.exists(), "retention removes retained audio");
         // A recording interrupted before it finished is also removed with its session.
         let other = history.save(meeting()).unwrap();
