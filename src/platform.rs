@@ -565,10 +565,12 @@ mod win {
                     if msg.message == WM_QUIT {
                         break 'worker;
                     }
-                    if msg.message == WM_HOTKEY
-                        && registration.accepts(msg.wParam, msg.lParam)
-                        && lifecycle.press()
-                    {
+                    let accepted =
+                        msg.message == WM_HOTKEY && registration.accepts(msg.wParam, msg.lParam);
+                    if accepted && let Some((_, shortcut)) = &registration.active {
+                        mask_modifier_release(shortcut);
+                    }
+                    if accepted && lifecycle.press() {
                         let target = target().unwrap_or(Target {
                             window: 0,
                             focus: 0,
@@ -674,6 +676,37 @@ mod win {
                 )
             })
         }
+    }
+
+    /// Not assigned to any key, so no app acts on it or turns it into a character.
+    const MASK_KEY: VIRTUAL_KEY = 0xE8;
+
+    /// Releasing Alt (or Win) with no other key seen since it went down opens
+    /// the app's menu (or Start). The shortcut key itself is swallowed by the
+    /// hotkey, so the target app sees exactly that: Alt alone. Its menu then
+    /// takes focus from the text field and insertion is refused. Tapping an
+    /// unassigned key while the modifier is still held makes the release an
+    /// ordinary chord release.
+    fn mask_modifier_release(shortcut: &Hotkey) {
+        let held = |key: VIRTUAL_KEY| unsafe { GetAsyncKeyState(key as i32) < 0 };
+        if !needs_release_mask(shortcut, held(VK_MENU), held(VK_LWIN) || held(VK_RWIN)) {
+            return;
+        }
+        let input = [
+            selection_key(MASK_KEY, 0),
+            selection_key(MASK_KEY, KEYEVENTF_KEYUP),
+        ];
+        unsafe {
+            SendInput(
+                input.len() as u32,
+                input.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            );
+        }
+    }
+
+    fn needs_release_mask(shortcut: &Hotkey, alt_held: bool, win_held: bool) -> bool {
+        (shortcut.alt && alt_held) || (shortcut.win && win_held)
     }
 
     unsafe fn modifiers_released() -> bool {
@@ -932,6 +965,28 @@ mod win {
     #[cfg(test)]
     mod hotkey_tests {
         use super::*;
+
+        #[test]
+        fn alt_and_win_chords_mask_their_release_but_ctrl_alone_does_not() {
+            let chord = |ctrl, alt, win| Hotkey {
+                ctrl,
+                alt,
+                shift: false,
+                win,
+                key: "Space".into(),
+            };
+            // Alt + Space alone would open the target app's menu on release.
+            assert!(needs_release_mask(&chord(false, true, false), true, false));
+            assert!(needs_release_mask(&chord(true, true, false), true, false));
+            assert!(needs_release_mask(&chord(false, false, true), false, true));
+            // Already released, or not part of the chord: nothing to mask.
+            assert!(!needs_release_mask(
+                &chord(false, true, false),
+                false,
+                false
+            ));
+            assert!(!needs_release_mask(&chord(true, false, false), true, true));
+        }
 
         #[test]
         fn multiline_input_uses_virtual_enter_and_preserves_unicode() {
