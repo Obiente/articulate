@@ -82,10 +82,13 @@ not automatically adopted as app-owned files.
    automatically with Articulate on the same Windows account.
 3. Join a voice channel. Articulate should report a connected speaker source.
 
-No key needs to be copied or pasted. The companion's native helper reads only
-the pairing key from Articulate's local preferences and refreshes it every three
-seconds. It does not expose other preferences or offer a network endpoint for
-retrieving the key. Settings offers **Rotate pairing key**, which generates a new
+No key needs to be copied or pasted. Articulate publishes the pairing key in
+`discord-pairing.json` in its data folder, and the companion's native helper
+reads only that file, refreshing it every three seconds; with an older
+Articulate that writes no such file it falls back to the key in plaintext
+`settings.json`. The pairing file stays readable when encryption at rest seals
+`settings.json`; SECURITY.md explains that tradeoff. The helper does not expose
+other preferences or offer a network endpoint for retrieving the key. Settings offers **Rotate pairing key**, which generates a new
 key that the current companion picks up within a few seconds while every copy
 of the old key stops working, and **Forget pairing**, which removes the key and
 stops listening until you connect again.
@@ -106,7 +109,8 @@ After pairing, Articulate automatically opens its receiver on startup and the
 companion reconnects. Explicitly disconnecting disables automatic connection;
 closing Articulate closes the listener. Reconnecting retries the local pairing;
 the current companion picks up key changes automatically. The random key stays
-in Articulate's local settings and is held in memory by the companion. It
+in Articulate's local settings and pairing file and is held in memory by the
+companion. It
 authorizes submitting speaker metadata and participant audio during an active
 capture. Authentication remains required for every local protocol request.
 
@@ -182,10 +186,18 @@ It then sends `POST /session/confirm` with
 Articulate compares it in constant time and marks that connection authenticated.
 Later requests on the connection carry `Authorization: Articulate-Session <id>`,
 which must match the session that authenticated it; the key itself never crosses
-the socket in either direction, and a new connection must pair again. A request
-on an unauthenticated connection is answered `401`, a wrong proof `403`, and a
-version mismatch `426` together with the supported version, which the user sees
-as an **update** state. Articulate serves up to eight connections concurrently,
+the socket in either direction, and a new connection must pair again. The
+companion binds the session to the socket object that completed the handshake.
+Should its keep-alive agent ever open a different connection, after Articulate
+restarts or because another program took the port in between, nothing is
+written there before a fresh handshake has proven the key: a request that would
+have left on the replaced connection is dropped unsent and repeated after
+pairing. A request on an unauthenticated connection is answered `401`, a wrong
+proof `403`, and a version mismatch `426` together with the supported version,
+which the user sees as an **update** state. Those answers close that connection
+only: an unauthenticated peer can set the update notice while no companion is
+paired, but it can neither replace a paired companion's observation nor stop a
+capture, and the next successful handshake clears the notice. Articulate serves up to eight connections concurrently,
 closes a connection that is idle for fifteen seconds or whose request stalls for
 half a second, and the companion retries a failed audio batch a bounded number of
 times before reporting the transport as unavailable.
@@ -214,10 +226,11 @@ its own license and distribution requirements. No Vencord binary is bundled here
 The companion targets Vencord commit
 `59a54286542651fff5ea53f0ce6cadf2a6aa7521` with its locked dependency graph.
 Receiver tests cover the mutual handshake, session binding, version mismatches,
-request validation, actual TCP publication over concurrent keep-alive
+paired state surviving unauthenticated compatibility errors, request validation, actual TCP publication over concurrent keep-alive
 connections, sequence ordering, connection limits, stale state invalidation and
 shutdown. The native IPC validation covers payload bounds, duplicate
-participants, forbidden fields, stale samples and the fixed endpoint. A
+participants, forbidden fields, stale samples, the fixed endpoint, the pairing
+file and re-pairing on a replaced or unproven connection. A
 protocol-version-2 typecheck against the pinned checkout and a controlled call
 with the rebuilt companion remain to be run.
 Installer tests cover file ownership, preserving other plugins, rollback,

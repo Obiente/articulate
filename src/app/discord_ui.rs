@@ -23,6 +23,9 @@ pub(super) struct LaunchState {
     installed_flavors: Option<(Instant, Vec<Flavor>)>,
     avatars: Option<crate::discord::avatar::Cache>,
     pub(super) meetings: MeetingGlue,
+    /// Whether the companion pairing file has been checked against the saved
+    /// key since startup, so settings restored by other means are mirrored.
+    pairing_file_checked: bool,
 }
 
 /// What a background relaunch did when it succeeded.
@@ -466,21 +469,43 @@ impl App {
     }
 
     fn replace_pairing(&mut self, key: String, reconnect: bool) -> Result<(), String> {
+        let previous_key = std::mem::replace(&mut self.settings.discord_pairing_key, key);
+        let previous_reconnect =
+            std::mem::replace(&mut self.settings.discord_auto_connect, reconnect);
+        // The saved file is the source of truth. If it cannot be written, the
+        // old key stays in force everywhere: in memory, in the pairing file
+        // and in the listener that still holds it.
+        if let Err(error) = self.save_preferences() {
+            self.settings.discord_pairing_key = previous_key;
+            self.settings.discord_auto_connect = previous_reconnect;
+            return Err(error.to_string());
+        }
         if let Some(connection) = self.discord.take() {
             connection.disconnect();
         }
         if let Some(control) = &self.call {
             control.set_discord(None);
         }
-        self.settings.discord_pairing_key = key;
-        self.settings.discord_auto_connect = reconnect;
         self.discord_launch.retry = Retry::default();
         self.discord_launch.error = None;
-        self.save_preferences().map_err(|e| e.to_string())?;
+        let published = self.publish_pairing_file();
         if reconnect && self.settings.discord_companion {
             self.connect_discord();
         }
+        published?;
         self.discord_launch.error.clone().map_or(Ok(()), Err)
+    }
+
+    /// Mirrors the saved pairing key into the file the companion reads, so a
+    /// companion keeps pairing when `settings.json` is encrypted at rest.
+    fn publish_pairing_file(&mut self) -> Result<(), String> {
+        self.discord_launch.pairing_file_checked = true;
+        crate::discord::pairing::sync(
+            &crate::model::data_dir(),
+            &self.settings.discord_pairing_key,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("The companion cannot read the pairing key: {error:#}"))
     }
 
     /// Installed editions as last scanned, for settings validation.
@@ -573,6 +598,7 @@ impl App {
                     self.settings.discord_pairing_key = crate::discord::plugin::new_token()?;
                 }
                 self.save_preferences()?;
+                self.publish_pairing_file().map_err(anyhow::Error::msg)?;
                 crate::discord::plugin::start(self.settings.discord_pairing_key.clone())
             })();
             match result {
@@ -637,6 +663,13 @@ impl App {
     }
 
     fn poll_discord_connection(&mut self) {
+        // Settings restored from a backup or an older version carry a key the
+        // companion must be able to read even while `settings.json` is sealed.
+        if !self.discord_launch.pairing_file_checked
+            && let Err(error) = self.publish_pairing_file()
+        {
+            self.discord_launch.error = Some(error);
+        }
         if self
             .discord
             .as_ref()
@@ -1208,6 +1241,13 @@ type ProbeHandle = (
     Arc<AtomicBool>,
 );
 
+/// How long the last successful probe keeps counting as evidence once probes
+/// fail or stall. Shorter than the detector's start debounce, so a meeting is
+/// never confirmed from a single observation that was not refreshed, and
+/// bounded, so a meeting whose evidence cannot be refreshed ends after the
+/// usual end debounce instead of being transcribed indefinitely.
+const EVIDENCE_GRACE: Duration = Duration::from_millis(2500);
+
 /// Application-side state for meeting detection: the background probe, the
 /// debounced detector and which capture, if any, this feature owns.
 #[derive(Default)]
@@ -1215,7 +1255,8 @@ pub(super) struct MeetingGlue {
     detector: meetings::Detector,
     probe: Option<ProbeHandle>,
     probe_error: Option<String>,
-    latest: Option<Vec<meetings::Evidence>>,
+    /// The last successful probe and when it arrived.
+    latest: Option<(Vec<meetings::Evidence>, Instant)>,
     pending_start: Option<meetings::App>,
     prompt: Option<meetings::App>,
     owned: Option<meetings::App>,
@@ -1248,7 +1289,7 @@ impl MeetingGlue {
                 match receiver.try_recv() {
                     Ok(Ok(evidence)) => {
                         self.probe_error = None;
-                        self.latest = Some(evidence);
+                        self.latest = Some((evidence, now));
                     }
                     Ok(Err(error)) => self.probe_error = Some(error),
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -1259,7 +1300,14 @@ impl MeetingGlue {
                 }
             }
         }
-        let evidence = self.latest.clone().unwrap_or_default();
+        // Evidence that could not be refreshed within the grace counts as
+        // absent: it cannot confirm a start, and it cannot hold a meeting open.
+        let evidence = self
+            .latest
+            .as_ref()
+            .filter(|(_, at)| now.saturating_duration_since(*at) <= EVIDENCE_GRACE)
+            .map(|(evidence, _)| evidence.clone())
+            .unwrap_or_default();
         let events = self.detector.tick(now, &evidence, settings);
         for event in &events {
             self.events
@@ -2399,5 +2447,122 @@ mod tests {
             ),
             Some(AutoAction::Start)
         );
+    }
+
+    #[test]
+    fn meeting_evidence_expires_when_probes_fail_and_never_starts_stale() {
+        let settings = meetings::Settings {
+            teams: true,
+            ..Default::default()
+        };
+        let present = vec![meetings::Evidence {
+            app: meetings::App::Teams,
+            running: true,
+            capturing: true,
+        }];
+        let mut glue = MeetingGlue::default();
+        let (tx, rx) = mpsc::channel();
+        glue.probe = Some((rx, Arc::new(AtomicBool::new(false))));
+        let at = Instant::now();
+        let second = |n: u64| at + Duration::from_secs(n);
+        // One good probe, then failures: the single observation ages past the
+        // grace before the start debounce could complete, so nothing starts.
+        tx.send(Ok(present.clone())).unwrap();
+        assert!(glue.advance(at, &settings).is_empty());
+        tx.send(Err("probe failed".into())).unwrap();
+        for n in 1..=6 {
+            assert!(glue.advance(second(n), &settings).is_empty(), "{n}");
+        }
+        assert_eq!(glue.probe_error.as_deref(), Some("probe failed"));
+        assert!(glue.detector.active().is_empty());
+        assert!(
+            glue.latest.is_some(),
+            "the stale probe is kept, not trusted"
+        );
+        // Fresh evidence every second confirms a meeting after the debounce.
+        for n in 10..=13 {
+            tx.send(Ok(present.clone())).unwrap();
+            let events = glue.advance(second(n), &settings);
+            if n == 13 {
+                assert!(matches!(events[0], meetings::Event::Started { .. }));
+            } else {
+                assert!(events.is_empty(), "{n}");
+            }
+        }
+        assert!(glue.probe_error.is_none());
+        assert_eq!(glue.detector.active(), vec![meetings::App::Teams]);
+        // A transient failure within the grace keeps the meeting; a stalled
+        // probe is bounded by the grace plus the end debounce.
+        tx.send(Err("probe failed".into())).unwrap();
+        assert!(glue.advance(second(15), &settings).is_empty());
+        assert_eq!(glue.detector.active(), vec![meetings::App::Teams]);
+        assert!(glue.advance(second(16), &settings).is_empty());
+        assert!(glue.advance(second(20), &settings).is_empty());
+        assert_eq!(
+            glue.advance(second(21), &settings),
+            vec![meetings::Event::Ended {
+                app: meetings::App::Teams
+            }]
+        );
+        assert!(glue.detector.active().is_empty());
+        // The grace is shorter than the start debounce by construction.
+        assert!(EVIDENCE_GRACE < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn pairing_changes_roll_back_when_saving_fails_and_mirror_the_pairing_file() {
+        let (mut app, _) = super::super::tests::app();
+        let directory = crate::model::data_dir();
+        let _ = std::fs::remove_file(directory.join(crate::discord::pairing::FILE_NAME));
+        app.settings.discord_companion = true;
+        app.settings.discord_auto_connect = false;
+        app.settings.discord_pairing_key = crate::discord::plugin::new_token().unwrap();
+        let original = app.settings.discord_pairing_key.clone();
+        // Startup mirrors a key restored by other means into the pairing file.
+        app.poll_discord_connection();
+        assert_eq!(
+            crate::discord::pairing::read(&directory)
+                .unwrap()
+                .as_deref(),
+            Some(original.as_str())
+        );
+        // A failed save leaves the key, the auto-connect choice, the pairing
+        // file and the running listener exactly as they were.
+        app.discord = Some(crate::discord::Connection::start(1));
+        app.settings.discord_auto_connect = true;
+        app.settings.save_blocked = Some("disk is read-only".into());
+        let error = app.desktop_discord_rotate_key().unwrap_err();
+        assert!(error.contains("read-only"), "{error}");
+        assert_eq!(app.settings.discord_pairing_key, original);
+        assert!(app.settings.discord_auto_connect);
+        assert!(app.discord.is_some(), "the listener keeps running");
+        assert_eq!(
+            crate::discord::pairing::read(&directory)
+                .unwrap()
+                .as_deref(),
+            Some(original.as_str())
+        );
+        let error = app.desktop_discord_forget_pairing().unwrap_err();
+        assert!(error.contains("read-only"), "{error}");
+        assert_eq!(app.settings.discord_pairing_key, original);
+        assert!(app.settings.discord_auto_connect);
+        assert!(app.discord.is_some());
+        // Once saving works again, the rotation replaces both copies of the key
+        // and forgetting removes the pairing file with it.
+        app.settings.save_blocked = None;
+        app.settings.discord_auto_connect = false;
+        app.desktop_discord_rotate_key().unwrap();
+        let rotated = app.settings.discord_pairing_key.clone();
+        assert_ne!(rotated, original);
+        assert!(app.discord.is_none(), "the old listener was stopped");
+        assert_eq!(
+            crate::discord::pairing::read(&directory)
+                .unwrap()
+                .as_deref(),
+            Some(rotated.as_str())
+        );
+        app.desktop_discord_forget_pairing().unwrap();
+        assert!(app.settings.discord_pairing_key.is_empty());
+        assert_eq!(crate::discord::pairing::read(&directory).unwrap(), None);
     }
 }

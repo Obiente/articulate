@@ -14,6 +14,7 @@ pub mod install;
     reason = "Preserve guarded Discord relaunch for React connection setup"
 )]
 pub mod launch;
+pub mod pairing;
 pub mod pcm;
 pub mod plugin;
 
@@ -265,15 +266,23 @@ impl Shared {
         );
     }
 
-    /// Marks the companion as speaking an unsupported protocol version.
+    /// Records that a peer spoke an unsupported protocol version so Settings
+    /// can suggest an update. The notice is only ever advisory: it never
+    /// replaces a live, authenticated companion observation, touches the
+    /// activity history or stops a capture, so a local process that cannot
+    /// prove the pairing key cannot interrupt a paired companion. It applies
+    /// while nothing is paired and is overwritten by the next handshake.
     fn protocol_mismatch(&self, kind: &'static str) {
         let message = if kind == "newer" {
             "The Discord companion is newer than this Articulate version. Update Articulate."
         } else {
             "The Discord companion needs updating. Update it from Settings and restart Discord."
         };
-        self.unavailable(message);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(state.snapshot.status, Status::Ready) || state.snapshot.observation.is_some() {
+            return;
+        }
+        state.snapshot.status = Status::Unavailable(message.into());
         state.snapshot.companion_protocol = Some(kind.into());
     }
 
