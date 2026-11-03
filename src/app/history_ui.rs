@@ -59,6 +59,8 @@ pub(super) struct State {
     /// Progress of storage operations, file dialogs and library notices.
     pub storage: Storage,
     call_saved_committed: (usize, u64, usize),
+    /// Open documents replaced by a restore, reloaded before further edits.
+    pub restore_reloads: std::collections::HashSet<String>,
     insights_requested: Option<Instant>,
     retention_applied: Option<Instant>,
 }
@@ -376,6 +378,9 @@ impl App {
                     self.history.loading = false;
                 }
                 HistoryEvent::Loaded(mut session) => {
+                    if self.history.restore_reloads.remove(&session.id) {
+                        self.history_reconcile_restored(&session);
+                    }
                     if self.history.open_requested.as_deref() != Some(session.id.as_str()) {
                         continue;
                     }
@@ -546,6 +551,9 @@ impl App {
                                 );
                             }
                         }
+                    }
+                    if let Ok(restored) = &result {
+                        self.history_reload_restored(&restored.updated);
                     }
                     self.insights.stale = true;
                     self.history.restored = Some(result);
@@ -1058,6 +1066,12 @@ impl App {
                 };
                 // Saving open documents first lets a restore compare their latest version.
                 app.history_save_personal_notes();
+                if app.history.dictation_dirty.is_some() {
+                    app.history_save_dictation();
+                }
+                if app.history.call_dirty.is_some() {
+                    app.history_save_call();
+                }
                 if let Some(worker) = &app.history.worker {
                     worker.restore(backup::RestoreRequest {
                         source,
@@ -1073,6 +1087,83 @@ impl App {
         })?;
         self.history.storage.restore = Progress::Choosing;
         Ok(())
+    }
+
+    /// Reload open documents that a restore replaced. Until each reload
+    /// arrives, edits are not autosaved, and the store rejects saves of the
+    /// older copy, so restored content is never overwritten.
+    fn history_reload_restored(&mut self, replaced: &[String]) {
+        for id in replaced {
+            let open = [
+                &self.history.dictation,
+                &self.history.call,
+                &self.history.selected,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|session| &session.id == id);
+            if !open {
+                continue;
+            }
+            if self.history.dictation.as_ref().is_some_and(|s| &s.id == id) {
+                self.history.dictation_dirty = None;
+            }
+            if self.history.call.as_ref().is_some_and(|s| &s.id == id) {
+                self.history.call_dirty = None;
+            }
+            if self.history.selected.as_ref().is_some_and(|s| &s.id == id) {
+                self.history.selected_dirty = None;
+            }
+            self.brain.forget(id);
+            self.history.restore_reloads.insert(id.clone());
+            if let Some(worker) = &self.history.worker {
+                worker.load(id.clone());
+            }
+        }
+    }
+
+    /// Replace cached copies of a document with the version a restore installed.
+    fn history_reconcile_restored(&mut self, session: &Session) {
+        if self
+            .history
+            .dictation
+            .as_ref()
+            .is_some_and(|current| current.id == session.id)
+        {
+            self.text.clone_from(&session.text);
+            self.raw.clone_from(&session.original);
+            self.dictation_metrics.clone_from(&session.metrics);
+            self.history.dictation = Some(session.clone());
+            self.history.dictation_dirty = None;
+        }
+        if self.call.is_none()
+            && self
+                .history
+                .call
+                .as_ref()
+                .is_some_and(|current| current.id == session.id)
+        {
+            self.call_rows.clone_from(&session.rows);
+            self.call_committed.clone_from(&session.rows);
+            self.speaker_names.clone_from(&session.speaker_names);
+            self.call_notes.clone_from(&session.notes);
+            self.history.call = Some(session.clone());
+            self.history.call_dirty = None;
+            self.history.call_saved_committed = committed_fingerprint(&self.call_committed);
+        }
+        if self
+            .history
+            .selected
+            .as_ref()
+            .is_some_and(|current| current.id == session.id)
+        {
+            self.history.selected = Some(session.clone());
+            self.history.selected_dirty = None;
+            if !self.history.renaming {
+                self.history.rename.clone_from(&session.title);
+            }
+        }
+        self.brain.remember(session);
     }
 
     /// Apply merged preferences from a backup. Encryption and retention stay

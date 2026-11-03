@@ -874,6 +874,77 @@ mod tests {
     }
 
     #[test]
+    fn restore_reloads_open_documents_so_edits_keep_restored_content() {
+        let (mut app, directory) = library_app("restore-open");
+        let session = saved_session(&mut app, Kind::Note, "Original words.");
+        let stored = app
+            .history
+            .items
+            .iter()
+            .find(|item| item.id == session.id)
+            .unwrap()
+            .updated_ms;
+        let mut open = session.clone();
+        open.updated_ms = stored;
+        app.history.selected = Some(open.clone());
+        // An archive holding a newer version of the open document.
+        std::fs::create_dir_all(&directory).unwrap();
+        let archive = directory.join("newer.articulate-backup");
+        {
+            let source = crate::history::History::open(directory.join("source")).unwrap();
+            let mut newer = open.clone();
+            newer.personal_notes = "Restored notes.".into();
+            newer.updated_ms = stored + 1000;
+            source.install(&newer).unwrap();
+            crate::history::backup::create(
+                &source,
+                &crate::history::backup::Request {
+                    destination: archive.clone(),
+                    passphrase: None,
+                    settings: json!({}),
+                    library: crate::library::export(&[], &[]).unwrap(),
+                    include_audio: false,
+                },
+            )
+            .unwrap();
+        }
+        CHOSEN.with(|path| *path.borrow_mut() = Some(archive));
+        act(
+            &mut app,
+            json!({"type": "backup_restore", "replace_older": true, "include_settings": false}),
+        )
+        .unwrap();
+        app.history_poll();
+        wait(&mut app, "the restored document", |app| {
+            app.history
+                .selected
+                .as_ref()
+                .is_some_and(|selected| selected.personal_notes == "Restored notes.")
+        });
+        assert!(app.history.restore_reloads.is_empty());
+        // Renaming afterwards keeps the restored content.
+        act(
+            &mut app,
+            json!({"type": "session_patch", "id": session.id, "title": "Renamed"}),
+        )
+        .unwrap();
+        let id = session.id.clone();
+        wait(&mut app, "the rename", |app| {
+            app.history
+                .items
+                .iter()
+                .any(|item| item.id == id && item.title == "Renamed")
+        });
+        let stored = crate::history::History::open(directory.join("history"))
+            .unwrap()
+            .load(&session.id)
+            .unwrap();
+        assert_eq!(stored.personal_notes, "Restored notes.");
+        assert_eq!(stored.title, "Renamed");
+        finish(app, &directory);
+    }
+
+    #[test]
     fn quarantine_actions_need_a_listed_file() {
         let (mut app, directory) = library_app("quarantine");
         act(&mut app, json!({"type": "quarantine_list"})).unwrap();

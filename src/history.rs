@@ -299,6 +299,19 @@ impl std::fmt::Display for UnsupportedSchema {
 }
 impl std::error::Error for UnsupportedSchema {}
 
+/// A save based on a version older than one installed by a restore. Saving
+/// it would silently replace the restored content.
+#[derive(Debug)]
+pub struct StaleSave;
+impl std::fmt::Display for StaleSave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "This item was replaced by a restore after it was opened, so the older copy was not saved. Reopen it to keep editing.",
+        )
+    }
+}
+impl std::error::Error for StaleSave {}
+
 #[derive(Debug)]
 struct DamagedRecord;
 impl std::fmt::Display for DamagedRecord {
@@ -428,6 +441,9 @@ pub struct History {
     search: Option<SearchIndex>,
     protect: AtomicBool,
     quarantined_now: AtomicUsize,
+    /// `updated_ms` of records installed by a restore. Ordinary saves based
+    /// on an older version of these are rejected as stale.
+    replaced: Mutex<HashMap<String, u64>>,
 }
 
 impl History {
@@ -444,6 +460,7 @@ impl History {
             search: None,
             protect: AtomicBool::new(false),
             quarantined_now: AtomicUsize::new(0),
+            replaced: Mutex::new(HashMap::new()),
         })
     }
 
@@ -781,6 +798,15 @@ impl History {
 
     fn save_inner(&self, mut session: Session, preserve_membership: bool) -> Result<Session> {
         validate(&session)?;
+        if self
+            .replaced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&session.id)
+            .is_some_and(|installed| session.updated_ms < *installed)
+        {
+            return Err(StaleSave.into());
+        }
         ensure!(
             !self.path(&session.id, "deleted")?.exists(),
             "This history item was deleted"
@@ -896,7 +922,16 @@ impl History {
             !self.path(&session.id, "deleted")?.exists(),
             "This history item was deleted"
         );
-        self.write_record(session)
+        self.write_record(session)?;
+        self.replaced_by_restore(session);
+        Ok(())
+    }
+
+    /// Open copies older than `session` can no longer be saved over it.
+    fn replaced_by_restore(&self, session: &Session) {
+        let mut replaced = self.replaced.lock().unwrap_or_else(|e| e.into_inner());
+        let floor = replaced.entry(session.id.clone()).or_default();
+        *floor = (*floor).max(session.updated_ms);
     }
 
     /// The stored version of a record, if any, without hydrating topics.
@@ -1314,6 +1349,7 @@ impl History {
             );
         }
         self.write_record(&session)?;
+        self.replaced_by_restore(&session);
         remove_if_present(&path)?;
         Ok(session)
     }
@@ -2418,7 +2454,17 @@ fn history_worker(
         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
         state.active_save = None;
         state.active_operation = false;
+        let stale = result.as_ref().is_err_and(|error| error.is::<StaleSave>());
         match (&result, retry) {
+            (Err(_), Some(session)) if stale => {
+                if state
+                    .failed_saves
+                    .get(&session.id)
+                    .is_some_and(|failed| failed.revision <= session.revision)
+                {
+                    state.failed_saves.remove(&session.id);
+                }
+            }
             (Err(_), Some(session)) => {
                 if (state.failed_saves.len() < QUEUE_CAPACITY
                     || state.failed_saves.contains_key(&session.id))
@@ -3496,6 +3542,107 @@ mod tests {
         let main = fs::read(history.path(&session.id, "json").unwrap()).unwrap();
         assert!(protect::is_sealed(&main));
         assert!(contains_protected(&directory.0));
+    }
+
+    #[test]
+    fn saves_of_copies_older_than_a_restore_are_rejected() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let mut session = Session::new(Kind::Note);
+        session.personal_notes = "Before the restore.".into();
+        let open = history.save(session).unwrap();
+        let mut restored = open.clone();
+        restored.personal_notes = "Restored text.".into();
+        restored.updated_ms = open.updated_ms + 1000;
+        history.install(&restored).unwrap();
+        // The cached copy predates the restore: renaming it must not win.
+        let mut renamed = open.clone();
+        renamed.title = "Renamed".into();
+        let error = history.save(renamed).unwrap_err();
+        assert!(error.is::<StaleSave>());
+        assert_eq!(
+            history.load(&open.id).unwrap().personal_notes,
+            "Restored text."
+        );
+        // A reloaded copy saves normally.
+        let mut reloaded = history.load(&open.id).unwrap();
+        reloaded.title = "Renamed".into();
+        let saved = history.save(reloaded).unwrap();
+        assert_eq!(saved.personal_notes, "Restored text.");
+        let mut again = saved.clone();
+        again.personal_notes = "Edited after reload.".into();
+        history.save(again).unwrap();
+        assert!(!contains_protected(&directory.0));
+    }
+
+    fn describe(event: &Event) -> String {
+        match event {
+            Event::Failed(error) => format!("Failed({error})"),
+            Event::RestoreFinished(result) => format!(
+                "RestoreFinished({:?})",
+                result.as_ref().map(|restored| restored.updated.len())
+            ),
+            Event::Saved { id, .. } => format!("Saved({id})"),
+            Event::Listed(_) => "Listed".into(),
+            Event::ProtectionChanged(_) => "ProtectionChanged".into(),
+            _ => "Other".into(),
+        }
+    }
+
+    #[test]
+    fn worker_reports_stale_saves_without_retrying_them() {
+        let directory = TestDirectory::new();
+        let history = directory.history();
+        let session = history.save(Session::new(Kind::Note)).unwrap();
+        // Only the worker writes from here on, as in the app.
+        let worker = Worker::test_directory(directory.0.clone());
+        let mut restored = session.clone();
+        restored.updated_ms += 1000;
+        // The worker's own store installs the restored copy.
+        let path = directory.0.join("restore.articulate-backup");
+        {
+            let source = TestDirectory::new();
+            let archive_history = source.history();
+            archive_history.install(&restored).unwrap();
+            backup::create(
+                &archive_history,
+                &backup::Request {
+                    destination: path.clone(),
+                    passphrase: None,
+                    settings: serde_json::json!({}),
+                    library: crate::library::export(&[], &[]).unwrap(),
+                    include_audio: false,
+                },
+            )
+            .unwrap();
+        }
+        worker.restore(backup::RestoreRequest {
+            source: path,
+            passphrase: None,
+            replace_older: true,
+            include_settings: false,
+        });
+        worker.save(session.clone());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut events = Vec::new();
+        while !events.iter().any(|event| matches!(event, Event::Failed(_))) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                events.iter().map(describe).collect::<Vec<_>>()
+            );
+            events.extend(worker.drain());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::RestoreFinished(Ok(restored)) if restored.updated.len() == 1
+            )),
+            "{:?}",
+            events.iter().map(describe).collect::<Vec<_>>()
+        );
+        assert!(worker.saves_settled().is_ok());
     }
 
     #[test]
