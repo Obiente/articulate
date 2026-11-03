@@ -18,15 +18,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-static TRANSFERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static TRANSFERS: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 struct DirectoryLock {
     file: Option<fs::File>,
     path: std::path::PathBuf,
 }
 impl DirectoryLock {
-    fn acquire(directory: &Path) -> Result<Self> {
-        let path = directory.join(".download.lock");
+    fn acquire(path: &Path) -> Result<Self> {
+        let path = path.to_owned();
         let mut options = OpenOptions::new();
         options.create(true).truncate(false).read(true).write(true);
         #[cfg(windows)]
@@ -52,25 +52,44 @@ impl Drop for DirectoryLock {
 
 /// Remove abandoned prefixes only while no managed transfer is running.
 pub fn prune_stale(directory: &Path, age: Duration) -> Result<()> {
-    let _guard = TRANSFERS
-        .try_lock()
-        .map_err(|_| anyhow::anyhow!("A download is active"))?;
+    let _guard = cleanup_guard(&TRANSFERS)?;
+    prune_files(directory, age)
+}
+fn cleanup_guard(lock: &std::sync::RwLock<()>) -> Result<std::sync::RwLockWriteGuard<'_, ()>> {
+    lock.try_write().or_else(|error| match error {
+        std::sync::TryLockError::Poisoned(error) => Ok(error.into_inner()),
+        std::sync::TryLockError::WouldBlock => Err(anyhow::anyhow!("A download is active")),
+    })
+}
+fn prune_files(directory: &Path, age: Duration) -> Result<()> {
     if !directory.exists() {
         return Ok(());
     }
-    let _directory_lock = DirectoryLock::acquire(directory)?;
+
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.is_file()
             && !metadata.file_type().is_symlink()
-            && path.extension().is_some_and(|e| e == "part")
+            && (path.extension().is_some_and(|e| e == "part")
+                || path
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(".invalid-")))
             && metadata
                 .modified()?
                 .elapsed()
                 .is_ok_and(|elapsed| elapsed > age)
         {
+            let Some(name) = path.file_stem().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let base = name.rsplit_once('.').map_or(name, |(base, _)| base);
+            let Ok(_lock) =
+                DirectoryLock::acquire(&directory.join(format!("{base}.download.lock")))
+            else {
+                continue;
+            };
             ordinary(&path)?;
             fs::remove_file(&path)?;
             let _ = fs::remove_file(path.with_extension("identity"));
@@ -106,9 +125,6 @@ pub(crate) fn fetch(
     cancel: &Arc<AtomicBool>,
     progress: &mut impl FnMut(&str, Option<f32>),
 ) -> Result<()> {
-    let _guard = TRANSFERS
-        .try_lock()
-        .map_err(|_| anyhow::anyhow!("Another download is active"))?;
     transfer(artifact, cancel, progress, Policy::default())
 }
 fn transfer(
@@ -117,6 +133,7 @@ fn transfer(
     progress: &mut impl FnMut(&str, Option<f32>),
     policy: Policy,
 ) -> Result<()> {
+    let _guard = TRANSFERS.read().unwrap_or_else(|error| error.into_inner());
     check_cancel(cancel)?;
     ensure!(
         a.url.starts_with("https://") || cfg!(test) && a.url.starts_with("http://127.0.0.1:"),
@@ -127,19 +144,12 @@ fn transfer(
         "Invalid download manifest."
     );
     let part = a.destination.with_extension(format!("{}.part", a.sha));
-    let _directory_lock = DirectoryLock::acquire(
-        a.destination
-            .parent()
-            .context("Missing download directory")?,
-    )?;
+    let _directory_lock = DirectoryLock::acquire(&a.destination.with_extension("download.lock"))?;
     if part.exists() {
         ordinary(&part)?;
     }
     if part.metadata().is_ok_and(|m| m.len() > a.size) {
-        fs::rename(
-            &part,
-            part.with_extension(format!("invalid-{}", crate::discord::plugin::new_token()?)),
-        )?;
+        quarantine(&part)?;
     }
     let identity_path = part.with_extension("identity");
     let mut identity = fs::read_to_string(&identity_path).ok();
@@ -278,9 +288,7 @@ fn transfer(
     if let Err(error) = verified(&part, a.size, a.sha, cancel) {
         check_cancel(cancel)?;
         // Keep a failed artifact for diagnosis, but permit a clean retry next time.
-        let invalid =
-            part.with_extension(format!("invalid-{}", crate::discord::plugin::new_token()?));
-        fs::rename(&part, invalid)?;
+        quarantine(&part)?;
         let _ = fs::remove_file(&identity_path);
         return Err(error).context(
             "Downloaded data failed verification. Choose Download again to fetch a fresh copy.",
@@ -288,6 +296,26 @@ fn transfer(
     }
     let _ = fs::remove_file(identity_path);
     fs::rename(&part, a.destination)?;
+    Ok(())
+}
+fn quarantine(part: &Path) -> Result<()> {
+    let prefix = format!(
+        "{}.invalid-",
+        part.file_stem()
+            .context("Missing artifact name")?
+            .to_string_lossy()
+    );
+    for entry in fs::read_dir(part.parent().context("Missing artifact directory")?)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+        {
+            ordinary(&path)?;
+            fs::remove_file(path)?;
+        }
+    }
+    fs::rename(part, part.with_extension("invalid-latest"))?;
     Ok(())
 }
 fn validate_headers(
@@ -381,14 +409,17 @@ mod tests {
     fn cleanup_is_blocked_during_transfer_and_keeps_finished_files() {
         let (directory, _, _) = fixture();
         fs::write(directory.join("old.part"), b"partial").unwrap();
+        fs::write(directory.join("model.hash.invalid-old"), b"invalid").unwrap();
         fs::write(directory.join("finished.gguf"), b"complete").unwrap();
         {
-            let _guard = TRANSFERS.lock().unwrap();
+            let _guard = TRANSFERS.write().unwrap();
             assert!(prune_stale(&directory, Duration::ZERO).is_err());
             assert!(directory.join("old.part").exists());
         }
         std::thread::sleep(Duration::from_millis(20));
-        prune_stale(&directory, Duration::ZERO).unwrap();
+        let _guard = TRANSFERS.write().unwrap_or_else(|e| e.into_inner());
+        prune_files(&directory, Duration::ZERO).unwrap();
+        assert!(!directory.join("model.hash.invalid-old").exists());
         assert!(!directory.join("old.part").exists());
         assert!(directory.join("finished.gguf").exists());
         fs::remove_dir_all(directory).unwrap();
@@ -397,10 +428,45 @@ mod tests {
     #[test]
     fn directory_lock_excludes_another_handle() {
         let (directory, _, _) = fixture();
-        let lock = DirectoryLock::acquire(&directory).unwrap();
-        assert!(DirectoryLock::acquire(&directory).is_err());
+        let lock = DirectoryLock::acquire(&directory.join("model.download.lock")).unwrap();
+        assert!(DirectoryLock::acquire(&directory.join("model.download.lock")).is_err());
         drop(lock);
-        drop(DirectoryLock::acquire(&directory).unwrap());
+        drop(DirectoryLock::acquire(&directory.join("model.download.lock")).unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn poisoned_cleanup_lock_recovers() {
+        let lock = Arc::new(std::sync::RwLock::new(()));
+        let other = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = other.write().unwrap();
+            panic!("synthetic lock failure");
+        })
+        .join();
+        assert!(cleanup_guard(&lock).is_ok());
+    }
+    #[test]
+    fn quarantine_is_bounded() {
+        let (directory, _, sha) = fixture();
+        let part = directory.join(format!("fixture.{sha}.part"));
+        fs::write(part.with_extension("invalid-old"), b"old").unwrap();
+        for _ in 0..3 {
+            fs::write(&part, b"bad").unwrap();
+            quarantine(&part).unwrap();
+        }
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn unrelated_artifacts_can_lock_concurrently() {
+        let (directory, _, _) = fixture();
+        let a = directory.join("a.download.lock");
+        let b = directory.join("b.download.lock");
+        let first = DirectoryLock::acquire(&a).unwrap();
+        let second = DirectoryLock::acquire(&b).unwrap();
+        assert!(DirectoryLock::acquire(&a).is_err());
+        drop((first, second));
         fs::remove_dir_all(directory).unwrap();
     }
     fn request(socket: &mut TcpStream) -> String {

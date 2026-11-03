@@ -212,7 +212,7 @@ mod tests {
     }
 }
 
-/// Settings and state for explicit whole-segment editing, disabled by default.
+/// Settings and state for sentence editing, disabled by default.
 #[allow(
     dead_code,
     reason = "Backend API awaiting settings and text pipeline wiring"
@@ -228,11 +228,69 @@ pub struct EditingSettings {
 pub struct DictationEditor {
     segments: Vec<String>,
     undo: Vec<Vec<String>>,
+    pub notice: Option<String>,
+    prior: Option<(Vec<String>, Vec<Vec<String>>)>,
 }
 #[allow(dead_code, reason = "Backend API awaiting text pipeline wiring")]
 impl DictationEditor {
+    pub fn begin_recording(&mut self, unchanged: bool) {
+        let prior = if unchanged && (!self.segments.is_empty() || !self.undo.is_empty()) {
+            Some((
+                std::mem::take(&mut self.segments),
+                std::mem::take(&mut self.undo),
+            ))
+        } else {
+            None
+        };
+        *self = Self {
+            prior,
+            ..Default::default()
+        };
+    }
     /// Call exactly once per finalized segment, before applying bang macros.
     pub fn apply(&mut self, segment: &str, settings: &EditingSettings) -> String {
+        self.notice = None;
+        if settings.spoken_editing_commands
+            && self.segments.is_empty()
+            && previous_command(segment).is_some()
+            && let Some((segments, undo)) = self.prior.take()
+        {
+            self.segments = segments;
+            self.undo = undo;
+            if previous_command(segment) == Some(false) {
+                self.undo.push(std::mem::take(&mut self.segments));
+                return self.text();
+            }
+            if !self.segments.is_empty() {
+                self.undo.push(Vec::new());
+            }
+        }
+        if settings.spoken_editing_commands {
+            let mut start = 0;
+            let mut sentences = Vec::new();
+            for (index, ch) in segment.char_indices() {
+                let end = index + ch.len_utf8();
+                if matches!(ch, '.' | '!' | '?' | '\n')
+                    && segment[end..]
+                        .chars()
+                        .next()
+                        .is_none_or(char::is_whitespace)
+                {
+                    sentences.push(&segment[start..end]);
+                    start = end;
+                }
+            }
+            if !segment[start..].trim().is_empty() {
+                sentences.push(&segment[start..]);
+            }
+            sentences.retain(|s| !s.trim().is_empty());
+            if sentences.len() > 1 {
+                for sentence in sentences {
+                    self.apply(sentence.trim(), settings);
+                }
+                return self.text();
+            }
+        }
         let command = segment
             .trim()
             .trim_end_matches(['.', '!', '?'])
@@ -241,19 +299,46 @@ impl DictationEditor {
         if settings.spoken_editing_commands && command == "undo that" {
             if let Some(previous) = self.undo.pop() {
                 self.segments = previous;
+            } else {
+                self.notice = Some("Nothing to undo.".into());
             }
         } else {
-            self.undo.push(self.segments.clone());
+            let continuation = self
+                .segments
+                .last()
+                .is_some_and(|s| !s.ends_with(['.', '!', '?', '\n']))
+                && !matches!(
+                    command.as_str(),
+                    "scratch that" | "delete that" | "new line" | "new paragraph"
+                );
+            if !continuation {
+                self.undo.push(self.segments.clone());
+            }
             if self.undo.len() > 32 {
                 self.undo.remove(0);
             }
             match (settings.spoken_editing_commands, command.as_str()) {
                 (true, "scratch that" | "delete that") => {
-                    self.segments.pop();
+                    if self.segments.pop().is_none() {
+                        self.undo.pop();
+                        self.notice = Some("Nothing to remove from this dictation.".into());
+                    }
                 }
                 (true, "new line") => self.segments.push("\n".into()),
                 (true, "new paragraph") => self.segments.push("\n\n".into()),
-                _ => self.segments.push(segment.into()),
+                _ => {
+                    if self
+                        .segments
+                        .last()
+                        .is_some_and(|s| !s.ends_with(['.', '!', '?', '\n']))
+                    {
+                        let previous = self.segments.last_mut().unwrap();
+                        previous.push(' ');
+                        previous.push_str(segment);
+                    } else {
+                        self.segments.push(segment.into());
+                    }
+                }
             }
         }
         self.text()
@@ -304,6 +389,56 @@ mod editing_tests {
         }
     }
     #[test]
+    fn local_recordings_keep_history_only_when_unchanged() {
+        let settings = EditingSettings {
+            spoken_editing_commands: true,
+        };
+        let mut e = DictationEditor::default();
+        e.apply("First sentence. Second sentence.", &settings);
+        e.begin_recording(true);
+        assert_eq!(e.apply("scratch that", &settings), "");
+        e.begin_recording(true);
+        assert_eq!(
+            e.apply("undo that", &settings),
+            "First sentence. Second sentence."
+        );
+        e.begin_recording(false);
+        assert_eq!(e.apply("scratch that", &settings), "");
+        assert!(e.notice.is_some());
+        let mut e = DictationEditor::default();
+        assert_eq!(
+            e.apply("The price is 1.25.", &settings),
+            "The price is 1.25."
+        );
+    }
+    #[test]
+    fn sentences_and_capture_windows_are_independent() {
+        let settings = EditingSettings {
+            spoken_editing_commands: true,
+        };
+        let mut e = DictationEditor::default();
+        assert_eq!(
+            e.apply("First sentence. Second sentence. Scratch that.", &settings),
+            "First sentence."
+        );
+        assert_eq!(
+            e.apply("undo that", &settings),
+            "First sentence. Second sentence."
+        );
+        assert_eq!(
+            e.apply("I might scratch that tomorrow.", &settings),
+            "First sentence. Second sentence. I might scratch that tomorrow."
+        );
+        let mut e = DictationEditor::default();
+        e.apply("Sentence across", &settings);
+        e.apply("windows.", &settings);
+        assert_eq!(e.apply("scratch that", &settings), "");
+        assert!(e.apply("delete that", &settings).is_empty());
+        assert!(e.notice.is_some());
+        assert_eq!(previous_command("Scratch that!"), Some(false));
+        assert_eq!(previous_command("I said scratch that."), None);
+    }
+    #[test]
     fn editing_and_undo_preserve_segment_boundaries() {
         let mut e = DictationEditor::default();
         let settings = EditingSettings {
@@ -320,5 +455,20 @@ mod editing_tests {
             e.apply("Replacement.", &settings),
             "First.\nSecond.\n\nReplacement."
         );
+    }
+}
+
+/// Only an entire utterance can edit an earlier insertion.
+pub fn previous_command(text: &str) -> Option<bool> {
+    match text
+        .trim()
+        .trim_end_matches(['.', '!', '?'])
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "scratch that" | "delete that" => Some(false),
+        "undo that" => Some(true),
+        _ => None,
     }
 }

@@ -36,6 +36,8 @@ pub(crate) struct PlaybackView<'a> {
 pub(crate) struct CallTools<'a> {
     audio_import: ImportView<'a>,
     playback: PlaybackView<'a>,
+    active_microphone: Option<String>,
+    active_output: Option<String>,
 }
 
 pub(crate) fn call_tools(app: &App) -> CallTools<'_> {
@@ -52,7 +54,20 @@ pub(crate) fn call_tools(app: &App) -> CallTools<'_> {
         "idle"
     };
     let player = app.call_tools.player.as_ref();
+    let active = app
+        .call
+        .as_ref()
+        .map(|control| {
+            control
+                .active_devices
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+        .unwrap_or_default();
     CallTools {
+        active_microphone: active.0,
+        active_output: active.1,
         audio_import: ImportView {
             state,
             dragging: app.calls_dragging(),

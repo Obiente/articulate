@@ -70,6 +70,7 @@ impl App {
 pub enum StartMode {
     /// Show a prompt with the consent reminder and wait for the user.
     #[default]
+    #[serde(other)]
     Ask,
     /// Start a transcript as soon as a meeting is confirmed.
     Automatic,

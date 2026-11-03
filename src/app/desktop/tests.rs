@@ -114,7 +114,15 @@ fn snapshot_sections_have_a_locked_shape() {
         ("meetings", set(&["meetings"])),
         ("updater", set(&["updater"])),
         ("overlay", set(&["overlay"])),
-        ("call_tools", set(&["audio_import", "playback"])),
+        (
+            "call_tools",
+            set(&[
+                "audio_import",
+                "playback",
+                "active_microphone",
+                "active_output",
+            ]),
+        ),
         ("people", set(&["people", "people_error"])),
         ("history", set(&["history"])),
         ("document_body", set(&["selected_body"])),

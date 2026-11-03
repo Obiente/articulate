@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum WritingStyle {
     Verbatim,
     #[default]
+    #[serde(other)]
     Clean,
     Chat,
 }
@@ -202,7 +203,7 @@ mod tests {
 
 /// Overrides for a process basename. Missing fields inherit global preferences.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct InputProfile {
     pub app: String,
     pub hotkey_mode: Option<crate::platform::HotkeyMode>,

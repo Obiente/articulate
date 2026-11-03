@@ -4,6 +4,7 @@ use std::sync::mpsc::Sender;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LineBreak {
     #[default]
+    #[serde(other)]
     Enter,
     ShiftEnter,
 }
@@ -17,6 +18,7 @@ mod hotkey_lifecycle;
 pub enum HotkeyMode {
     Toggle,
     #[default]
+    #[serde(other)]
     Hold,
 }
 
