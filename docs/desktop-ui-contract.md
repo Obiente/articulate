@@ -60,7 +60,8 @@ type SessionMeta = {
   interruptions: Interruption[];
   speaker_undo: string | null;      // what `speaker_undo` would revert
   audio: { duration_ms: number; bytes: number; channels: string[]; incomplete: boolean } | null;
-  transcript_versions: { index: number; replaced_ms: number; model: string; preview: string }[];
+  transcript_versions: { id: string; index: number; replaced_ms: number; model: string; preview: string }[];
+  transcript_revision: string | null; // the current transcript, while versions exist
 };
 type Interruption = {
   start_ms: number; end_ms: number;
@@ -191,7 +192,7 @@ Actions that ask for a file or folder (`session_export`, `followups_export`, `qu
 
 Capture (`actions/capture.rs`):
 
-- `dictation_start`, `dictation_stop`, `dictation_cancel`
+- `dictation_start`, `dictation_stop`, `dictation_cancel`. While an import or re-transcription runs (`audio_import.state = "working"`), capture cannot start and `dictation_cancel` is refused; that job has its own `audio_import_cancel`.
 - `call_start { source?: "system"|"discord", language_preference?: string|null, audio_context?: boolean, keep_audio?: boolean }`, `call_stop`. `keep_audio` defaults to the `keep_call_audio` preference.
 - `note_capture_start`, `note_capture_stop`
 
@@ -217,10 +218,10 @@ Updates (`actions/updates.rs`): `update_check`, `update_download`, `update_insta
 Conversations and speakers (`actions/calls.rs`):
 
 - `speaker_rename { id, speaker, name }`, `speaker_merge { id, from, into }`, `speaker_reassign { id, rows: {index, start_ms}[], speaker? | name? }`, `speaker_undo { id }`. `speaker`, `from` and `into` are `speaker_keys` from the current snapshot. Each row reference carries the `start_ms` the renderer saw; a changed transcript is rejected. They apply to the call being recorded (committed rows only; later turns follow merges and participant renames) or to the open saved conversation, and save through the normal history path.
-- `person_save { id?, name }`, `person_delete { id }`, `people_clear`: the known-people list.
+- `person_save { id?, name }`, `person_delete { id }`, `people_clear { confirm: { count } }`: the known-people list. `count` is how many people the confirmation showed; a different count is refused. Clearing also removes damaged copies of the list.
 - `audio_import_choose` opens the system file dialog outside the controller. A chosen or dropped file is offered as `audio_import.state = "ready"`; `audio_import_start { kind: "call"|"dictation", keep_audio? }` imports it on the speech worker, `audio_import_cancel` stops it and `audio_import_dismiss` clears the offer or result. The renderer never sends or receives file paths.
-- `audio_play { id, from_ms? }`, `audio_stop`: native playback of kept audio. `audio_delete { id }` removes kept audio and keeps the transcript.
-- `transcript_rebuild { id }` re-transcribes kept audio with the loaded model and keeps the replaced transcript in `transcript_versions`; `transcript_restore { id, index }` swaps a kept version back. Installation requires capture and processing to finish, no active download, and pending document saves to complete before the verified installer launches.
+- `audio_play { id, from_ms? }`, `audio_stop`: native playback of kept audio. `audio_delete { id, confirm: { id, bytes } }` removes kept audio and keeps the transcript. `confirm` repeats the session and the `audio.bytes` the confirmation showed; anything else is refused.
+- `transcript_rebuild { id }` re-transcribes kept audio with the loaded model and keeps the replaced transcript in `transcript_versions`; `transcript_restore { id, version, expected }` swaps a kept version back: `version` is a `transcript_versions[].id` (stable, unlike `index`) and `expected` the `transcript_revision` the renderer showed, so a repeated or stale request is refused. A re-transcription changes only the transcript of the latest copy of the session; title and notes edited meanwhile stay, and if the transcript itself changed meanwhile it is kept and the new one is added to `transcript_versions`. Installation requires capture and processing to finish, no active download, and pending document saves to complete before the verified installer launches.
 
 Editing an existing vocabulary entry requires `index` and its original `expected_heard`; snippet edits require `index` and `expected_trigger`. Edits and deletions also require the complete original snapshot object in `expected_entry` or `expected_macro`. A stale row or changed scope is rejected without mutating data. Device preferences use an empty string to select the Windows default.
 
