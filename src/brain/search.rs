@@ -5,16 +5,15 @@
 //! first pass. Until then, or if the index could not be created, a bounded scan
 //! of the most recent saved files is used instead and marked `partial`.
 pub use crate::history::search_index::{Field, Filters};
-use crate::history::{History, Kind, Session, search_index::SearchIndex};
+use crate::history::{
+    History, Kind, Session,
+    search_index::{Cancel, SearchIndex},
+};
 use anyhow::{Result, ensure};
 use std::{
     fs,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, TryRecvError},
-    },
+    sync::mpsc::{self, Receiver, TryRecvError},
     time::SystemTime,
 };
 
@@ -55,15 +54,16 @@ pub struct Results {
 }
 
 pub struct Job {
-    cancel: Arc<AtomicBool>,
+    cancel: Cancel,
     result: Receiver<Result<Results, String>>,
 }
 impl Job {
     pub fn try_recv(&self) -> std::result::Result<Result<Results, String>, TryRecvError> {
         self.result.try_recv()
     }
+    /// Stop the search, interrupting an indexed query that is running.
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Release);
+        self.cancel.cancel();
     }
 }
 impl Drop for Job {
@@ -81,13 +81,13 @@ pub fn start(query: String, filters: Filters, index: Option<SearchIndex>) -> Res
     );
     let directory = crate::model::data_dir().join("history");
     let (tx, result) = mpsc::sync_channel(1);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Cancel::default();
     let worker_cancel = cancel.clone();
     std::thread::Builder::new()
         .name("saved-content-search".into())
         .spawn(move || {
             let answer = match index.filter(SearchIndex::is_ready) {
-                Some(index) => indexed(&index, query, &filters),
+                Some(index) => indexed(&index, query, &filters, &worker_cancel),
                 None => scan(directory, query, &filters, &worker_cancel),
             };
             let _ = tx.send(answer.map_err(|e| e.to_string()));
@@ -95,8 +95,13 @@ pub fn start(query: String, filters: Filters, index: Option<SearchIndex>) -> Res
     Ok(Job { cancel, result })
 }
 
-fn indexed(index: &SearchIndex, query: String, filters: &Filters) -> Result<Results> {
-    let found = index.search(&query, filters)?;
+fn indexed(
+    index: &SearchIndex,
+    query: String,
+    filters: &Filters,
+    cancel: &Cancel,
+) -> Result<Results> {
+    let found = index.search_cancellable(&query, filters, cancel)?;
     Ok(Results {
         query,
         scanned_sessions: found.indexed_sessions,
@@ -150,12 +155,7 @@ fn speaker_matches(label: Option<&str>, filters: &Filters) -> bool {
     })
 }
 
-fn scan(
-    directory: PathBuf,
-    query: String,
-    filters: &Filters,
-    cancel: &AtomicBool,
-) -> Result<Results> {
+fn scan(directory: PathBuf, query: String, filters: &Filters, cancel: &Cancel) -> Result<Results> {
     let mut result = Results {
         query: query.clone(),
         ..Default::default()
@@ -166,7 +166,7 @@ fn scan(
     let history = History::open(directory.clone())?;
     let mut files = Vec::new();
     for (index, entry) in fs::read_dir(&directory)?.enumerate() {
-        ensure!(!cancel.load(Ordering::Acquire), "Search cancelled.");
+        ensure!(!cancel.is_cancelled(), "Search cancelled.");
         if index >= MAX_DIRECTORY_ENTRIES {
             result.partial = true;
             break;
@@ -199,7 +199,7 @@ fn scan(
     result.partial |= files.len() > MAX_FILES;
     let mut scanned = 0;
     for (_, id) in files.into_iter().take(MAX_FILES) {
-        ensure!(!cancel.load(Ordering::Acquire), "Search cancelled.");
+        ensure!(!cancel.is_cancelled(), "Search cancelled.");
         if result.hits.len() >= MAX_MATCHES {
             result.partial = true;
             break;
@@ -328,6 +328,21 @@ fn locate(text: &str, query: &str) -> Option<(usize, usize, (usize, usize))> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_indexed_searches_return_no_results() {
+        let index = SearchIndex::in_memory().unwrap();
+        let mut session = Session::new(Kind::Dictation);
+        session.text = "The zephyr release is Friday.".into();
+        index.upsert(&session).unwrap();
+        index.set_ready(0);
+        let cancel = Cancel::default();
+        let found = indexed(&index, "zephyr".into(), &Filters::default(), &cancel).unwrap();
+        assert_eq!(found.hits.len(), 1);
+        cancel.cancel();
+        assert!(indexed(&index, "zephyr".into(), &Filters::default(), &cancel).is_err());
+    }
+
     #[test]
     fn exact_excerpts_survive_casefold_expansion_and_unicode_boundaries() {
         let text = "İstanbul café planning. Send the résumé tomorrow.";
@@ -381,7 +396,7 @@ mod tests {
             directory.clone(),
             "zephyr".into(),
             &Filters::default(),
-            &AtomicBool::new(false),
+            &Cancel::default(),
         )
         .unwrap();
         assert_eq!(result.hits.len(), 1);
@@ -398,7 +413,7 @@ mod tests {
                     kind: Some(Kind::Call),
                     ..Default::default()
                 },
-                &AtomicBool::new(false),
+                &Cancel::default(),
             )
             .unwrap()
             .hits
@@ -415,7 +430,7 @@ mod tests {
             directory.clone(),
             "zephyr".into(),
             &Filters::default(),
-            &AtomicBool::new(false),
+            &Cancel::default(),
         )
         .unwrap();
         assert_eq!(result.hits.len(), 1);
@@ -426,7 +441,7 @@ mod tests {
             directory.clone(),
             "zephyr".into(),
             &Filters::default(),
-            &AtomicBool::new(false),
+            &Cancel::default(),
         )
         .unwrap();
         assert!(result.hits.is_empty());
